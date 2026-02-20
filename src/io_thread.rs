@@ -5,8 +5,6 @@ use disruptor::{MultiProducer, Polling, Producer, SingleConsumerBarrier};
 use io_uring::{IoUring, opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
-use std::sync::Arc;
-
 use crate::buffer_pool::BufferPool;
 use crate::protocol;
 use crate::response_queue::RespPoller;
@@ -77,7 +75,7 @@ pub struct IoThread {
     pub producer: ReqProducer,
     pub response_poller: RespPoller,
     pub eventfd: RawFd,
-    pub buffer_pool: Arc<BufferPool>,
+    pub buffer_pool: &'static BufferPool,
 }
 
 impl IoThread {

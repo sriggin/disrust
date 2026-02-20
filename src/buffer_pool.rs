@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -17,7 +17,7 @@ pub enum AllocError {
 /// Automatically returns space to pool when dropped (if len > 0).
 #[derive(Clone)]
 pub struct PoolSlice {
-    pool: Option<Arc<BufferPool>>,
+    pool: &'static BufferPool,
     data: *const f32,
     len: usize,
 }
@@ -26,7 +26,7 @@ impl PoolSlice {
     /// Create an empty PoolSlice (for initialization).
     pub fn empty() -> Self {
         Self {
-            pool: None,
+            pool: factory_pool(),
             data: std::ptr::null(),
             len: 0,
         }
@@ -38,10 +38,8 @@ unsafe impl Sync for PoolSlice {}
 
 impl Drop for PoolSlice {
     fn drop(&mut self) {
-        if let Some(pool) = &self.pool
-            && self.len > 0
-        {
-            pool.read_cursor.fetch_add(self.len, Ordering::Relaxed);
+        if self.len > 0 {
+            self.pool.read_cursor.fetch_add(self.len, Ordering::Relaxed);
         }
     }
 }
@@ -62,7 +60,7 @@ impl PoolSlice {
 
 /// Mutable slice backed by a buffer pool arena. Can be frozen to PoolSlice.
 pub struct PoolSliceMut {
-    pool: Option<Arc<BufferPool>>,
+    pool: &'static BufferPool,
     data: *mut f32,
     len: usize,
 }
@@ -107,13 +105,18 @@ pub struct BufferPool {
 
 impl BufferPool {
     /// Create a new buffer pool with capacity for `capacity` f32 values.
-    pub fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new_boxed(capacity: usize) -> Box<Self> {
+        Box::new(Self {
             data: vec![0.0f32; capacity].into_boxed_slice(),
             capacity,
             write_cursor: AtomicUsize::new(0),
             read_cursor: AtomicUsize::new(0),
         })
+    }
+
+    /// Create a new buffer pool and leak it to obtain a `'static` reference.
+    pub fn leak_new(capacity: usize) -> &'static Self {
+        Box::leak(Self::new_boxed(capacity))
     }
 
     /// Allocate space for `len` f32 values, returning a mutable slice.
@@ -122,7 +125,7 @@ impl BufferPool {
     /// # Errors
     /// - `AllocError::TooLarge` if `len` exceeds pool capacity
     /// - `AllocError::Exhausted` if pool is full (producer outpacing consumer)
-    pub fn alloc(self: &Arc<Self>, len: usize) -> Result<PoolSliceMut, AllocError> {
+    pub fn alloc(&'static self, len: usize) -> Result<PoolSliceMut, AllocError> {
         if len > self.capacity {
             return Err(AllocError::TooLarge {
                 requested: len,
@@ -156,7 +159,7 @@ impl BufferPool {
 
         let ptr = self.data.as_ptr() as *mut f32;
         Ok(PoolSliceMut {
-            pool: Some(Arc::clone(self)),
+            pool: self,
             data: unsafe { ptr.add(actual_offset) },
             len,
         })
@@ -171,13 +174,24 @@ impl BufferPool {
     }
 }
 
+static FACTORY_POOL: OnceLock<&'static BufferPool> = OnceLock::new();
+
+/// Set the pool used for factory-created empty slices.
+pub fn set_factory_pool(pool: &'static BufferPool) {
+    let _ = FACTORY_POOL.set(pool);
+}
+
+fn factory_pool() -> &'static BufferPool {
+    FACTORY_POOL.get().expect("factory pool not initialized")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn basic_alloc() {
-        let pool = BufferPool::new(1000);
+        let pool = BufferPool::leak_new(1000);
         let mut m1 = pool.alloc(10).expect("alloc failed");
         m1.as_mut_slice().fill(1.0);
         let s1 = m1.freeze();
@@ -198,7 +212,7 @@ mod tests {
 
     #[test]
     fn wraparound() {
-        let pool = BufferPool::new(100);
+        let pool = BufferPool::leak_new(100);
         let s1 = pool.alloc(95).expect("alloc failed").freeze();
         drop(s1); // Free to make space
 
@@ -213,7 +227,7 @@ mod tests {
 
     #[test]
     fn read_write() {
-        let pool = BufferPool::new(100);
+        let pool = BufferPool::leak_new(100);
         let mut mutable = pool.alloc(5).expect("alloc failed");
         mutable
             .as_mut_slice()
@@ -225,14 +239,14 @@ mod tests {
 
     #[test]
     fn alloc_too_large() {
-        let pool = BufferPool::new(100);
+        let pool = BufferPool::leak_new(100);
         let result = pool.alloc(200);
         assert!(matches!(result, Err(AllocError::TooLarge { .. })));
     }
 
     #[test]
     fn exhaustion() {
-        let pool = BufferPool::new(100);
+        let pool = BufferPool::leak_new(100);
         let _s1 = pool.alloc(90).expect("alloc failed");
         // Pool exhausted - can't allocate 20 more
         let result = pool.alloc(20);

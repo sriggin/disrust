@@ -12,7 +12,7 @@ use disruptor::{BusySpin, build_multi_producer};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use batch_processor::BatchProcessor;
-use buffer_pool::BufferPool;
+use buffer_pool::{BufferPool, set_factory_pool};
 use io_thread::IoThread;
 use response_queue::build_response_channel;
 use ring_types::{FEATURE_DIM, InferenceEvent, MAX_VECTORS_PER_REQUEST};
@@ -93,6 +93,10 @@ fn main() {
         BUFFER_POOL_CAPACITY
     );
 
+    // Factory needs a pool for empty slices created during ring initialization.
+    let factory_pool = BufferPool::leak_new(1);
+    set_factory_pool(factory_pool);
+
     // Build the request disruptor (MPSC: IO threads → batch processor)
     let builder = build_multi_producer(DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
     let (request_poller, builder) = builder.event_poller();
@@ -131,7 +135,7 @@ fn main() {
     {
         let listen_socket = create_listener(port);
         let listen_fd = listen_socket.into_raw_fd();
-        let buffer_pool = BufferPool::new(BUFFER_POOL_CAPACITY);
+        let buffer_pool = BufferPool::leak_new(BUFFER_POOL_CAPACITY);
 
         let io = IoThread {
             thread_id: i as u16,
