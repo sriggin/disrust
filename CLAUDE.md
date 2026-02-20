@@ -34,6 +34,15 @@ cargo run --bin client -- 9900 bench <num_connections> <requests_per_conn>
 
 # Run tests (buffer_pool.rs contains tests)
 cargo test
+
+# Run buffer pool benchmarks
+cargo bench --bench buffer_pool_bench -- --alloc-sizes
+cargo bench --bench buffer_pool_bench -- --pool-sizes
+
+# Profile buffer pool with perf (Linux only, runs 100M iterations)
+cargo bench --no-run
+perf record -g target/release/deps/profile_buffer_pool-*
+perf report
 ```
 
 ## Architecture Overview
@@ -63,7 +72,7 @@ The server uses a multi-threaded architecture with clear separation of concerns:
 - **SO_REUSEPORT**: Multiple IO threads bind to the same port, kernel load-balances incoming connections
 - **Disruptor Pattern**: Lock-free ring buffers with busy-spin for ultra-low latency
 - **Slab Allocator**: Connection state stored in `Slab<Connection>` for efficient allocation/deallocation
-- **Pre-allocated Buffers**: Feature arrays allocated once per disruptor slot via factory functions
+- **Buffer Pool**: Per-thread ring-based buffer pools allocate variable-length feature data. Each IO thread has a dedicated `BufferPool` (currently 2GB worst-case sizing, but can be right-sized to 8-32 MB for typical workloads). Features are allocated as `PoolSlice` which automatically returns memory when dropped. Pool size critically affects performance due to cache locality - see PERFORMANCE.md
 
 ### Protocol
 
@@ -83,6 +92,7 @@ Wire format is little-endian binary:
 - `FEATURE_DIM: 128` - Fixed feature vector dimension
 - `MAX_VECTORS_PER_REQUEST: 64` - Protocol limit
 - `READ_BUF_SIZE: 65536` - Per-connection read buffer
+- `BUFFER_POOL_CAPACITY: DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM` - Per-thread buffer pool size (~2GB). **Note:** This is worst-case sizing assuming all in-flight requests are at max size. Real workloads are typically 1-8 vectors, so this could be reduced to 8-32 MB for significant performance gains (2.5x speedup due to better cache locality). Minimum: `DISRUPTOR_SIZE * FEATURE_DIM` (~32MB)
 
 ## File Organization
 
@@ -92,7 +102,7 @@ Wire format is little-endian binary:
 - `protocol.rs`: Wire protocol parsing and serialization (try_parse_request, copy_features, write_response)
 - `ring_types.rs`: Disruptor event types (InferenceEvent, InferenceResponse) and constants
 - `response_queue.rs`: SPSC response channel builder and eventfd signaling
-- `buffer_pool.rs`: Atomic ring-based buffer pool (currently unused, alternative to pre-allocated arrays)
+- `buffer_pool.rs`: Ring-based buffer pool with automatic memory reclamation via `PoolSlice`/`PoolSliceMut` RAII types. Each IO thread has a dedicated pool instance
 - `bin/client.rs`: Test client with smoke test, pipeline test, and benchmark modes
 
 ## Important Implementation Details
@@ -127,6 +137,17 @@ Multiple requests can be pipelined in a single read buffer; parse loop consumes 
 ### Response Signaling
 
 After publishing responses, batch processor calls `response_producers[thread_id].signal()` which writes to eventfd. This wakes io_uring on the IO thread via OP_EVENTFD completion, which then drains the response queue.
+
+### Buffer Pool Memory Management
+
+Each IO thread has a dedicated `Arc<BufferPool>` with ring-based allocation:
+- **Allocation**: IO thread calls `pool.alloc(len)` returning `PoolSliceMut` for writing feature data
+- **Freezing**: `PoolSliceMut::freeze()` converts to immutable `PoolSlice` which is stored in `InferenceEvent`
+- **Automatic Reclamation**: When `PoolSlice` is dropped (disruptor slot overwritten), `Drop` impl advances read cursor to free space
+- **Single-threaded**: Despite using `Arc`, all pool operations happen on one IO thread. Uses `Relaxed` atomic ordering
+- **Cache Locality**: Pool size critically affects performance. Small pools (~8-32 MB) are 2.5x faster than current 2GB sizing due to cache behavior
+
+See PERFORMANCE.md for detailed benchmarks and right-sizing opportunities.
 
 ## Development Notes
 

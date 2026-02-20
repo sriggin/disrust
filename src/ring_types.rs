@@ -33,9 +33,11 @@ impl InferenceEvent {
 }
 
 /// Response sent back from batch processor to IO threads.
+/// Cache-line aligned to prevent false sharing in SPSC ring buffer.
+#[repr(C, align(64))]
 pub struct InferenceResponse {
-    pub conn_id: u32,
     pub request_seq: u64,
+    pub conn_id: u32,
     pub num_vectors: u32,
     pub results: [f32; MAX_VECTORS_PER_REQUEST],
 }
