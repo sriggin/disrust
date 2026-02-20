@@ -1,0 +1,41 @@
+[package]
+name = "disrust"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "disrust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "disrust"
+path = "src/main.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bench]]
+name = "buffer_pool_bench"
+path = "benches/buffer_pool_bench.rs"
+harness = false
+
+[[bench]]
+name = "profile_buffer_pool"
+path = "benches/profile_buffer_pool.rs"
+harness = false
+
+[dependencies]
+disruptor = "3.7.1"
+io-uring = "0.7"
+socket2 = "0.5"
+slab = "0.4"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true
