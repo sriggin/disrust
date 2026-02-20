@@ -6,26 +6,7 @@ const FEATURE_DIM: usize = 128;
 const DEFAULT_POOL_CAPACITY: usize = 65536 * 64 * FEATURE_DIM; // Same as real config
 const ITERATIONS: usize = 10_000_000;
 
-fn bench_size(pool: &std::sync::Arc<disrust::buffer_pool::BufferPool>, size: usize, label: &str) {
-    // Pre-touch all pages to avoid page fault noise
-    let (_, pool_capacity) = pool.utilization();
-    let mut slices = Vec::new();
-    let mut total_touched = 0;
-    while total_touched < pool_capacity {
-        let alloc_size = size.min(pool_capacity - total_touched);
-        if let Ok(mut slice) = pool.alloc(alloc_size) {
-            // Touch every page (4KB = 1024 f32s)
-            for i in (0..alloc_size).step_by(1024) {
-                slice.as_mut_slice()[i] = 1.0;
-            }
-            slices.push(slice.freeze());
-            total_touched += alloc_size;
-        } else {
-            break;
-        }
-    }
-    drop(slices); // Free everything
-
+fn bench_size(pool: &'static BufferPool, size: usize, label: &str) {
     // Warm up
     for _ in 0..10000 {
         let mut slice = pool.alloc(size).unwrap();
@@ -40,7 +21,7 @@ fn bench_size(pool: &std::sync::Arc<disrust::buffer_pool::BufferPool>, size: usi
     // Size ring to use ~50% of pool capacity to allow headroom
     let (_, pool_capacity) = pool.utilization();
     let max_possible = pool_capacity / size; // Max allocations that fit in pool
-    let ring_size = (max_possible / 2).clamp(4, 1024);
+    let ring_size = (max_possible / 2).max(1).min(1024);
     let mut ring: Vec<_> = (0..ring_size)
         .map(|_| pool.alloc(size).unwrap().freeze())
         .collect();
@@ -86,7 +67,7 @@ fn main() {
             524288, 1048576, 2097152,
         ] {
             let capacity = multiplier * FEATURE_DIM;
-            let pool = BufferPool::new(capacity);
+            let pool = BufferPool::leak_new(capacity);
             let size_bytes = capacity * 4;
             let label = if size_bytes < 1024 * 1024 {
                 format!("{} KB pool", size_bytes / 1024)
@@ -97,7 +78,7 @@ fn main() {
         }
     } else if args.len() > 1 && args[1] == "--alloc-sizes" {
         // Benchmark different allocation sizes with fixed pool
-        let pool = BufferPool::new(DEFAULT_POOL_CAPACITY);
+        let pool = BufferPool::leak_new(DEFAULT_POOL_CAPACITY);
         eprintln!(
             "Pool capacity: {} f32s ({} MB)",
             DEFAULT_POOL_CAPACITY,

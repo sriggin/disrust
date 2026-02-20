@@ -16,13 +16,18 @@ pub struct ResponseProducer {
 }
 
 impl ResponseProducer {
-    pub fn send(&mut self, response: &InferenceResponse) {
-        let nv = response.num_vectors as usize;
+    pub fn send(&mut self, response: InferenceResponse) {
+        let InferenceResponse {
+            conn_id,
+            request_seq,
+            num_vectors,
+            results,
+        } = response;
         self.producer.publish(|slot| {
-            slot.conn_id = response.conn_id;
-            slot.request_seq = response.request_seq;
-            slot.num_vectors = response.num_vectors;
-            slot.results[..nv].copy_from_slice(&response.results[..nv]);
+            slot.conn_id = conn_id;
+            slot.request_seq = request_seq;
+            slot.num_vectors = num_vectors;
+            slot.results = results;
         });
     }
 

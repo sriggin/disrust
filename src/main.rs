@@ -1,5 +1,6 @@
 mod batch_processor;
 mod buffer_pool;
+mod constants;
 mod io_thread;
 mod protocol;
 mod response_queue;
@@ -13,9 +14,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use batch_processor::BatchProcessor;
 use buffer_pool::{BufferPool, set_factory_pool};
+use constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use io_thread::IoThread;
 use response_queue::build_response_channel;
-use ring_types::{FEATURE_DIM, InferenceEvent, MAX_VECTORS_PER_REQUEST};
+use ring_types::InferenceEvent;
 
 const DEFAULT_PORT: u16 = 9900;
 const DISRUPTOR_SIZE: usize = 65536;
@@ -29,6 +31,11 @@ const RESPONSE_QUEUE_SIZE: usize = 8192;
 // Real workloads are mostly 1-8 vectors (not 64), so this is very conservative.
 // See PERFORMANCE.md for right-sizing opportunities based on typical workload.
 const BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+
+// Result pool capacity (for responses >INLINE_RESULT_CAPACITY vectors).
+// Tunable based on expected workload. Most responses are inline (≤10 vectors).
+// Min: Enough for a few large responses. Max: All response queue slots at max size.
+const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * 16; // Conservative: ~16 vectors average
 
 fn create_listener(port: u16) -> Socket {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -77,12 +84,23 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    // Safety check: ensure buffer pool capacity is sufficient for worst-case in-flight data
+    // Safety checks: ensure pool capacities are within valid bounds
     const MIN_BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * FEATURE_DIM;
+    const MIN_RESULT_POOL_CAPACITY: usize = MAX_VECTORS_PER_REQUEST * 4; // At least a few large responses
+    const MAX_RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * MAX_VECTORS_PER_REQUEST;
+
     const {
         assert!(
             BUFFER_POOL_CAPACITY >= MIN_BUFFER_POOL_CAPACITY,
             "buffer pool capacity is too small for disruptor size"
+        );
+        assert!(
+            RESULT_POOL_CAPACITY >= MIN_RESULT_POOL_CAPACITY,
+            "result pool capacity is too small"
+        );
+        assert!(
+            RESULT_POOL_CAPACITY <= MAX_RESULT_POOL_CAPACITY,
+            "result pool capacity exceeds maximum needed"
         );
     }
 
@@ -116,10 +134,22 @@ fn main() {
         eventfds.push(efd);
     }
 
+    // Create result buffer pools - one per IO thread (for large responses >INLINE_RESULT_CAPACITY)
+    let result_pools: Vec<&'static BufferPool> = (0..num_threads)
+        .map(|_| BufferPool::leak_new(RESULT_POOL_CAPACITY))
+        .collect();
+
+    eprintln!(
+        "  result pool: {} KB per thread ({} f32s)",
+        RESULT_POOL_CAPACITY * 4 / 1_000,
+        RESULT_POOL_CAPACITY
+    );
+
     // Spawn batch processor thread
     let batch = BatchProcessor {
         poller: request_poller,
         response_producers,
+        result_pools,
     };
     let batch_handle = thread::Builder::new()
         .name("batch-processor".into())

@@ -12,7 +12,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_ITERATIONS);
 
-    let pool = BufferPool::new(POOL_CAPACITY);
+    let pool = BufferPool::leak_new(POOL_CAPACITY);
     let alloc_size = FEATURE_DIM * 8; // 8 vectors
 
     // Warm up

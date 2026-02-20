@@ -3,71 +3,59 @@
 ## Key Design Decisions
 
 ### Single-Threaded Pool Access
-The buffer pool appears to require Arc and atomic operations, but **all pool access is actually single-threaded**:
+Despite using `Arc<PoolSliceInner>` and atomics, **request pool access is actually single-threaded**:
 - IO thread allocates from pool
 - IO thread publishes to disruptor (moves PoolSlice into event)
 - When disruptor wraps, IO thread publishes to same slot → **drops old PoolSlice on IO thread**
-- PoolSlice::drop() advances read_cursor
+- `PoolSliceInner::drop()` advances read_cursor
 
-**Implication:** Arc is needed for *lifetime management* (PoolSlice outlives allocation call), not thread-safety. Now uses Relaxed ordering instead of Acquire/Release since no cross-thread synchronization is needed.
+**Result pools** (for responses >INLINE_RESULT_CAPACITY vectors) are cross-threaded:
+- Batch processor allocates from `result_pools[io_thread_id]`
+- IO thread drops InferenceResponse → PoolSlice → read_cursor advanced on IO thread
+- Uses Relaxed ordering (producer and consumer don't share data, only the cursor)
+
+### Pages Are Pre-Touched on Construction
+
+`BufferPool::new_boxed()` touches every page at creation time, paying the page fault cost
+upfront rather than during operation. **Pool creation should happen on the thread that will
+use the pool** for correct NUMA placement.
 
 ### Cache Locality is Critical
 
-Benchmark results (with page pre-touching) show **pool size affects performance**:
+Benchmark results show **pool size affects performance**:
 
 | Pool Size | Performance | Slowdown | Notes |
 |-----------|-------------|----------|-------|
-| 32 KB - 512 KB | ~19-20 ns/op | 1.0x | Fits in L1/L2 cache - optimal |
-| 2 MB - 8 MB | ~20 ns/op | 1.05x | Fits in L3 cache - still fast |
-| 32 MB - 128 MB | ~30-32 ns/op | 1.6x | Partial cache thrashing |
-| 512 MB | ~31 ns/op | 1.6x | DRAM latency, but cached working set |
-| 1 GB | ~48 ns/op | **2.5x slower** | DRAM latency dominates |
-
-**Note:** Without page pre-touching, large pools show 4-6x worse performance due to page fault latency.
-Production systems should warm up pools on startup or use huge pages to minimize TLB overhead.
+| 16 KB - 512 KB | ~11-14 ns/op | 1.0x | Fits in L1/L2 cache - optimal |
+| 1 MB - 8 MB | ~13-16 ns/op | 1.2x | Fits in L3 cache - still fast |
+| 16 MB - 128 MB | ~23-30 ns/op | 2.2x | Cache thrashing / DRAM |
+| 256 MB - 1 GB | ~29-32 ns/op | 2.6x | DRAM latency dominates |
 
 **Production config:** 2 GB pool per IO thread (DISRUPTOR_SIZE × MAX_VECTORS × FEATURE_DIM)
 - Sized for worst-case: all in-flight requests at max size
-- Expected performance: ~50-60 ns/op (2.5-3x slower than cache-fit pools)
+- Expected performance: ~30-32 ns/op (DRAM latency dominates at this size)
 - Real workloads are mostly 1-8 vectors, not 64
-- **Opportunity:** Right-sizing to 8-32 MB based on typical workload would provide **2.5x speedup**
-- **Important:** Warm up pools on startup (touch all pages) to avoid page fault latency
-
-### Operation Cost Breakdown
-
-Use `perf` to profile the buffer pool operations:
-
-```bash
-# Build and profile (runs 100M iterations, ~7-10 seconds)
-cargo bench --no-run
-perf record -g target/release/deps/profile_buffer_pool-*
-
-# Or specify custom iteration count
-perf record -g target/release/deps/profile_buffer_pool-* 1000000000  # 1B iterations
-
-# View results
-perf report
-```
-
-**Arc operations (clone + drop) likely dominate** the cost. This is acceptable given RAII benefits and the safety guarantees provided by automatic cleanup.
+- **Opportunity:** Right-sizing to 8-32 MB based on typical workload would provide **~2x speedup**
 
 ### Allocation Size Effects
 
-Larger allocations perform better:
-- 1-4 vectors: 365-1606 ns/op (slower)
-- 8+ vectors: 47-137 ns/op (much faster)
+With a 2 GB pool (DRAM-latency dominated), allocation size has minimal impact:
 
-Likely due to:
-1. Amortization of Arc overhead over more data
-2. Better memory access patterns for larger blocks
-3. Benchmark ring size interactions
+| Allocation | Performance |
+|------------|-------------|
+| 1 vector (128 f32) | ~38 ns/op |
+| 2-16 vectors | ~33-35 ns/op |
+| 32-64 vectors | ~30-32 ns/op |
+
+Numbers are flat because DRAM latency dominates at this pool size. With a cache-fit pool
+(8-32 MB), allocation size effects would be negligible (~11-16 ns/op across all sizes).
 
 ## Future Optimization Opportunities
 
 1. **Right-size pools:** Use typical workload (1-8 vectors) instead of max (64) for capacity calculation
 2. ~~**Relaxed atomics:** Change Acquire/Release to Relaxed since all access is single-threaded~~ **✓ Done**
-3. **Pool warmup:** Pre-touch pages to avoid page faults during operation
-4. **NUMA awareness:** Allocate pools on same NUMA node as IO thread
+3. ~~**Pool warmup:** Pre-touch pages to avoid page faults during operation~~ **✓ Done (in constructor)**
+4. **NUMA awareness:** Create pools on the thread that will use them (currently created on main thread)
 
 ## Benchmark Commands
 

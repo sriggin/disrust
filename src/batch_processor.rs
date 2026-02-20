@@ -1,7 +1,9 @@
 use disruptor::{EventPoller, MultiProducerBarrier, Polling};
 
+use crate::buffer_pool::BufferPool;
+use crate::constants::MAX_VECTORS_PER_REQUEST;
 use crate::response_queue::ResponseProducer;
-use crate::ring_types::{InferenceEvent, InferenceResponse};
+use crate::ring_types::{INLINE_RESULT_CAPACITY, InferenceEvent, InferenceResponse};
 
 // Concrete type for the request poller on the batch processor thread.
 pub type ReqPoller = EventPoller<InferenceEvent, MultiProducerBarrier>;
@@ -11,12 +13,14 @@ pub type ReqPoller = EventPoller<InferenceEvent, MultiProducerBarrier>;
 pub struct BatchProcessor {
     pub poller: ReqPoller,
     pub response_producers: Vec<ResponseProducer>,
+    pub result_pools: Vec<&'static BufferPool>,
 }
 
 impl BatchProcessor {
     pub fn run(mut self) {
         let num_threads = self.response_producers.len();
         let mut signaled = vec![false; num_threads];
+        let mut temp_results = [0.0f32; MAX_VECTORS_PER_REQUEST];
 
         loop {
             match self.poller.poll() {
@@ -24,19 +28,31 @@ impl BatchProcessor {
                     signaled.iter_mut().for_each(|s| *s = false);
 
                     for event in &mut guard {
-                        // POC inference: sum each feature vector
-                        let mut response = InferenceResponse::new();
-                        response.conn_id = event.conn_id;
-                        response.request_seq = event.request_seq;
-                        response.num_vectors = event.num_vectors;
+                        let num_vecs = event.num_vectors as usize;
 
-                        for v in 0..event.num_vectors as usize {
+                        // POC inference: sum each feature vector into temp buffer
+                        for (v, result) in temp_results.iter_mut().enumerate().take(num_vecs) {
                             let vector = event.vector(v);
-                            response.results[v] = vector.iter().sum();
+                            *result = vector.iter().sum();
                         }
 
+                        // Create response - automatically chooses inline vs pooled
+                        let pool_ref = if num_vecs > INLINE_RESULT_CAPACITY {
+                            Some(self.result_pools[event.io_thread_id as usize])
+                        } else {
+                            None
+                        };
+
+                        let response = InferenceResponse::with_results(
+                            event.conn_id,
+                            event.request_seq,
+                            &temp_results[..num_vecs],
+                            pool_ref,
+                        )
+                        .expect("failed to create response");
+
                         let thread_id = event.io_thread_id as usize;
-                        self.response_producers[thread_id].send(&response);
+                        self.response_producers[thread_id].send(response);
                         signaled[thread_id] = true;
                     }
 

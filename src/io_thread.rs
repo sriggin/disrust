@@ -6,9 +6,10 @@ use io_uring::{IoUring, opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
 use crate::buffer_pool::BufferPool;
+use crate::constants::FEATURE_DIM;
 use crate::protocol;
 use crate::response_queue::RespPoller;
-use crate::ring_types::{FEATURE_DIM, InferenceEvent};
+use crate::ring_types::InferenceEvent;
 
 // Concrete type for the request producer on IO threads.
 pub type ReqProducer = MultiProducer<InferenceEvent, SingleConsumerBarrier>;

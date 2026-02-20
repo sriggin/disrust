@@ -1,4 +1,4 @@
-use crate::ring_types::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
+use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 
 /// Result of attempting to parse a request from a byte buffer.
 #[allow(dead_code)]

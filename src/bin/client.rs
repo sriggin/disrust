@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
-const FEATURE_DIM: usize = 128;
+use disrust::constants::FEATURE_DIM;
 
 fn build_request(num_vectors: u32) -> (Vec<u8>, Vec<f32>) {
     let mut buf = Vec::new();
