@@ -1,0 +1,20 @@
+services:
+  disrust:
+    build: .
+    security_opt:
+      - seccomp:unconfined
+    ports:
+      - "9900:9900"
+    cpuset: "0,1"     # pin: IO thread + batch processor, both busy-spin
+    mem_limit: 512m
+
+  client:
+    build: .
+    network_mode: "service:disrust"
+    depends_on:
+      - disrust
+    profiles:
+      - client
+    command: ["client"]
+    cpuset: "2,3"     # non-overlapping with server (adjust to VM CPU count)
+    mem_limit: 256m
