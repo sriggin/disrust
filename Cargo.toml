@@ -27,11 +27,15 @@ path = "benches/profile_buffer_pool.rs"
 harness = false
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 disruptor = "3.7.1"
 io-uring = "0.7"
 socket2 = "0.5"
 slab = "0.4"
 libc = "0.2"
+
+[features]
+metrics = []
 
 [profile.release]
 opt-level = 3

@@ -3,16 +3,17 @@
 ## Key Design Decisions
 
 ### Single-Threaded Pool Access
-Despite using `Arc<PoolSliceInner>` and atomics, **request pool access is actually single-threaded**:
+Despite using atomics, **request pool access is actually single-threaded for cursor updates**:
 - IO thread allocates from pool
 - IO thread publishes to disruptor (moves PoolSlice into event)
 - When disruptor wraps, IO thread publishes to same slot → **drops old PoolSlice on IO thread**
-- `PoolSliceInner::drop()` advances read_cursor
+- `PoolSlice::drop()` advances read_cursor
 
-**Result pools** (for responses >INLINE_RESULT_CAPACITY vectors) are cross-threaded:
-- Batch processor allocates from `result_pools[io_thread_id]`
-- IO thread drops InferenceResponse → PoolSlice → read_cursor advanced on IO thread
-- Uses Relaxed ordering (producer and consumer don't share data, only the cursor)
+**Result pools** (for responses >INLINE_RESULT_CAPACITY vectors) are also single-threaded for cursor
+updates: the batch thread allocates and overwrites response slots (which drops old PoolSlice).
+The IO thread only reads the results via `&InferenceResponse`.
+
+**Atomic ordering:** cursors use Acquire/Release to be safe under cross-thread pool usage.
 
 ### Pages Are Pre-Touched on Construction
 
@@ -53,7 +54,7 @@ Numbers are flat because DRAM latency dominates at this pool size. With a cache-
 ## Future Optimization Opportunities
 
 1. **Right-size pools:** Use typical workload (1-8 vectors) instead of max (64) for capacity calculation
-2. ~~**Relaxed atomics:** Change Acquire/Release to Relaxed since all access is single-threaded~~ **✓ Done**
+2. **Relaxed atomics:** Only safe if a pool’s cursor updates are truly single-threaded; otherwise keep Acquire/Release
 3. ~~**Pool warmup:** Pre-touch pages to avoid page faults during operation~~ **✓ Done (in constructor)**
 4. **NUMA awareness:** Create pools on the thread that will use them (currently created on main thread)
 

@@ -1,18 +1,16 @@
 use std::os::unix::io::RawFd;
 use std::ptr;
 
-use disruptor::{MultiProducer, Polling, Producer, SingleConsumerBarrier};
+use disruptor::{Polling, Producer, RingBufferFull, SingleConsumerBarrier, SingleProducer};
 use io_uring::{IoUring, opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
 use crate::buffer_pool::BufferPool;
 use crate::constants::FEATURE_DIM;
+use crate::metrics;
 use crate::protocol;
 use crate::response_queue::RespPoller;
-use crate::ring_types::InferenceEvent;
-
-// Concrete type for the request producer on IO threads.
-pub type ReqProducer = MultiProducer<InferenceEvent, SingleConsumerBarrier>;
+use crate::ring_types::{InferenceEvent, ResultStorage};
 
 /// Encode operation type + connection key into io_uring user_data.
 const OP_ACCEPT: u64 = 0;
@@ -73,7 +71,7 @@ fn push_sqe(ring: &mut IoUring, sqe: &Entry) {
 pub struct IoThread {
     pub thread_id: u16,
     pub listen_fd: RawFd,
-    pub producer: ReqProducer,
+    pub producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     pub response_poller: RespPoller,
     pub eventfd: RawFd,
     pub buffer_pool: &'static BufferPool,
@@ -179,15 +177,27 @@ impl IoThread {
                     };
 
                     protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
-                    let features = pool_slice.freeze();
+                    let mut features = Some(pool_slice.freeze());
 
-                    self.producer.publish(|slot| {
-                        slot.io_thread_id = thread_id;
-                        slot.conn_id = conn_id;
-                        slot.request_seq = seq;
-                        slot.num_vectors = num_vectors;
-                        slot.features = features;
-                    });
+                    loop {
+                        match self.producer.try_publish(|slot| {
+                            slot.io_thread_id = thread_id;
+                            slot.conn_id = conn_id;
+                            slot.request_seq = seq;
+                            slot.num_vectors = num_vectors;
+                            slot.features =
+                                features.take().expect("features already moved into ring");
+                        }) {
+                            Ok(_) => {
+                                metrics::inc_req_occ();
+                                break;
+                            }
+                            Err(RingBufferFull) => {
+                                metrics::inc_req_ring_full();
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
 
                     consumed += bytes_consumed;
                 }
@@ -262,6 +272,10 @@ impl IoThread {
                             submit_write(ring, conns, resp.conn_id);
                         }
                     }
+                    if let ResultStorage::Pooled(slice) = &resp.results {
+                        slice.release();
+                    }
+                    metrics::dec_resp_occ();
                 }
             }
             Err(Polling::NoEvents) => {}

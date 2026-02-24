@@ -2,6 +2,7 @@ mod batch_processor;
 mod buffer_pool;
 mod constants;
 mod io_thread;
+mod metrics;
 mod protocol;
 mod response_queue;
 mod ring_types;
@@ -9,8 +10,17 @@ mod ring_types;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::thread;
 
-use disruptor::{BusySpin, build_multi_producer};
+use clap::Parser;
+use disruptor::{BusySpin, build_single_producer};
 use socket2::{Domain, Protocol, Socket, Type};
+
+#[derive(Parser)]
+#[command(about = "High-performance io_uring inference server")]
+struct Args {
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 9900)]
+    port: u16,
+}
 
 use batch_processor::BatchProcessor;
 use buffer_pool::{BufferPool, set_factory_pool};
@@ -19,7 +29,6 @@ use io_thread::IoThread;
 use response_queue::build_response_channel;
 use ring_types::InferenceEvent;
 
-const DEFAULT_PORT: u16 = 9900;
 const DISRUPTOR_SIZE: usize = 65536;
 const RESPONSE_QUEUE_SIZE: usize = 8192;
 
@@ -69,24 +78,13 @@ fn create_eventfd() -> RawFd {
 }
 
 fn main() {
-    let num_threads: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let n = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            (n - 1).max(1)
-        });
-
-    let port: u16 = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    metrics::spawn_reporter();
+    let args = Args::parse();
+    let port = args.port;
 
     // Safety checks: ensure pool capacities are within valid bounds
     const MIN_BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * FEATURE_DIM;
-    const MIN_RESULT_POOL_CAPACITY: usize = MAX_VECTORS_PER_REQUEST * 4; // At least a few large responses
+    const MIN_RESULT_POOL_CAPACITY: usize = MAX_VECTORS_PER_REQUEST * 4;
     const MAX_RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * MAX_VECTORS_PER_REQUEST;
 
     const {
@@ -104,43 +102,35 @@ fn main() {
         );
     }
 
-    eprintln!("disrust: {} IO threads, port {}", num_threads, port);
+    eprintln!("disrust: 1 IO thread, port {}", port);
     eprintln!(
-        "  buffer pool: {} MB per thread ({} f32s)",
+        "  buffer pool: {} MB ({} f32s)",
         BUFFER_POOL_CAPACITY * 4 / 1_000_000,
         BUFFER_POOL_CAPACITY
     );
 
     // Factory needs a pool for empty slices created during ring initialization.
-    let factory_pool = BufferPool::leak_new(1);
+    let factory_pool = BufferPool::new_boxed(1);
     set_factory_pool(factory_pool);
 
-    // Build the request disruptor (MPSC: IO threads → batch processor)
-    let builder = build_multi_producer(DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
+    // Build the request disruptor (SPSC: one IO thread → batch processor).
+    // To support multiple IO threads, switch to build_multi_producer, change
+    // IoThread::producer to MultiProducer (Clone), and BatchProcessor::poller
+    // to EventPoller<InferenceEvent, MultiProducerBarrier>.
+    let builder = build_single_producer(DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
     let (request_poller, builder) = builder.event_poller();
     let producer = builder.build();
 
-    // Build per-IO-thread response channels
-    let mut response_producers = Vec::with_capacity(num_threads);
-    let mut response_pollers = Vec::with_capacity(num_threads);
-    let mut eventfds = Vec::with_capacity(num_threads);
+    // Build response channel for the IO thread
+    let efd = create_eventfd();
+    assert!(efd >= 0, "failed to create eventfd");
+    let (resp_prod, resp_poll) = build_response_channel(RESPONSE_QUEUE_SIZE, efd);
 
-    for _ in 0..num_threads {
-        let efd = create_eventfd();
-        assert!(efd >= 0, "failed to create eventfd");
-        let (resp_prod, resp_poll) = build_response_channel(RESPONSE_QUEUE_SIZE, efd);
-        response_producers.push(resp_prod);
-        response_pollers.push(resp_poll);
-        eventfds.push(efd);
-    }
-
-    // Create result buffer pools - one per IO thread (for large responses >INLINE_RESULT_CAPACITY)
-    let result_pools: Vec<&'static BufferPool> = (0..num_threads)
-        .map(|_| BufferPool::leak_new(RESULT_POOL_CAPACITY))
-        .collect();
+    // Create result buffer pool (for large responses >INLINE_RESULT_CAPACITY vectors)
+    let result_pool = BufferPool::leak_new(RESULT_POOL_CAPACITY);
 
     eprintln!(
-        "  result pool: {} KB per thread ({} f32s)",
+        "  result pool: {} KB ({} f32s)",
         RESULT_POOL_CAPACITY * 4 / 1_000,
         RESULT_POOL_CAPACITY
     );
@@ -148,48 +138,31 @@ fn main() {
     // Spawn batch processor thread
     let batch = BatchProcessor {
         poller: request_poller,
-        response_producers,
-        result_pools,
+        response_producers: vec![resp_prod],
+        result_pools: vec![result_pool],
     };
     let batch_handle = thread::Builder::new()
         .name("batch-processor".into())
         .spawn(move || batch.run())
         .expect("failed to spawn batch processor");
 
-    // Spawn IO threads
-    let mut io_handles = Vec::with_capacity(num_threads);
-    for (i, (response_poller, efd)) in response_pollers
-        .into_iter()
-        .zip(eventfds.into_iter())
-        .enumerate()
-    {
-        let listen_socket = create_listener(port);
-        let listen_fd = listen_socket.into_raw_fd();
-        let buffer_pool = BufferPool::leak_new(BUFFER_POOL_CAPACITY);
-
-        let io = IoThread {
-            thread_id: i as u16,
-            listen_fd,
-            producer: producer.clone(),
-            response_poller,
-            eventfd: efd,
-            buffer_pool,
-        };
-
-        let handle = thread::Builder::new()
-            .name(format!("io-{}", i))
-            .spawn(move || io.run())
-            .expect("failed to spawn IO thread");
-        io_handles.push(handle);
-    }
-
-    // Drop our copy of the producer so only IO threads hold refs
-    drop(producer);
+    // Spawn IO thread
+    let listen_socket = create_listener(port);
+    let io = IoThread {
+        thread_id: 0,
+        listen_fd: listen_socket.into_raw_fd(),
+        producer,
+        response_poller: resp_poll,
+        eventfd: efd,
+        buffer_pool: BufferPool::leak_new(BUFFER_POOL_CAPACITY),
+    };
+    let io_handle = thread::Builder::new()
+        .name("io-0".into())
+        .spawn(move || io.run())
+        .expect("failed to spawn IO thread");
 
     eprintln!("disrust: ready");
 
-    for h in io_handles {
-        let _ = h.join();
-    }
+    let _ = io_handle.join();
     let _ = batch_handle.join();
 }

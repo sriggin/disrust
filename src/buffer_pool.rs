@@ -1,8 +1,10 @@
+use std::cell::UnsafeCell;
 use std::sync::{
     OnceLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use crate::metrics;
 /// Error returned when buffer pool allocation fails.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -19,6 +21,7 @@ pub struct PoolSlice {
     pool: &'static BufferPool,
     data: *const f32,
     len: usize,
+    freed: AtomicBool,
 }
 
 unsafe impl Send for PoolSlice {}
@@ -26,8 +29,8 @@ unsafe impl Sync for PoolSlice {}
 
 impl Drop for PoolSlice {
     fn drop(&mut self) {
-        if self.len > 0 {
-            self.pool.read_cursor.fetch_add(self.len, Ordering::Relaxed);
+        if self.len > 0 && !self.freed.swap(true, Ordering::AcqRel) {
+            self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
         }
     }
 }
@@ -39,6 +42,7 @@ impl PoolSlice {
             pool: factory_pool(),
             data: std::ptr::NonNull::dangling().as_ptr(),
             len: 0,
+            freed: AtomicBool::new(false),
         }
     }
 
@@ -57,6 +61,13 @@ impl PoolSlice {
         let end = start.saturating_add(feature_dim);
         assert!(end <= self.len, "vector index out of bounds");
         unsafe { std::slice::from_raw_parts(self.data.add(start), feature_dim) }
+    }
+
+    /// Release this slice back to the pool early. Safe to call at most once.
+    pub fn release(&self) {
+        if self.len > 0 && !self.freed.swap(true, Ordering::AcqRel) {
+            self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
+        }
     }
 }
 
@@ -79,6 +90,7 @@ impl PoolSliceMut {
             pool: self.pool,
             data: self.data,
             len: self.len,
+            freed: AtomicBool::new(false),
         }
     }
 }
@@ -99,11 +111,14 @@ impl PoolSliceMut {
 ///
 /// See PERFORMANCE.md for detailed benchmarking results and optimization opportunities.
 pub struct BufferPool {
-    data: Box<[f32]>,
+    data: Box<[UnsafeCell<f32>]>,
     capacity: usize,
     write_cursor: AtomicUsize,
     read_cursor: AtomicUsize,
 }
+
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
 
 impl BufferPool {
     /// Create a new buffer pool with capacity for `capacity` f32 values.
@@ -111,11 +126,14 @@ impl BufferPool {
     /// during operation. Should be called on the thread that will use the pool
     /// for correct NUMA placement.
     pub fn new_boxed(capacity: usize) -> Box<Self> {
-        let mut data = vec![0.0f32; capacity].into_boxed_slice();
+        let data: Vec<UnsafeCell<f32>> = (0..capacity).map(|_| UnsafeCell::new(0.0f32)).collect();
+        let data = data.into_boxed_slice();
 
         // Touch every page (4KB = 1024 f32s) to force physical allocation upfront.
         for i in (0..capacity).step_by(1024) {
-            data[i] = 0.0;
+            unsafe {
+                *data[i].get() = 0.0f32;
+            }
         }
 
         Box::new(Self {
@@ -140,6 +158,7 @@ impl BufferPool {
     /// - `AllocError::Exhausted` if pool is full (producer outpacing consumer)
     pub fn alloc(&'static self, len: usize) -> Result<PoolSliceMut, AllocError> {
         if len > self.capacity {
+            metrics::inc_pool_too_large();
             return Err(AllocError::TooLarge {
                 requested: len,
                 capacity: self.capacity,
@@ -147,33 +166,36 @@ impl BufferPool {
         }
 
         // Check if we have space (write cursor can't lap read cursor by more than capacity)
-        let write = self.write_cursor.load(Ordering::Relaxed);
-        let read = self.read_cursor.load(Ordering::Relaxed);
+        let write = self.write_cursor.load(Ordering::Acquire);
+        let read = self.read_cursor.load(Ordering::Acquire);
         let in_use = write.wrapping_sub(read);
 
         if in_use + len > self.capacity {
+            metrics::inc_pool_exhausted();
             return Err(AllocError::Exhausted {
                 in_use,
                 capacity: self.capacity,
             });
         }
+        metrics::update_pool_in_use(in_use + len);
 
         // Allocate
         let offset = write % self.capacity;
         let actual_offset = if offset + len > self.capacity {
             // Would straddle the end, wrap to 0
             self.write_cursor
-                .store(write + (self.capacity - offset) + len, Ordering::Relaxed);
+                .store(write + (self.capacity - offset) + len, Ordering::Release);
             0
         } else {
-            self.write_cursor.store(write + len, Ordering::Relaxed);
+            self.write_cursor.store(write + len, Ordering::Release);
             offset
         };
 
-        let ptr = self.data.as_ptr() as *mut f32;
+        let base = self.data.as_ptr() as *mut f32;
+        let ptr = unsafe { base.add(actual_offset) };
         Ok(PoolSliceMut {
             pool: self,
-            data: unsafe { ptr.add(actual_offset) },
+            data: ptr,
             len,
         })
     }
@@ -181,21 +203,25 @@ impl BufferPool {
     /// Get current pool utilization for debugging.
     #[allow(dead_code)]
     pub fn utilization(&self) -> (usize, usize) {
-        let write = self.write_cursor.load(Ordering::Relaxed);
-        let read = self.read_cursor.load(Ordering::Relaxed);
+        let write = self.write_cursor.load(Ordering::Acquire);
+        let read = self.read_cursor.load(Ordering::Acquire);
         (write.wrapping_sub(read), self.capacity)
     }
 }
 
-static FACTORY_POOL: OnceLock<&'static BufferPool> = OnceLock::new();
+static FACTORY_POOL: OnceLock<Box<BufferPool>> = OnceLock::new();
 
 /// Set the pool used for factory-created empty slices.
-pub fn set_factory_pool(pool: &'static BufferPool) {
+pub fn set_factory_pool(pool: Box<BufferPool>) -> &'static BufferPool {
     let _ = FACTORY_POOL.set(pool);
+    factory_pool()
 }
 
 fn factory_pool() -> &'static BufferPool {
-    FACTORY_POOL.get().expect("factory pool not initialized")
+    FACTORY_POOL
+        .get()
+        .expect("factory pool not initialized")
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -207,131 +233,175 @@ mod tests {
 
     fn init_factory_pool() {
         INIT_FACTORY_POOL.call_once(|| {
-            let pool = BufferPool::leak_new(1);
+            let pool = BufferPool::new_boxed(1);
             set_factory_pool(pool);
         });
     }
 
+    fn with_pool<F>(capacity: usize, f: F)
+    where
+        F: FnOnce(&'static BufferPool),
+    {
+        let boxed = BufferPool::new_boxed(capacity);
+        let ptr = Box::into_raw(boxed);
+        struct PoolGuard {
+            ptr: *mut BufferPool,
+        }
+        impl Drop for PoolGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    drop(Box::from_raw(self.ptr));
+                }
+            }
+        }
+        let _guard = PoolGuard { ptr };
+        let pool = unsafe { &*ptr };
+        f(pool);
+    }
+
     #[test]
     fn basic_alloc() {
-        let pool = BufferPool::leak_new(1000);
-        let mut m1 = pool.alloc(10).expect("alloc failed");
-        m1.as_mut_slice().fill(1.0);
-        let s1 = m1.freeze();
+        with_pool(1000, |pool| {
+            let mut m1 = pool.alloc(10).expect("alloc failed");
+            m1.as_mut_slice().fill(1.0);
+            let s1 = m1.freeze();
 
-        let mut m2 = pool.alloc(20).expect("alloc failed");
-        m2.as_mut_slice().fill(2.0);
-        let s2 = m2.freeze();
+            let mut m2 = pool.alloc(20).expect("alloc failed");
+            m2.as_mut_slice().fill(2.0);
+            let s2 = m2.freeze();
 
-        assert_eq!(s1.as_slice().len(), 10);
-        assert_eq!(s2.as_slice().len(), 20);
-        assert!(s1.as_slice().iter().all(|&x| x == 1.0));
-        assert!(s2.as_slice().iter().all(|&x| x == 2.0));
+            assert_eq!(s1.as_slice().len(), 10);
+            assert_eq!(s2.as_slice().len(), 20);
+            assert!(s1.as_slice().iter().all(|&x| x == 1.0));
+            assert!(s2.as_slice().iter().all(|&x| x == 2.0));
 
-        // Drop handles free automatically
-        drop(s1);
-        drop(s2);
+            // Drop handles free automatically
+            drop(s1);
+            drop(s2);
+        });
     }
 
     #[test]
     fn wraparound() {
-        let pool = BufferPool::leak_new(100);
-        let s1 = pool.alloc(95).expect("alloc failed").freeze();
-        drop(s1); // Free to make space
+        with_pool(100, |pool| {
+            let s1 = pool.alloc(95).expect("alloc failed").freeze();
+            drop(s1); // Free to make space
 
-        // Next allocation would straddle, should wrap to 0
-        let mut m2 = pool.alloc(10).expect("alloc failed");
-        m2.as_mut_slice().fill(42.0);
-        let s2 = m2.freeze();
+            // Next allocation would straddle, should wrap to 0
+            let mut m2 = pool.alloc(10).expect("alloc failed");
+            m2.as_mut_slice().fill(42.0);
+            let s2 = m2.freeze();
 
-        assert_eq!(s2.as_slice().len(), 10);
-        assert!(s2.as_slice().iter().all(|&x| x == 42.0));
+            assert_eq!(s2.as_slice().len(), 10);
+            assert!(s2.as_slice().iter().all(|&x| x == 42.0));
+        });
     }
 
     #[test]
     fn read_write() {
-        let pool = BufferPool::leak_new(100);
-        let mut mutable = pool.alloc(5).expect("alloc failed");
-        mutable
-            .as_mut_slice()
-            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-        let immutable = mutable.freeze();
+        with_pool(100, |pool| {
+            let mut mutable = pool.alloc(5).expect("alloc failed");
+            mutable
+                .as_mut_slice()
+                .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+            let immutable = mutable.freeze();
 
-        assert_eq!(immutable.as_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
+            assert_eq!(immutable.as_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        });
     }
 
     #[test]
     fn alloc_too_large() {
-        let pool = BufferPool::leak_new(100);
-        let result = pool.alloc(200);
-        assert!(matches!(result, Err(AllocError::TooLarge { .. })));
+        with_pool(100, |pool| {
+            let result = pool.alloc(200);
+            assert!(matches!(result, Err(AllocError::TooLarge { .. })));
+        });
     }
 
     #[test]
     fn exhaustion() {
-        let pool = BufferPool::leak_new(100);
-        let _s1 = pool.alloc(90).expect("alloc failed");
-        // Pool exhausted - can't allocate 20 more
-        let result = pool.alloc(20);
-        assert!(matches!(result, Err(AllocError::Exhausted { .. })));
+        with_pool(100, |pool| {
+            let _s1 = pool.alloc(90).expect("alloc failed");
+            // Pool exhausted - can't allocate 20 more
+            let result = pool.alloc(20);
+            assert!(matches!(result, Err(AllocError::Exhausted { .. })));
+        });
     }
 
     #[test]
     fn alloc_zero_len_is_ok_and_noop() {
-        let pool = BufferPool::leak_new(10);
-        let before = pool.utilization();
-        let mut m = pool.alloc(0).expect("alloc failed");
-        assert_eq!(m.as_mut_slice().len(), 0);
-        drop(m.freeze());
-        let after = pool.utilization();
-        assert_eq!(before, after);
+        with_pool(10, |pool| {
+            let before = pool.utilization();
+            let mut m = pool.alloc(0).expect("alloc failed");
+            assert_eq!(m.as_mut_slice().len(), 0);
+            drop(m.freeze());
+            let after = pool.utilization();
+            assert_eq!(before, after);
+        });
     }
 
     #[test]
     fn alloc_exact_capacity_then_free_allows_reuse() {
-        let pool = BufferPool::leak_new(8);
-        let s = pool.alloc(8).expect("alloc failed").freeze();
-        assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
-        drop(s);
-        assert!(pool.alloc(1).is_ok());
+        with_pool(8, |pool| {
+            let s = pool.alloc(8).expect("alloc failed").freeze();
+            assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
+            drop(s);
+            assert!(pool.alloc(1).is_ok());
+        });
     }
 
     #[test]
     fn exhaustion_then_reuse_after_drop() {
-        let pool = BufferPool::leak_new(100);
-        let s1 = pool.alloc(95).expect("alloc failed").freeze();
-        assert!(matches!(pool.alloc(10), Err(AllocError::Exhausted { .. })));
-        drop(s1);
-        assert!(pool.alloc(10).is_ok());
+        with_pool(100, |pool| {
+            let s1 = pool.alloc(95).expect("alloc failed").freeze();
+            assert!(matches!(pool.alloc(10), Err(AllocError::Exhausted { .. })));
+            drop(s1);
+            assert!(pool.alloc(10).is_ok());
+        });
     }
 
     #[test]
     fn utilization_tracks_simple_alloc_and_drop() {
-        let pool = BufferPool::leak_new(50);
-        let s1 = pool.alloc(12).expect("alloc failed").freeze();
-        assert_eq!(pool.utilization(), (12, 50));
-        drop(s1);
-        assert_eq!(pool.utilization(), (0, 50));
+        with_pool(50, |pool| {
+            let s1 = pool.alloc(12).expect("alloc failed").freeze();
+            assert_eq!(pool.utilization(), (12, 50));
+            drop(s1);
+            assert_eq!(pool.utilization(), (0, 50));
+        });
+    }
+
+    #[test]
+    fn release_frees_once() {
+        with_pool(10, |pool| {
+            let s = pool.alloc(10).expect("alloc failed").freeze();
+            assert_eq!(pool.utilization(), (10, 10));
+            s.release();
+            assert_eq!(pool.utilization(), (0, 10));
+            drop(s);
+            assert_eq!(pool.utilization(), (0, 10));
+        });
     }
 
     #[test]
     fn vector_access_returns_expected_slice() {
-        let pool = BufferPool::leak_new(32);
-        let mut m = pool.alloc(8).expect("alloc failed");
-        m.as_mut_slice()
-            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
-        let s = m.freeze();
+        with_pool(32, |pool| {
+            let mut m = pool.alloc(8).expect("alloc failed");
+            m.as_mut_slice()
+                .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+            let s = m.freeze();
 
-        assert_eq!(s.vector(0, 4), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(s.vector(1, 4), &[10.0, 20.0, 30.0, 40.0]);
+            assert_eq!(s.vector(0, 4), &[1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(s.vector(1, 4), &[10.0, 20.0, 30.0, 40.0]);
+        });
     }
 
     #[test]
     #[should_panic]
     fn vector_access_out_of_bounds_panics() {
-        let pool = BufferPool::leak_new(8);
-        let s = pool.alloc(4).expect("alloc failed").freeze();
-        let _ = s.vector(1, 4);
+        with_pool(8, |pool| {
+            let s = pool.alloc(4).expect("alloc failed").freeze();
+            let _ = s.vector(1, 4);
+        });
     }
 
     #[test]
@@ -343,18 +413,18 @@ mod tests {
 
     #[test]
     fn wrap_like_behavior_still_allows_allocation() {
-        let pool = BufferPool::leak_new(10);
-        let s1 = pool.alloc(7).expect("alloc failed").freeze();
-        drop(s1);
-        // This may require wrap internally, but from the API view it should succeed.
-        let s2 = pool.alloc(7).expect("alloc failed").freeze();
-        assert_eq!(s2.as_slice().len(), 7);
+        with_pool(10, |pool| {
+            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+            drop(s1);
+            // This may require wrap internally, but from the API view it should succeed.
+            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            assert_eq!(s2.as_slice().len(), 7);
+        });
     }
 
     #[test]
     fn alloc_too_large_error_includes_requested_and_capacity() {
-        let pool = BufferPool::leak_new(5);
-        match pool.alloc(6) {
+        with_pool(5, |pool| match pool.alloc(6) {
             Err(AllocError::TooLarge {
                 requested,
                 capacity,
@@ -364,56 +434,60 @@ mod tests {
             }
             Err(_) => panic!("unexpected error variant"),
             Ok(_) => panic!("expected error"),
-        }
+        });
     }
 
     #[test]
     fn exhausted_error_includes_in_use_and_capacity() {
-        let pool = BufferPool::leak_new(10);
-        let _s1 = pool.alloc(7).expect("alloc failed");
-        let _s2 = pool.alloc(3).expect("alloc failed");
-        match pool.alloc(1) {
-            Err(AllocError::Exhausted { in_use, capacity }) => {
-                assert_eq!(capacity, 10);
-                assert_eq!(in_use, 10);
+        with_pool(10, |pool| {
+            let _s1 = pool.alloc(7).expect("alloc failed");
+            let _s2 = pool.alloc(3).expect("alloc failed");
+            match pool.alloc(1) {
+                Err(AllocError::Exhausted { in_use, capacity }) => {
+                    assert_eq!(capacity, 10);
+                    assert_eq!(in_use, 10);
+                }
+                Err(_) => panic!("unexpected error variant"),
+                Ok(_) => panic!("expected error"),
             }
-            Err(_) => panic!("unexpected error variant"),
-            Ok(_) => panic!("expected error"),
-        }
+        });
     }
 
     #[test]
     fn multiple_allocations_fill_capacity_then_fail() {
-        let pool = BufferPool::leak_new(12);
-        let _a = pool.alloc(5).expect("alloc failed");
-        let _b = pool.alloc(4).expect("alloc failed");
-        let _c = pool.alloc(3).expect("alloc failed");
-        assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
+        with_pool(12, |pool| {
+            let _a = pool.alloc(5).expect("alloc failed");
+            let _b = pool.alloc(4).expect("alloc failed");
+            let _c = pool.alloc(3).expect("alloc failed");
+            assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
+        });
     }
 
     #[test]
     fn reuse_after_partial_drop_allows_additional_allocations() {
-        let pool = BufferPool::leak_new(20);
-        let s1 = pool.alloc(8).expect("alloc failed").freeze();
-        let s2 = pool.alloc(8).expect("alloc failed").freeze();
-        assert!(matches!(pool.alloc(5), Err(AllocError::Exhausted { .. })));
-        drop(s1);
-        assert!(pool.alloc(5).is_ok());
-        drop(s2);
+        with_pool(20, |pool| {
+            let s1 = pool.alloc(8).expect("alloc failed").freeze();
+            let s2 = pool.alloc(8).expect("alloc failed").freeze();
+            assert!(matches!(pool.alloc(5), Err(AllocError::Exhausted { .. })));
+            drop(s1);
+            assert!(pool.alloc(5).is_ok());
+            drop(s2);
+        });
     }
 
     #[test]
     fn freeze_preserves_written_data_across_multiple_allocations() {
-        let pool = BufferPool::leak_new(16);
-        let mut a = pool.alloc(4).expect("alloc failed");
-        a.as_mut_slice().copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-        let sa = a.freeze();
+        with_pool(16, |pool| {
+            let mut a = pool.alloc(4).expect("alloc failed");
+            a.as_mut_slice().copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+            let sa = a.freeze();
 
-        let mut b = pool.alloc(4).expect("alloc failed");
-        b.as_mut_slice().copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
-        let sb = b.freeze();
+            let mut b = pool.alloc(4).expect("alloc failed");
+            b.as_mut_slice().copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+            let sb = b.freeze();
 
-        assert_eq!(sa.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(sb.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
+            assert_eq!(sa.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(sb.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
+        });
     }
 }

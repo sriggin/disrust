@@ -3,6 +3,7 @@ use disruptor::{
     build_single_producer,
 };
 
+use crate::metrics;
 use crate::ring_types::InferenceResponse;
 
 // Concrete types for the response SPSC channel.
@@ -23,12 +24,24 @@ impl ResponseProducer {
             num_vectors,
             results,
         } = response;
-        self.producer.publish(|slot| {
-            slot.conn_id = conn_id;
-            slot.request_seq = request_seq;
-            slot.num_vectors = num_vectors;
-            slot.results = results;
-        });
+        let mut results = Some(results);
+        loop {
+            match self.producer.try_publish(|slot| {
+                slot.conn_id = conn_id;
+                slot.request_seq = request_seq;
+                slot.num_vectors = num_vectors;
+                slot.results = results.take().expect("results already moved into ring");
+            }) {
+                Ok(_) => {
+                    metrics::inc_resp_occ();
+                    break;
+                }
+                Err(_) => {
+                    metrics::inc_resp_ring_full();
+                    std::hint::spin_loop();
+                }
+            }
+        }
     }
 
     /// Signal the IO thread's io_uring via eventfd. Call after sending a batch.

@@ -1,17 +1,18 @@
-use disruptor::{EventPoller, MultiProducerBarrier, Polling};
+use disruptor::{EventPoller, Polling, SingleProducerBarrier};
 
 use crate::buffer_pool::BufferPool;
 use crate::constants::MAX_VECTORS_PER_REQUEST;
 use crate::response_queue::ResponseProducer;
 use crate::ring_types::{INLINE_RESULT_CAPACITY, InferenceEvent, InferenceResponse};
 
-// Concrete type for the request poller on the batch processor thread.
-pub type ReqPoller = EventPoller<InferenceEvent, MultiProducerBarrier>;
-
 /// Batch processor: consumes from the request disruptor, runs inference,
 /// pushes responses to per-IO-thread response channels.
+///
+/// Uses a single-producer disruptor (SPSC with one IO thread).
+/// To support multiple IO threads: switch to build_multi_producer in main.rs,
+/// use SingleProducer -> MultiProducer in IoThread, and MultiProducerBarrier here.
 pub struct BatchProcessor {
-    pub poller: ReqPoller,
+    pub poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
     pub response_producers: Vec<ResponseProducer>,
     pub result_pools: Vec<&'static BufferPool>,
 }
@@ -35,6 +36,7 @@ impl BatchProcessor {
                             let vector = event.vector(v);
                             *result = vector.iter().sum();
                         }
+                        event.features.release();
 
                         // Create response - automatically chooses inline vs pooled
                         let pool_ref = if num_vecs > INLINE_RESULT_CAPACITY {
@@ -54,6 +56,7 @@ impl BatchProcessor {
                         let thread_id = event.io_thread_id as usize;
                         self.response_producers[thread_id].send(response);
                         signaled[thread_id] = true;
+                        crate::metrics::dec_req_occ();
                     }
 
                     // Signal all IO threads that received responses

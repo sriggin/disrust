@@ -2,7 +2,37 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
+use clap::{Parser, Subcommand};
+
 use disrust::constants::FEATURE_DIM;
+
+#[derive(Parser)]
+#[command(about = "Test client for disrust inference server")]
+struct Args {
+    /// Server port
+    #[arg(short, long, default_value_t = 9900)]
+    port: u16,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Send a few requests and verify results (default)
+    Smoke,
+    /// Send 1000 pipelined requests and verify all results
+    Pipeline,
+    /// Benchmark throughput with concurrent pipelined connections
+    Bench {
+        /// Number of concurrent connections
+        #[arg(short, long, default_value_t = 4)]
+        connections: usize,
+        /// Requests per connection
+        #[arg(short, long, default_value_t = 100_000)]
+        requests: usize,
+    },
+}
 
 fn build_request(num_vectors: u32) -> (Vec<u8>, Vec<f32>) {
     let mut buf = Vec::new();
@@ -48,19 +78,16 @@ fn read_response(stream: &mut TcpStream) -> Vec<f32> {
 }
 
 fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(9900);
+    let args = Args::parse();
+    let addr = format!("127.0.0.1:{}", args.port);
 
-    let mode = std::env::args().nth(2).unwrap_or_default();
-
-    let addr = format!("127.0.0.1:{}", port);
-
-    match mode.as_str() {
-        "pipeline" => pipeline_test(&addr),
-        "bench" => bench_test(&addr),
-        _ => smoke_test(&addr),
+    match args.command.unwrap_or(Command::Smoke) {
+        Command::Smoke => smoke_test(&addr),
+        Command::Pipeline => pipeline_test(&addr),
+        Command::Bench {
+            connections,
+            requests,
+        } => bench_test(&addr, connections, requests),
     }
 }
 
@@ -114,7 +141,6 @@ fn pipeline_test(addr: &str) {
     );
     let mut stream = TcpStream::connect(addr).expect("failed to connect");
 
-    // Send all requests without reading
     let mut all_expected = Vec::new();
     for _ in 0..num_requests {
         let (req, expected) = build_request(2);
@@ -122,7 +148,6 @@ fn pipeline_test(addr: &str) {
         all_expected.push(expected);
     }
 
-    // Read all responses
     for (i, expected) in all_expected.iter().enumerate() {
         let results = read_response(&mut stream);
         assert_eq!(results.len(), 2, "request {}: wrong result count", i);
@@ -135,24 +160,13 @@ fn pipeline_test(addr: &str) {
     eprintln!("pipeline test: PASSED ({} requests)", num_requests);
 }
 
-fn bench_test(addr: &str) {
-    let num_connections: usize = std::env::args()
-        .nth(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
-    let requests_per_conn: usize = std::env::args()
-        .nth(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
-
+fn bench_test(addr: &str, num_connections: usize, requests_per_conn: usize) {
     eprintln!(
         "bench: {} connections x {} requests (pipelined) to {}",
         num_connections, requests_per_conn, addr
     );
 
-    // Pre-build the request payload once
     let (req, _) = build_request(1);
-    // Response size: 4-byte header + 1 f32 = 8 bytes
     let response_size: usize = 4 + 4;
 
     let start = Instant::now();
@@ -165,7 +179,6 @@ fn bench_test(addr: &str) {
                 let stream = TcpStream::connect(&addr).expect("failed to connect");
                 stream.set_nodelay(true).unwrap();
 
-                // Split into writer and reader on separate threads
                 let mut writer = stream.try_clone().expect("clone failed");
                 let mut reader = stream;
 
@@ -175,7 +188,6 @@ fn bench_test(addr: &str) {
                     }
                 });
 
-                // Reader: consume all responses
                 let mut resp_buf = vec![0u8; response_size * 1024];
                 let mut total_bytes_needed = requests_per_conn * response_size;
                 while total_bytes_needed > 0 {
