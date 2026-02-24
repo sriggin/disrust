@@ -261,6 +261,11 @@ impl IoThread {
         // Drain all available responses from the disruptor
         match self.response_poller.poll() {
             Ok(mut guard) => {
+                // Append all responses BEFORE submitting any writes.
+                // write_buf may reallocate as data is appended; capturing buf_ptr
+                // (inside submit_write) before all appends are done would leave a
+                // dangling pointer in the SQE once the Vec moves its allocation.
+                let mut write_keys: Vec<u32> = Vec::new();
                 for resp in &mut guard {
                     if let Some(conn) = conns.get_mut(resp.conn_id as usize) {
                         protocol::write_response(
@@ -269,13 +274,18 @@ impl IoThread {
                             resp.results_slice(),
                         );
                         if !conn.write_inflight {
-                            submit_write(ring, conns, resp.conn_id);
+                            write_keys.push(resp.conn_id);
                         }
                     }
                     if let ResultStorage::Pooled(slice) = &resp.results {
                         slice.release();
                     }
                     metrics::dec_resp_occ();
+                }
+                // Responses arrive ordered per connection, so dedup collapses runs.
+                write_keys.dedup();
+                for key in write_keys {
+                    submit_write(ring, conns, key);
                 }
             }
             Err(Polling::NoEvents) => {}

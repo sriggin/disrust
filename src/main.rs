@@ -30,7 +30,7 @@ use response_queue::build_response_channel;
 use ring_types::InferenceEvent;
 
 const DISRUPTOR_SIZE: usize = 65536;
-const RESPONSE_QUEUE_SIZE: usize = 8192;
+const RESPONSE_QUEUE_SIZE: usize = DISRUPTOR_SIZE; // must be >= DISRUPTOR_SIZE to avoid deadlock
 
 // Size each buffer pool to handle all in-flight requests at max size.
 // CRITICAL: Pool must be >= disruptor capacity * max request size to prevent
