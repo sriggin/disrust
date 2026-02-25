@@ -142,7 +142,9 @@ mod imp {
                 let resp_full_d = snap.resp_ring_full.saturating_sub(last_snap.resp_ring_full);
                 let pool_exh_d = snap.pool_exhausted.saturating_sub(last_snap.pool_exhausted);
                 let pool_tl_d = snap.pool_too_large.saturating_sub(last_snap.pool_too_large);
-                let req_pub_d = snap.requests_published.saturating_sub(last_snap.requests_published);
+                let req_pub_d = snap
+                    .requests_published
+                    .saturating_sub(last_snap.requests_published);
                 let resp_sent_d = snap.responses_sent.saturating_sub(last_snap.responses_sent);
                 let poll_ev_d = snap.poll_events.saturating_sub(last_snap.poll_events);
                 let poll_no_d = snap.poll_no_events.saturating_sub(last_snap.poll_no_events);

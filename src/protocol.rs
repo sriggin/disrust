@@ -5,7 +5,7 @@ use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 pub enum ParseResult {
     /// Successfully parsed a request. Contains (num_vectors, total bytes consumed).
     Complete {
-        num_vectors: u32,
+        num_vectors: u8,
         bytes_consumed: usize,
     },
     /// Need more data. Contains minimum bytes still needed.
@@ -21,12 +21,13 @@ pub fn try_parse_request(buf: &[u8]) -> ParseResult {
         return ParseResult::Incomplete(4 - buf.len());
     }
 
-    let num_vectors = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let num_vectors_u32 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
-    if num_vectors == 0 || num_vectors as usize > MAX_VECTORS_PER_REQUEST {
+    if num_vectors_u32 == 0 || num_vectors_u32 as usize > MAX_VECTORS_PER_REQUEST {
         return ParseResult::Error("num_vectors out of range");
     }
 
+    let num_vectors = num_vectors_u32 as u8;
     let payload_size = num_vectors as usize * FEATURE_DIM * 4;
     let total_size = 4 + payload_size;
 
@@ -46,7 +47,7 @@ pub fn try_parse_request(buf: &[u8]) -> ParseResult {
 /// # Safety
 /// Caller must ensure `src` has at least `num_vectors * FEATURE_DIM * 4` bytes
 /// and `dst` has at least `num_vectors * FEATURE_DIM` f32 slots.
-pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u32) {
+pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u8) {
     let count = num_vectors as usize * FEATURE_DIM;
     // SAFETY: f32 and [u8; 4] have the same size, and we're just reinterpreting
     // little-endian bytes as f32. This is safe on little-endian platforms.
@@ -63,9 +64,9 @@ pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u32) {
 }
 
 /// Serialize a response into the write buffer.
-/// Format: [u32 num_vectors] [f32 * num_vectors]
-pub fn write_response(buf: &mut Vec<u8>, num_vectors: u32, results: &[f32]) {
-    buf.extend_from_slice(&num_vectors.to_le_bytes());
+/// Wire format: [u32 num_vectors] [f32 * num_vectors] (u32 for compatibility).
+pub fn write_response(buf: &mut Vec<u8>, num_vectors: u8, results: &[f32]) {
+    buf.extend_from_slice(&(num_vectors as u32).to_le_bytes());
     for &val in &results[..num_vectors as usize] {
         buf.extend_from_slice(&val.to_le_bytes());
     }

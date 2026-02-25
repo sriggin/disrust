@@ -29,6 +29,9 @@ use io_thread::IoThread;
 use response_queue::build_response_channel;
 use ring_types::InferenceEvent;
 
+/// io_thread_id is u8 in InferenceEvent; do not spawn more than this many IO threads.
+const MAX_IO_THREADS: usize = 256;
+
 const DISRUPTOR_SIZE: usize = 65536;
 const RESPONSE_QUEUE_SIZE: usize = DISRUPTOR_SIZE; // must be >= DISRUPTOR_SIZE to avoid deadlock
 
@@ -141,6 +144,11 @@ fn main() {
         response_producers: vec![resp_prod],
         result_pools: vec![result_pool],
     };
+    assert!(
+        batch.response_producers.len() <= MAX_IO_THREADS,
+        "io_thread_id is u8; max {} IO threads",
+        MAX_IO_THREADS
+    );
     let batch_handle = thread::Builder::new()
         .name("batch-processor".into())
         .spawn(move || batch.run())

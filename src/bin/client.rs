@@ -259,7 +259,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
     sorted[i.min(sorted.len() - 1)] as f64 / 1_000.0
 }
 
-fn print_interval(samples: &mut Vec<u64>, elapsed: Duration) {
+fn print_interval(samples: &mut [u64], elapsed: Duration) {
     samples.sort_unstable();
     let n = samples.len();
     let qps = n as f64 / elapsed.as_secs_f64();
@@ -380,7 +380,11 @@ fn sustain_test(
     let n = all_samples.len();
     let elapsed = measure_start.elapsed();
     eprintln!();
-    eprintln!("── summary ({:.1}s, {} requests) ──────────────────────────────────", elapsed.as_secs_f64(), n);
+    eprintln!(
+        "── summary ({:.1}s, {} requests) ──────────────────────────────────",
+        elapsed.as_secs_f64(),
+        n
+    );
     eprintln!("  qps     {:.0}", n as f64 / elapsed.as_secs_f64());
     eprintln!("  p50     {:.1}µs", percentile(&all_samples, 50.0));
     eprintln!("  p95     {:.1}µs", percentile(&all_samples, 95.0));

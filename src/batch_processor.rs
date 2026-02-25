@@ -39,9 +39,18 @@ impl BatchProcessor {
                         }
                         event.features.release();
 
+                        // io_thread_id is u8; batch processor is built with <= 256 producers (see main)
+                        let thread_id = event.io_thread_id as usize;
+                        debug_assert!(
+                            thread_id < self.response_producers.len(),
+                            "io_thread_id {} out of range (max {})",
+                            thread_id,
+                            self.response_producers.len()
+                        );
+
                         // Create response - automatically chooses inline vs pooled
                         let pool_ref = if num_vecs > INLINE_RESULT_CAPACITY {
-                            Some(self.result_pools[event.io_thread_id as usize])
+                            Some(self.result_pools[thread_id])
                         } else {
                             None
                         };
@@ -54,7 +63,6 @@ impl BatchProcessor {
                         )
                         .expect("failed to create response");
 
-                        let thread_id = event.io_thread_id as usize;
                         self.response_producers[thread_id].send(response);
                         signaled[thread_id] = true;
                         crate::metrics::dec_req_occ();

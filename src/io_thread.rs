@@ -18,15 +18,19 @@ const OP_READ: u64 = 1;
 const OP_WRITE: u64 = 2;
 const OP_EVENTFD: u64 = 3;
 
-fn encode_user_data(op: u64, key: u32) -> u64 {
+fn encode_user_data(op: u64, key: u16) -> u64 {
     (op << 32) | key as u64
 }
 
-fn decode_user_data(user_data: u64) -> (u64, u32) {
-    (user_data >> 32, user_data as u32)
+fn decode_user_data(user_data: u64) -> (u64, u16) {
+    (user_data >> 32, user_data as u16)
 }
 
 const READ_BUF_SIZE: usize = 65536;
+
+/// Max concurrent connections per IO thread. Must fit in u16 (conn_id).
+const SLAB_CAPACITY: usize = 4096;
+const _: () = assert!(SLAB_CAPACITY <= u16::MAX as usize, "conn_id is u16");
 
 struct Connection {
     fd: RawFd,
@@ -69,7 +73,7 @@ fn push_sqe(ring: &mut IoUring, sqe: &Entry) {
 }
 
 pub struct IoThread {
-    pub thread_id: u16,
+    pub thread_id: u8,
     pub listen_fd: RawFd,
     pub producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     pub response_poller: RespPoller,
@@ -80,7 +84,7 @@ pub struct IoThread {
 impl IoThread {
     pub fn run(mut self) {
         let mut ring = IoUring::new(4096).expect("failed to create io_uring");
-        let mut conns: Slab<Connection> = Slab::with_capacity(4096);
+        let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut eventfd_buf: u64 = 0;
 
         // Submit initial accept
@@ -116,7 +120,8 @@ impl IoThread {
             let entry = conns.vacant_entry();
             let key = entry.key();
             entry.insert(Connection::new(client_fd));
-            submit_read(ring, conns, key as u32);
+            // key is always < SLAB_CAPACITY, which is asserted to fit in u16
+            submit_read(ring, conns, key as u16);
         }
         submit_accept(ring, self.listen_fd);
     }
@@ -125,7 +130,7 @@ impl IoThread {
         &mut self,
         ring: &mut IoUring,
         conns: &mut Slab<Connection>,
-        key: u32,
+        key: u16,
         result: i32,
     ) {
         let key_usize = key as usize;
@@ -227,7 +232,7 @@ impl IoThread {
         &mut self,
         ring: &mut IoUring,
         conns: &mut Slab<Connection>,
-        key: u32,
+        key: u16,
         result: i32,
     ) {
         let key_usize = key as usize;
@@ -266,7 +271,7 @@ impl IoThread {
                 // write_buf may reallocate as data is appended; capturing buf_ptr
                 // (inside submit_write) before all appends are done would leave a
                 // dangling pointer in the SQE once the Vec moves its allocation.
-                let mut write_keys: Vec<u32> = Vec::new();
+                let mut write_keys: Vec<u16> = Vec::new();
                 for resp in &mut guard {
                     if let Some(conn) = conns.get_mut(resp.conn_id as usize) {
                         protocol::write_response(
@@ -305,7 +310,7 @@ fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     push_sqe(ring, &sqe);
 }
 
-fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u32) {
+fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let conn = &mut conns[key as usize];
     if conn.read_inflight {
         return;
@@ -321,7 +326,7 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u32) {
     push_sqe(ring, &sqe);
 }
 
-fn submit_write(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u32) {
+fn submit_write(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let conn = &mut conns[key as usize];
     if conn.write_inflight {
         return;

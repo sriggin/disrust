@@ -5,27 +5,32 @@ use std::mem::size_of;
 // Calculate inline capacity using const math to fit exactly in 64-byte cache line
 pub const INLINE_RESULT_CAPACITY: usize = {
     const METADATA_SIZE: usize = size_of::<u64>() +   // request_seq
-        size_of::<u32>() +   // conn_id
-        size_of::<u32>(); // num_vectors
+        size_of::<u16>() +   // conn_id
+        size_of::<u8>(); // num_vectors (1..=MAX_VECTORS_PER_REQUEST)
 
     const TARGET_STRUCT_SIZE: usize = 64;
-    const ENUM_BUDGET: usize = TARGET_STRUCT_SIZE - METADATA_SIZE; // 48 bytes
+    const ENUM_BUDGET: usize = TARGET_STRUCT_SIZE - METADATA_SIZE; // 53 bytes
 
     // Enum is max(Inline size, Pooled size) + discriminant
     // Conservatively reserve 8 bytes for discriminant/padding
-    const INLINE_BYTES: usize = ENUM_BUDGET - 8; // 40 bytes
+    const INLINE_BYTES: usize = ENUM_BUDGET - 8; // 45 bytes
 
     INLINE_BYTES / size_of::<f32>()
 };
 
 /// Entry in the disruptor ring buffer. Pre-allocated per slot via factory.
 /// IO threads fill these in the publish closure; batch processor reads them.
+///
+/// Invariants:
+/// - `io_thread_id`: index into batch processor's response_producers/result_pools (u8 → max 256 IO threads).
+/// - `conn_id`: slab key from the IO thread's Slab<Connection> (u16 → slab capacity must be ≤ 65535).
+/// - `num_vectors`: 1..=MAX_VECTORS_PER_REQUEST (u8).
 #[repr(C, align(64))]
 pub struct InferenceEvent {
-    pub io_thread_id: u16,
-    pub conn_id: u32,
+    pub io_thread_id: u8,
+    pub conn_id: u16,
     pub request_seq: u64,
-    pub num_vectors: u32,
+    pub num_vectors: u8,
     pub features: PoolSlice,
 }
 
@@ -62,8 +67,8 @@ pub enum ResultStorage {
 #[repr(C, align(64))]
 pub struct InferenceResponse {
     pub request_seq: u64,
-    pub conn_id: u32,
-    pub num_vectors: u32,
+    pub conn_id: u16,
+    pub num_vectors: u8,
     pub results: ResultStorage,
 }
 
@@ -89,12 +94,17 @@ impl InferenceResponse {
     /// - Small results (≤INLINE_RESULT_CAPACITY): Uses inline storage (zero allocations)
     /// - Large results (>INLINE_RESULT_CAPACITY): Allocates from pool
     pub fn with_results(
-        conn_id: u32,
+        conn_id: u16,
         request_seq: u64,
         results: &[f32],
         pool: Option<&'static BufferPool>,
     ) -> Result<Self, &'static str> {
-        let num_vectors = results.len() as u32;
+        let num_vectors = results.len();
+        assert!(
+            num_vectors <= crate::constants::MAX_VECTORS_PER_REQUEST,
+            "results.len() must be <= MAX_VECTORS_PER_REQUEST"
+        );
+        let num_vectors = num_vectors as u8;
 
         if results.len() <= INLINE_RESULT_CAPACITY {
             // Fast path: inline storage, no pool needed
