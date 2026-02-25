@@ -3,10 +3,18 @@ mod imp {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    // Stall / backpressure (cumulative counts)
     static REQ_RING_FULL: AtomicU64 = AtomicU64::new(0);
     static RESP_RING_FULL: AtomicU64 = AtomicU64::new(0);
     static POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
     static POOL_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+    // Throughput (cumulative)
+    static REQUESTS_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+    static RESPONSES_SENT: AtomicU64 = AtomicU64::new(0);
+    // Batch processor: poll outcomes (stall = NoEvents)
+    static POLL_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static POLL_NO_EVENTS: AtomicU64 = AtomicU64::new(0);
+    // Gauges
     static POOL_MAX_IN_USE: AtomicUsize = AtomicUsize::new(0);
     static REQ_OCC: AtomicUsize = AtomicUsize::new(0);
     static RESP_OCC: AtomicUsize = AtomicUsize::new(0);
@@ -19,6 +27,10 @@ mod imp {
         pub resp_ring_full: u64,
         pub pool_exhausted: u64,
         pub pool_too_large: u64,
+        pub requests_published: u64,
+        pub responses_sent: u64,
+        pub poll_events: u64,
+        pub poll_no_events: u64,
         pub pool_max_in_use: usize,
         pub req_occ: usize,
         pub resp_occ: usize,
@@ -85,12 +97,32 @@ mod imp {
         RESP_OCC.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn inc_requests_published() {
+        REQUESTS_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_responses_sent() {
+        RESPONSES_SENT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_poll_events() {
+        POLL_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_poll_no_events() {
+        POLL_NO_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot() -> MetricsSnapshot {
         MetricsSnapshot {
             req_ring_full: REQ_RING_FULL.load(Ordering::Relaxed),
             resp_ring_full: RESP_RING_FULL.load(Ordering::Relaxed),
             pool_exhausted: POOL_EXHAUSTED.load(Ordering::Relaxed),
             pool_too_large: POOL_TOO_LARGE.load(Ordering::Relaxed),
+            requests_published: REQUESTS_PUBLISHED.load(Ordering::Relaxed),
+            responses_sent: RESPONSES_SENT.load(Ordering::Relaxed),
+            poll_events: POLL_EVENTS.load(Ordering::Relaxed),
+            poll_no_events: POLL_NO_EVENTS.load(Ordering::Relaxed),
             pool_max_in_use: POOL_MAX_IN_USE.load(Ordering::Relaxed),
             req_occ: REQ_OCC.load(Ordering::Relaxed),
             resp_occ: RESP_OCC.load(Ordering::Relaxed),
@@ -100,26 +132,45 @@ mod imp {
     }
 
     pub fn spawn_reporter() {
+        const INTERVAL_SECS: u64 = 10;
         std::thread::spawn(|| {
-            let mut last = Instant::now();
+            let mut last_snap = snapshot();
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_secs(INTERVAL_SECS));
                 let snap = snapshot();
-                let elapsed = last.elapsed().as_secs_f32();
-                last = Instant::now();
-                eprintln!(
-                    "metrics: req_full={} resp_full={} req_occ={} resp_occ={} req_max={} resp_max={} pool_exh={} pool_too_large={} pool_max_in_use={} ({:.1}s)",
-                    snap.req_ring_full,
-                    snap.resp_ring_full,
+                let req_full_d = snap.req_ring_full.saturating_sub(last_snap.req_ring_full);
+                let resp_full_d = snap.resp_ring_full.saturating_sub(last_snap.resp_ring_full);
+                let pool_exh_d = snap.pool_exhausted.saturating_sub(last_snap.pool_exhausted);
+                let pool_tl_d = snap.pool_too_large.saturating_sub(last_snap.pool_too_large);
+                let req_pub_d = snap.requests_published.saturating_sub(last_snap.requests_published);
+                let resp_sent_d = snap.responses_sent.saturating_sub(last_snap.responses_sent);
+                let poll_ev_d = snap.poll_events.saturating_sub(last_snap.poll_events);
+                let poll_no_d = snap.poll_no_events.saturating_sub(last_snap.poll_no_events);
+                let total_poll = poll_ev_d + poll_no_d;
+                let stall_pct = if total_poll > 0 {
+                    100.0 * (poll_no_d as f64 / total_poll as f64)
+                } else {
+                    0.0
+                };
+                println!(
+                    "metrics delta {}s: published={} sent={} | stalls: req_ring_full={} resp_ring_full={} pool_exh={} pool_too_large={} | batch: poll_events={} poll_no_events={} stall_pct={:.1}% | gauges: req_occ={} resp_occ={} req_max={} resp_max={} pool_max_in_use={}",
+                    INTERVAL_SECS,
+                    req_pub_d,
+                    resp_sent_d,
+                    req_full_d,
+                    resp_full_d,
+                    pool_exh_d,
+                    pool_tl_d,
+                    poll_ev_d,
+                    poll_no_d,
+                    stall_pct,
                     snap.req_occ,
                     snap.resp_occ,
                     snap.req_max_occ,
                     snap.resp_max_occ,
-                    snap.pool_exhausted,
-                    snap.pool_too_large,
                     snap.pool_max_in_use,
-                    elapsed,
                 );
+                last_snap = snap;
             }
         });
     }
@@ -134,6 +185,10 @@ mod imp {
         pub resp_ring_full: u64,
         pub pool_exhausted: u64,
         pub pool_too_large: u64,
+        pub requests_published: u64,
+        pub responses_sent: u64,
+        pub poll_events: u64,
+        pub poll_no_events: u64,
         pub pool_max_in_use: usize,
         pub req_occ: usize,
         pub resp_occ: usize,
@@ -150,12 +205,20 @@ mod imp {
     pub fn dec_req_occ() {}
     pub fn inc_resp_occ() {}
     pub fn dec_resp_occ() {}
+    pub fn inc_requests_published() {}
+    pub fn inc_responses_sent() {}
+    pub fn inc_poll_events() {}
+    pub fn inc_poll_no_events() {}
     pub fn snapshot() -> MetricsSnapshot {
         MetricsSnapshot {
             req_ring_full: 0,
             resp_ring_full: 0,
             pool_exhausted: 0,
             pool_too_large: 0,
+            requests_published: 0,
+            responses_sent: 0,
+            poll_events: 0,
+            poll_no_events: 0,
             pool_max_in_use: 0,
             req_occ: 0,
             resp_occ: 0,

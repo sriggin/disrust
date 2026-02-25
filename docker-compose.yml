@@ -6,7 +6,14 @@ services:
     ports:
       - "9900:9900"
     cpuset: "0,1"     # pin: IO thread + batch processor, both busy-spin
-    mem_limit: 512m
+    deploy:
+      resources:
+        reservations:
+          cpus: "2"
+          memory: 512m
+        limits:
+          cpus: "2"
+          memory: 512m
 
   client:
     build: .
@@ -17,4 +24,11 @@ services:
       - client
     command: ["client"]
     cpuset: "2,3"     # non-overlapping with server (adjust to VM CPU count)
-    mem_limit: 256m
+    deploy:
+      resources:
+        reservations:
+          cpus: "2"
+          memory: 256m
+        limits:
+          cpus: "2"
+          memory: 256m

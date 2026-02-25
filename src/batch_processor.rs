@@ -26,6 +26,7 @@ impl BatchProcessor {
         loop {
             match self.poller.poll() {
                 Ok(mut guard) => {
+                    crate::metrics::inc_poll_events();
                     signaled.iter_mut().for_each(|s| *s = false);
 
                     for event in &mut guard {
@@ -67,6 +68,7 @@ impl BatchProcessor {
                     }
                 }
                 Err(Polling::NoEvents) => {
+                    crate::metrics::inc_poll_no_events();
                     std::hint::spin_loop();
                 }
                 Err(Polling::Shutdown) => {

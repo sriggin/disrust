@@ -190,6 +190,7 @@ impl IoThread {
                         }) {
                             Ok(_) => {
                                 metrics::inc_req_occ();
+                                metrics::inc_requests_published();
                                 break;
                             }
                             Err(RingBufferFull) => {
@@ -281,6 +282,7 @@ impl IoThread {
                         slice.release();
                     }
                     metrics::dec_resp_occ();
+                    metrics::inc_responses_sent();
                 }
                 // Responses arrive ordered per connection, so dedup collapses runs.
                 write_keys.dedup();

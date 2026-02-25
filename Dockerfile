@@ -3,7 +3,7 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release && \
+    cargo build --release --features metrics && \
     cp target/release/disrust /disrust && \
     cp target/release/client /client
 

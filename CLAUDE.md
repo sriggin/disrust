@@ -43,7 +43,22 @@ cargo bench --bench buffer_pool_bench -- --pool-sizes
 cargo bench --no-run
 perf record -g target/release/deps/profile_buffer_pool-*
 perf report
+
+# Run with metrics (deltas every 10s to stdout; low-overhead atomics)
+cargo build --release --features metrics
+./target/release/disrust --port 9900
 ```
+
+## Metrics (optional, `--features metrics`)
+
+When built with `--features metrics`, a background thread prints **deltas every 10 seconds to stdout** with minimal overhead (atomic counters only, no locks or allocations in the hot path). Output includes:
+
+- **Throughput:** `published` (requests enqueued to disruptor), `sent` (responses written to clients)
+- **Stalls:** `req_ring_full`, `resp_ring_full`, `pool_exh`, `pool_too_large` (deltas = occurrences in the interval)
+- **Batch processor utilization:** `poll_events` vs `poll_no_events` and `stall_pct` (fraction of poll cycles with no events; high = processor often spinning idle)
+- **Gauges:** current and max in-flight (`req_occ`, `resp_occ`, `req_max`, `resp_max`), `pool_max_in_use`
+
+Use this to spot backpressure, underutilization, or pool exhaustion without paying for a full metrics stack.
 
 ## Architecture Overview
 
