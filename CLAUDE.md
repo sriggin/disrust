@@ -6,164 +6,103 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `disrust` is a high-performance TCP inference server built with Rust, using io_uring for asynchronous I/O and the LMAX disruptor pattern for lock-free inter-thread communication. The server processes fixed-size feature vectors (16 f32 values per vector; see `constants::FEATURE_DIM`) and returns inference results with minimal latency.
 
-## Build and Run Commands
+## Dev Environment
+
+io_uring and SO_REUSEPORT require Linux. On Linux, run `cargo` commands directly. On macOS, prefix every `cargo` command with `docker exec <container>` where `<container>` is the dev container name (randomly assigned by Docker — find it with `docker ps`). The container is started via `docker-compose.yml`.
+
+## Run Commands
 
 ```bash
-# Build release binary
-cargo build --release
-
-# Run server (auto-detects CPU count for IO threads)
+# Start server (default port 9900)
 ./target/release/disrust
+./target/release/disrust --port 9900
 
-# Run server with specific thread count and port
-./target/release/disrust <num_io_threads> <port>
-# Example: ./target/release/disrust 4 9900
+# Run with metrics (deltas every 10s to stdout)
+cargo build --release --features metrics && ./target/release/disrust
 
-# Build and run debug build
-cargo run
-
-# Run client smoke test
+# Client smoke / pipeline / benchmark
 cargo run --bin client
-
-# Run client pipeline test
 cargo run --bin client -- 9900 pipeline
-
-# Run client benchmark
 cargo run --bin client -- 9900 bench <num_connections> <requests_per_conn>
-# Example: cargo run --bin client -- 9900 bench 8 100000
 
-# Run tests (buffer_pool.rs contains tests)
-cargo test
-
-# Run buffer pool benchmarks
+# Benchmarks
 cargo bench --bench buffer_pool_bench -- --alloc-sizes
 cargo bench --bench buffer_pool_bench -- --pool-sizes
-
-# Profile buffer pool with perf (Linux only, runs 100M iterations)
-cargo bench --no-run
-perf record -g target/release/deps/profile_buffer_pool-*
-perf report
-
-# Run with metrics (deltas every 10s to stdout; low-overhead atomics)
-cargo build --release --features metrics
-./target/release/disrust --port 9900
 ```
 
-## Metrics (optional, `--features metrics`)
-
-When built with `--features metrics`, a background thread prints **deltas every 10 seconds to stdout** with minimal overhead (atomic counters only, no locks or allocations in the hot path). Output includes:
-
-- **Throughput:** `published` (requests enqueued to disruptor), `sent` (responses written to clients)
-- **Stalls:** `req_ring_full`, `resp_ring_full`, `pool_exh`, `pool_too_large` (deltas = occurrences in the interval)
-- **Batch processor utilization:** `poll_events` vs `poll_no_events` and `stall_pct` (fraction of poll cycles with no events; high = processor often spinning idle)
-- **Gauges:** current and max in-flight (`req_occ`, `resp_occ`, `req_max`, `resp_max`), `pool_max_in_use`
-
-Use this to spot backpressure, underutilization, or pool exhaustion without paying for a full metrics stack.
-
-## Architecture Overview
+## Architecture
 
 ### Threading Model
 
-The server uses a multi-threaded architecture with clear separation of concerns:
+Currently **1 IO thread + 1 batch processor thread**. The disruptor is SPSC (`build_single_producer`). Expanding to N IO threads requires switching to `build_multi_producer`, making `IoThread::producer` a `MultiProducer` (Clone), and `BatchProcessor::poller` to `EventPoller<InferenceEvent, MultiProducerBarrier>`. Each IO thread already gets a dedicated response channel and `BufferPool`.
 
-- **IO Threads** (N threads, one per CPU core - 1): Handle network I/O using io_uring, parse protocol, publish requests to disruptor, write responses
-- **Batch Processor** (1 thread): Consumes requests from disruptor, runs inference (currently POC: sum of feature vectors), publishes responses back to IO threads
+- **IO Thread**: io_uring event loop — accept, read, write, eventfd. Parses protocol, publishes to request disruptor, writes responses.
+- **Batch Processor**: Busy-spins on request disruptor, runs inference (currently: sum of feature vector — replace in `batch_processor.rs`), publishes responses to per-thread response queues.
 
 ### Communication Flow
 
-1. **Request path** (MPSC): IO threads → Batch processor
-   - Uses multi-producer disruptor (`build_multi_producer`)
-   - IO threads publish `InferenceEvent` to shared ring buffer
-   - Batch processor polls events with busy-spin wait strategy
+1. **Request path** (IO thread → batch processor): IO thread calls `request_flow::process_requests_from_buffer()`, which parses bytes, allocates pool space, and publishes `InferenceEvent` to the SPSC disruptor.
+2. **Response path** (batch processor → IO thread): Batch processor publishes `InferenceResponse` to a per-thread SPSC queue, then calls `signal()` which writes to an `eventfd`. This triggers an `OP_EVENTFD` completion in the IO thread's ring, which drains the response queue and submits writev.
 
-2. **Response path** (SPSC per IO thread): Batch processor → IO thread
-   - Each IO thread has dedicated single-producer response channel
-   - Batch processor writes to per-thread response queue
-   - Uses `eventfd` to wake io_uring when responses are ready
+### io_uring Wrapper
 
-### Key Design Patterns
+`io_thread.rs` defines a local `IoUring` struct (shadows the crate type) that wraps `io_uring::IoUring`. The rest of the file interacts only with the local wrapper:
+- `push(&mut self, sqe: &Entry)` — submits an SQE, flushing the SQ to the kernel if full
+- `wait(&mut self, n: usize)` — `submit_and_wait`
+- `drain_cqes(&mut self) -> Vec<(u64, i32)>` — collects eagerly to release the CQ borrow before any SQE submissions in the same iteration
+- `fd(&self) -> RawFd` — for future `MSG_RING` cross-thread posting
 
-- **io_uring**: All I/O operations (accept, read, write, eventfd) use io_uring submission/completion queues for zero-copy async I/O
-- **SO_REUSEPORT**: Multiple IO threads bind to the same port, kernel load-balances incoming connections
-- **Disruptor Pattern**: Lock-free ring buffers with busy-spin for ultra-low latency
-- **Slab Allocator**: Connection state stored in `Slab<Connection>` for efficient allocation/deallocation
-- **Buffer Pool**: Per-thread ring-based buffer pools allocate variable-length feature data. Each IO thread has a dedicated `BufferPool` (sized in config; see PERFORMANCE.md). Features are allocated as `PoolSlice` which automatically returns memory when dropped. Pool size critically affects performance due to cache locality - see PERFORMANCE.md
+Four operations are encoded into the 64-bit `user_data` field (`OP_ACCEPT`, `OP_READ`, `OP_WRITE`, `OP_EVENTFD`) with the connection key in the low 16 bits.
+
+### Connection State
+
+Each `Connection` owns:
+- `read_buf` / `read_len` — accumulates partial reads; compacted after each parse pass
+- `write_headers` / `write_payloads` / `write_segments` — filled per-response before building iovecs
+- `pending_iovecs` — scatter-gather list built by `build_iovecs()` for `Writev`
+- `read_inflight` / `write_inflight` — prevent duplicate SQE submissions
+- `next_request_seq` — per-connection sequence counter
+
+`Connection` has a `Drop` impl that closes the fd. Remove from `Slab` is sufficient to close — no manual `libc::close` needed at call sites.
+
+### Buffer Pool
+
+`BufferPool` is a ring-based arena. Each IO thread holds a `&'static BufferPool` (via `leak_new`). The batch processor holds a separate result pool for large response payloads.
+
+- `alloc(len) -> Result<PoolSliceMut, AllocError>` — advances write cursor; wraps to 0 if allocation would straddle the end
+- `PoolSliceMut::freeze() -> PoolSlice` — makes immutable; stored in `InferenceEvent`
+- `PoolSlice::Drop` — advances read cursor, reclaiming space
+
+Pool size critically affects performance due to cache locality (see PERFORMANCE.md).
+
+### lib/binary Split
+
+`lib.rs` exports everything **except** `io_thread` and `config`. This keeps the library testable without io_uring. Integration tests and benchmarks drive `request_flow` and `response_flow` directly. `io_thread` is compiled only by the binary.
 
 ### Protocol
 
 Wire format is little-endian binary:
 
-**Request**: `[u32 num_vectors][f32 * num_vectors * FEATURE_DIM]`
-- `num_vectors`: 1-64 vectors per request
-- Each vector: 16 f32 values (FEATURE_DIM = 16)
+- **Request**: `[u32 num_vectors][f32 × num_vectors × FEATURE_DIM]`
+- **Response**: `[u8 num_vectors][f32 × num_vectors]`
 
-**Response**: `[u8 num_vectors][f32 * num_vectors]`
-- One f32 result per input vector
+`protocol::try_parse_request()` returns `Complete { num_vectors, bytes_consumed }`, `Incomplete`, or `Error`. Multiple requests may be pipelined; the parse loop in `request_flow` consumes all complete requests per read.
 
 ### Critical Constants
 
-- Sizing and operational values live in the **config** module (`config.rs`): `DISRUPTOR_SIZE`, `RESPONSE_QUEUE_SIZE`, `BUFFER_POOL_CAPACITY`, `RESULT_POOL_CAPACITY`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`.
-- Protocol constants live in **constants** (`constants.rs`): `FEATURE_DIM: 16`, `MAX_VECTORS_PER_REQUEST: 64`.
+- `config.rs`: `DISRUPTOR_SIZE`, `RESPONSE_QUEUE_SIZE`, `BUFFER_POOL_CAPACITY`, `RESULT_POOL_CAPACITY`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`
+- `constants.rs`: `FEATURE_DIM = 16`, `MAX_VECTORS_PER_REQUEST = 64`
 
-## File Organization
+## Metrics (`--features metrics`)
 
-- `main.rs`: Entry point, spawns IO threads and batch processor, creates sockets with SO_REUSEPORT. **The binary is the only io_uring entrypoint;** `io_thread` is not exposed from the library.
-- `io_thread.rs`: IoThread implementation, io_uring event loop, connection management (used only by the binary)
-- `batch_processor.rs`: BatchProcessor implementation, consumes requests and produces responses
-- `protocol.rs`: Wire protocol parsing and serialization (try_parse_request, copy_features, write_response)
-- `ring_types.rs`: Disruptor event types (InferenceEvent, InferenceResponse) and constants
-- `response_queue.rs`: SPSC response channel builder and eventfd signaling
-- `buffer_pool.rs`: Ring-based buffer pool with automatic memory reclamation via `PoolSlice`/`PoolSliceMut` RAII types. Each IO thread has a dedicated pool instance
-- `bin/client.rs`: Test client with smoke test, pipeline test, and benchmark modes
+Background thread prints deltas every 10s:
+- **Throughput**: `published` (to disruptor), `sent` (responses written)
+- **Stalls**: `req_ring_full`, `resp_ring_full`, `pool_exh`, `pool_too_large`
+- **Batch processor**: `poll_events` vs `poll_no_events`, `stall_pct`
+- **Gauges**: `req_occ`, `resp_occ`, `req_max`, `resp_max`, `pool_max_in_use`
 
-## Important Implementation Details
-
-### io_uring Operations
-
-Four operation types encoded in user_data field:
-- `OP_ACCEPT`: Accept new connections on listen socket
-- `OP_READ`: Read from client connection
-- `OP_WRITE`: Write response to client
-- `OP_EVENTFD`: Read from eventfd (signals responses available)
-
-Use `push_sqe()` helper which handles submission queue full by flushing to kernel.
-
-### Connection State Machine
-
-Each connection tracks:
-- `read_inflight/write_inflight`: Prevent duplicate submissions
-- `read_buf`: Accumulates partial protocol messages
-- `write_buf`: Queues responses for transmission
-- `next_request_seq`: Per-connection sequence number for ordering
-
-### Request Parsing
-
-`protocol::try_parse_request()` returns:
-- `Complete`: Full request parsed, returns num_vectors and bytes_consumed
-- `Incomplete`: Need more data, returns minimum bytes needed
-- `Error`: Protocol violation (num_vectors == 0 or > MAX)
-
-Multiple requests can be pipelined in a single read buffer; parse loop consumes all complete requests, then compacts remaining data.
-
-### Response Signaling
-
-After publishing responses, batch processor calls `response_producers[thread_id].signal()` which writes to eventfd. This wakes io_uring on the IO thread via OP_EVENTFD completion, which then drains the response queue.
-
-### Buffer Pool Memory Management
-
-Each IO thread has a dedicated `Arc<BufferPool>` with ring-based allocation:
-- **Allocation**: IO thread calls `pool.alloc(len)` returning `PoolSliceMut` for writing feature data
-- **Freezing**: `PoolSliceMut::freeze()` converts to immutable `PoolSlice` which is stored in `InferenceEvent`
-- **Automatic Reclamation**: When `PoolSlice` is dropped (disruptor slot overwritten), `Drop` impl advances read cursor to free space
-- **Single-threaded**: Despite using `Arc`, all pool operations happen on one IO thread. Uses `Relaxed` atomic ordering
-- **Cache Locality**: Pool size critically affects performance. Small pools (~8-32 MB) are 2.5x faster than current 2GB sizing due to cache behavior
-
-See PERFORMANCE.md for detailed benchmarks and right-sizing opportunities.
-
-## Development Notes
+## Notes
 
 - Edition 2024 Rust required
-- Release profile uses LTO and single codegen unit for maximum performance
-- The current "inference" is a POC placeholder (sum of feature vector) - replace `batch_processor.rs` logic for real ML models
-- SO_REUSEPORT requires Linux kernel support
-- io_uring requires Linux 5.1+ (use 5.6+ for best stability)
+- Release profile: LTO + single codegen unit
+- io_uring requires Linux 5.1+ (5.6+ recommended)
