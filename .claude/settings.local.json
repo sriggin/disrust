@@ -4,7 +4,14 @@
       "Bash(docker compose:*)",
       "Bash(tail:*)",
       "Bash(docker exec:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebSearch",
+      "WebFetch(domain:ort.pyke.io)",
+      "WebFetch(domain:onnxruntime.ai)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:forums.developer.nvidia.com)"
     ]
   }
 }

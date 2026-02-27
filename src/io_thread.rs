@@ -1,5 +1,5 @@
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::ptr;
 
 use disruptor::{Polling, SingleConsumerBarrier, SingleProducer};
@@ -28,8 +28,7 @@ fn decode_user_data(user_data: u64) -> (u64, u16) {
     (user_data >> 32, user_data as u16)
 }
 
-/// Thin zero-cost wrapper around `IoUring` that centralises submission helpers
-/// and exposes a stable fd handle for future cross-thread `MSG_RING` posting.
+/// Thin zero-cost wrapper around `IoUring` that centralises submission helpers.
 struct IoUring {
     inner: io_uring::IoUring,
 }
@@ -39,11 +38,6 @@ impl IoUring {
         Ok(Self {
             inner: io_uring::IoUring::new(entries)?,
         })
-    }
-
-    /// The underlying ring fd — for future MSG_RING cross-thread posting.
-    fn fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
     }
 
     /// Push an SQE, flushing the submission queue to the kernel if full.
@@ -61,7 +55,9 @@ impl IoUring {
 
     /// Block until at least `n` completions are available.
     fn wait(&mut self, n: usize) {
-        self.inner.submit_and_wait(n).expect("submit_and_wait failed");
+        self.inner
+            .submit_and_wait(n)
+            .expect("submit_and_wait failed");
     }
 
     /// Drain all pending completions into a `(user_data, result)` vec.
@@ -140,7 +136,9 @@ impl Drop for Connection {
         // Return value intentionally ignored: on Linux, close() after EINTR still
         // closes the fd (retrying causes double-close); EIO means flush failed but
         // the fd is gone. Neither case is recoverable or worth panicking over.
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -286,7 +284,8 @@ impl IoThread {
                         let payload_start = conn.write_payloads.len();
                         let results = resp.results_slice();
                         let payload_len = results.len() * 4;
-                        conn.write_payloads.extend_from_slice(f32_slice_as_bytes(results));
+                        conn.write_payloads
+                            .extend_from_slice(f32_slice_as_bytes(results));
                         conn.write_segments
                             .push((header_off, payload_start, payload_len));
                         if !conn.write_inflight {

@@ -182,7 +182,16 @@ impl BufferPool {
         // Allocate
         let offset = write % self.capacity;
         let actual_offset = if offset + len > self.capacity {
-            // Would straddle the end, wrap to 0
+            // Would straddle the end, wrap to 0 only if physical [0, len) is free.
+            // That region is free iff the consumer has freed at least `len` bytes from the
+            // start of the ring, i.e. read >= len (logical).
+            if read < len {
+                metrics::inc_pool_exhausted();
+                return Err(AllocError::Exhausted {
+                    in_use,
+                    capacity: self.capacity,
+                });
+            }
             self.write_cursor
                 .store(write + (self.capacity - offset) + len, Ordering::Release);
             0
@@ -294,6 +303,41 @@ mod tests {
 
             assert_eq!(s2.as_slice().len(), 10);
             assert!(s2.as_slice().iter().all(|&x| x == 42.0));
+        });
+    }
+
+    /// Demonstrates the wraparound bug fix: when alloc would wrap to physical [0, len),
+    /// that region may still be in use (read has not advanced enough). We must not use
+    /// it; instead return Exhausted so the producer gets backpressure.
+    /// Setup: read=9, write=91 (one held slice at physical [9, 91)), then alloc(10)
+    /// would straddle and wrap. With the fix, alloc(10) returns Exhausted and the
+    /// held slice is never corrupted.
+    #[test]
+    fn wraparound_overwrites_in_use_region() {
+        with_pool(100, |pool| {
+            // Free 9 bytes at the start so read = 9.
+            let s_head = pool.alloc(9).expect("alloc failed").freeze();
+            drop(s_head);
+
+            // Allocate 82 bytes at physical [9, 91). Hold this slice.
+            let mut m_mid = pool.alloc(82).expect("alloc failed");
+            m_mid.as_mut_slice().fill(42.0);
+            let slice_mid = m_mid.freeze();
+            // write = 91, read = 9. Next alloc(10) would wrap to [0, 10) but that would
+            // overwrite physical 9 (first element of slice_mid). Fix: return Exhausted.
+
+            let result = pool.alloc(10);
+            assert!(
+                matches!(result, Err(AllocError::Exhausted { .. })),
+                "alloc(10) must return Exhausted when wrap would overwrite in-use [0, len)"
+            );
+
+            // Held slice is unchanged.
+            assert_eq!(
+                slice_mid.as_slice()[0],
+                42.0,
+                "held slice must not be corrupted"
+            );
         });
     }
 

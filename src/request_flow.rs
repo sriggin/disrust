@@ -20,8 +20,9 @@ pub enum ProcessRequestError {
 /// Process all complete requests in `buf`, publishing each to the request ring.
 /// Returns (bytes consumed, number of requests published) on success.
 ///
-/// On parse error or alloc failure, returns `Err` and no further bytes are consumed.
-/// Caller should close the connection or back off.
+/// On parse error or alloc TooLarge, returns `Err` and no further bytes are consumed.
+/// Pool exhaustion is handled by spinning until space is available (backpressure).
+/// Caller should close the connection only on parse error or TooLarge.
 pub fn process_requests_from_buffer(
     buf: &[u8],
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
@@ -44,9 +45,13 @@ pub fn process_requests_from_buffer(
                 *request_seq += 1;
 
                 let feature_count = num_vectors as usize * FEATURE_DIM;
-                let mut pool_slice = pool
-                    .alloc(feature_count)
-                    .map_err(ProcessRequestError::Alloc)?;
+                let mut pool_slice = loop {
+                    match pool.alloc(feature_count) {
+                        Ok(s) => break s,
+                        Err(AllocError::Exhausted { .. }) => std::hint::spin_loop(),
+                        Err(e) => return Err(ProcessRequestError::Alloc(e)),
+                    }
+                };
                 protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
                 let mut features = Some(pool_slice.freeze());
 
