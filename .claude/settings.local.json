@@ -3,7 +3,8 @@
     "allow": [
       "Bash(docker compose:*)",
       "Bash(tail:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "Bash(python3:*)"
     ]
   }
 }

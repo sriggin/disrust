@@ -1,8 +1,9 @@
-use std::os::unix::io::RawFd;
+use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr;
 
 use disruptor::{Polling, SingleConsumerBarrier, SingleProducer};
-use io_uring::{IoUring, opcode, squeue::Entry, types::Fd};
+use io_uring::{opcode, squeue::Entry, types::Fd};
 use libc::iovec;
 use slab::Slab;
 
@@ -25,6 +26,53 @@ fn encode_user_data(op: u64, key: u16) -> u64 {
 
 fn decode_user_data(user_data: u64) -> (u64, u16) {
     (user_data >> 32, user_data as u16)
+}
+
+/// Thin zero-cost wrapper around `IoUring` that centralises submission helpers
+/// and exposes a stable fd handle for future cross-thread `MSG_RING` posting.
+struct IoUring {
+    inner: io_uring::IoUring,
+}
+
+impl IoUring {
+    fn new(entries: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: io_uring::IoUring::new(entries)?,
+        })
+    }
+
+    /// The underlying ring fd — for future MSG_RING cross-thread posting.
+    fn fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
+    }
+
+    /// Push an SQE, flushing the submission queue to the kernel if full.
+    fn push(&mut self, sqe: &Entry) {
+        loop {
+            match unsafe { self.inner.submission().push(sqe) } {
+                Ok(()) => return,
+                Err(_) => {
+                    // SQ full — flush to kernel and retry.
+                    self.inner.submit().expect("submit failed during SQ flush");
+                }
+            }
+        }
+    }
+
+    /// Block until at least `n` completions are available.
+    fn wait(&mut self, n: usize) {
+        self.inner.submit_and_wait(n).expect("submit_and_wait failed");
+    }
+
+    /// Drain all pending completions into a `(user_data, result)` vec.
+    /// Collects eagerly so the borrow on the completion queue is released
+    /// before any SQE submissions happen in the same loop iteration.
+    fn drain_cqes(&mut self) -> Vec<(u64, i32)> {
+        self.inner
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+            .collect()
+    }
 }
 
 struct Connection {
@@ -58,20 +106,48 @@ impl Connection {
             write_inflight: false,
         }
     }
-}
 
-/// Push an SQE, flushing the submission queue if full.
-fn push_sqe(ring: &mut IoUring, sqe: &Entry) {
-    loop {
-        let result = unsafe { ring.submission().push(sqe) };
-        match result {
-            Ok(()) => return,
-            Err(_) => {
-                // SQ full, flush pending submissions to kernel and retry
-                ring.submit().expect("submit failed during SQ flush");
-            }
+    /// Pointer and length for the unfilled tail of the read buffer.
+    /// Safety: read_len is always <= READ_BUF_SIZE by construction.
+    fn read_buf_tail(&mut self) -> (*mut u8, u32) {
+        (
+            unsafe { self.read_buf.as_mut_ptr().add(self.read_len) },
+            (READ_BUF_SIZE - self.read_len) as u32,
+        )
+    }
+
+    /// Rebuild pending_iovecs from write_headers/write_payloads/write_segments.
+    /// Must only be called when write_inflight is false (buffers must not reallocate while in flight).
+    fn build_iovecs(&mut self) {
+        self.pending_iovecs.clear();
+        let hdr = self.write_headers.as_ptr();
+        let pay = self.write_payloads.as_ptr();
+        for &(ho, ps, pl) in &self.write_segments {
+            self.pending_iovecs.push(iovec {
+                iov_base: unsafe { hdr.add(ho) as *mut libc::c_void },
+                iov_len: 1,
+            });
+            self.pending_iovecs.push(iovec {
+                iov_base: unsafe { pay.add(ps) as *mut libc::c_void },
+                iov_len: pl,
+            });
         }
     }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Return value intentionally ignored: on Linux, close() after EINTR still
+        // closes the fd (retrying causes double-close); EIO means flush failed but
+        // the fd is gone. Neither case is recoverable or worth panicking over.
+        unsafe { libc::close(self.fd); }
+    }
+}
+
+/// Reinterpret a slice of f32 as raw little-endian bytes.
+/// Safety: f32 has no padding; any bit pattern is valid; alignment of u8 <= f32.
+fn f32_slice_as_bytes(slice: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) }
 }
 
 pub struct IoThread {
@@ -89,22 +165,14 @@ impl IoThread {
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut eventfd_buf: u64 = 0;
 
-        // Submit initial accept
         submit_accept(&mut ring, self.listen_fd);
-        // Submit eventfd read to wake us when responses arrive
         submit_eventfd_read(&mut ring, self.eventfd, &mut eventfd_buf);
 
         loop {
-            ring.submit_and_wait(1).expect("submit_and_wait failed");
+            ring.wait(1);
 
-            let cqes: Vec<(u64, i32)> = ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result()))
-                .collect();
-
-            for (user_data, result) in cqes {
+            for (user_data, result) in ring.drain_cqes() {
                 let (op, key) = decode_user_data(user_data);
-
                 match op {
                     OP_ACCEPT => self.handle_accept(&mut ring, &mut conns, result),
                     OP_READ => self.handle_read(&mut ring, &mut conns, key, result),
@@ -137,11 +205,7 @@ impl IoThread {
     ) {
         let key_usize = key as usize;
         if result <= 0 {
-            if let Some(conn) = conns.try_remove(key_usize) {
-                unsafe {
-                    libc::close(conn.fd);
-                }
-            }
+            conns.try_remove(key_usize);
             return;
         }
 
@@ -174,10 +238,7 @@ impl IoThread {
                     "io-{}: request flow error ({:?}), closing conn {}",
                     self.thread_id, e, key
                 );
-                let conn = conns.remove(key_usize);
-                unsafe {
-                    libc::close(conn.fd);
-                }
+                conns.remove(key_usize);
                 return;
             }
         }
@@ -194,18 +255,12 @@ impl IoThread {
     ) {
         let key_usize = key as usize;
         if result < 0 {
-            if let Some(conn) = conns.try_remove(key_usize) {
-                unsafe {
-                    libc::close(conn.fd);
-                }
-            }
+            conns.try_remove(key_usize);
             return;
         }
 
-        let _bytes_written = result as usize;
         let conn = &mut conns[key_usize];
         conn.write_inflight = false;
-
         conn.write_headers.clear();
         conn.write_payloads.clear();
         conn.write_segments.clear();
@@ -231,9 +286,7 @@ impl IoThread {
                         let payload_start = conn.write_payloads.len();
                         let results = resp.results_slice();
                         let payload_len = results.len() * 4;
-                        conn.write_payloads.extend_from_slice(unsafe {
-                            std::slice::from_raw_parts(results.as_ptr() as *const u8, payload_len)
-                        });
+                        conn.write_payloads.extend_from_slice(f32_slice_as_bytes(results));
                         conn.write_segments
                             .push((header_off, payload_start, payload_len));
                         if !conn.write_inflight {
@@ -249,19 +302,7 @@ impl IoThread {
                 write_keys.dedup();
                 for key in write_keys {
                     if let Some(conn) = conns.get_mut(key as usize) {
-                        conn.pending_iovecs.clear();
-                        let hdr = conn.write_headers.as_ptr();
-                        let pay = conn.write_payloads.as_ptr();
-                        for &(ho, ps, pl) in &conn.write_segments {
-                            conn.pending_iovecs.push(iovec {
-                                iov_base: unsafe { hdr.add(ho) as *mut libc::c_void },
-                                iov_len: 1,
-                            });
-                            conn.pending_iovecs.push(iovec {
-                                iov_base: unsafe { pay.add(ps) as *mut libc::c_void },
-                                iov_len: pl,
-                            });
-                        }
+                        conn.build_iovecs();
                     }
                     submit_write(ring, conns, key);
                 }
@@ -278,7 +319,7 @@ fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     let sqe = opcode::Accept::new(Fd(listen_fd), ptr::null_mut(), ptr::null_mut())
         .build()
         .user_data(encode_user_data(OP_ACCEPT, 0));
-    push_sqe(ring, &sqe);
+    ring.push(&sqe);
 }
 
 fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
@@ -287,14 +328,12 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
         return;
     }
     conn.read_inflight = true;
-
-    let buf_ptr = unsafe { conn.read_buf.as_mut_ptr().add(conn.read_len) };
-    let buf_len = (READ_BUF_SIZE - conn.read_len) as u32;
+    let (buf_ptr, buf_len) = conn.read_buf_tail();
 
     let sqe = opcode::Read::new(Fd(conn.fd), buf_ptr, buf_len)
         .build()
         .user_data(encode_user_data(OP_READ, key));
-    push_sqe(ring, &sqe);
+    ring.push(&sqe);
 }
 
 fn submit_write(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
@@ -310,12 +349,14 @@ fn submit_write(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let sqe = opcode::Writev::new(Fd(conn.fd), iovecs_ptr, iovecs_len)
         .build()
         .user_data(encode_user_data(OP_WRITE, key));
-    push_sqe(ring, &sqe);
+    ring.push(&sqe);
 }
 
 fn submit_eventfd_read(ring: &mut IoUring, eventfd: RawFd, buf: &mut u64) {
+    // buf as *mut u64 as *mut u8: io_uring Read requires a *mut u8 buffer;
+    // the eventfd kernel ABI always writes exactly 8 bytes (a u64 counter value).
     let sqe = opcode::Read::new(Fd(eventfd), buf as *mut u64 as *mut u8, 8)
         .build()
         .user_data(encode_user_data(OP_EVENTFD, 0));
-    push_sqe(ring, &sqe);
+    ring.push(&sqe);
 }

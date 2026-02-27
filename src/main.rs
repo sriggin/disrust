@@ -38,19 +38,7 @@ fn create_listener(port: u16) -> Socket {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .expect("failed to create socket");
     socket.set_reuse_address(true).unwrap();
-
-    // SO_REUSEPORT via raw setsockopt (not in socket2 API)
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        let optval: libc::c_int = 1;
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &optval as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    socket.set_reuse_port(true).expect("SO_REUSEPORT failed");
 
     socket.set_nonblocking(true).unwrap();
     socket.set_nodelay(true).unwrap();

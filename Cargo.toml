@@ -45,7 +45,7 @@ harness = false
 clap = { version = "4", features = ["derive"] }
 disruptor = "3.7.1"
 io-uring = "0.7"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 slab = "0.4"
 libc = "0.2"
 
