@@ -1,22 +1,19 @@
 //! Benchmark: response path (guard_to_wire_per_conn / guard_to_iovecs_per_conn) without io_uring.
 
+mod common;
+
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::os::unix::io::RawFd;
 
 use disrust::response_flow;
 use disrust::ring_types::InferenceResponse;
-
-fn create_eventfd() -> RawFd {
-    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
-}
 
 fn main() {
     const CAPACITY: usize = 8192;
     const RESPONSES_PER_BATCH: usize = 64;
     const TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
 
     let (mut producer, mut poller) = disrust::response_queue::build_response_channel(CAPACITY, efd);

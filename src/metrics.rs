@@ -55,18 +55,7 @@ mod imp {
     }
 
     pub fn update_pool_in_use(value: usize) {
-        let mut prev = POOL_MAX_IN_USE.load(Ordering::Relaxed);
-        while value > prev {
-            match POOL_MAX_IN_USE.compare_exchange_weak(
-                prev,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(next) => prev = next,
-            }
-        }
+        update_max(&POOL_MAX_IN_USE, value);
     }
 
     fn update_max(target: &AtomicUsize, value: usize) {

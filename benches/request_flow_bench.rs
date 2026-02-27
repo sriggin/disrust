@@ -1,26 +1,18 @@
 //! Benchmark: request path (process_requests_from_buffer) without io_uring.
 
+mod common;
+
 use std::hint::black_box;
 
 use disruptor::{BusySpin, build_single_producer};
 
-use disrust::buffer_pool::{BufferPool, set_factory_pool};
+use disrust::buffer_pool::BufferPool;
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::request_flow;
 use disrust::ring_types::InferenceEvent;
 
-fn init_factory_pool() {
-    let _ = set_factory_pool(BufferPool::new_boxed(1));
-}
-
-fn one_request_bytes(num_vectors: u32) -> Vec<u8> {
-    let mut buf = num_vectors.to_le_bytes().to_vec();
-    buf.resize(4 + num_vectors as usize * FEATURE_DIM * 4, 0u8);
-    buf
-}
-
 fn main() {
-    init_factory_pool();
+    common::init_factory_pool();
 
     const RING_SIZE: usize = 65536;
     const REQUESTS_PER_BATCH: usize = 8;
@@ -32,7 +24,7 @@ fn main() {
     let pool_capacity = RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
 
-    let buf = one_request_bytes(REQUESTS_PER_BATCH as u32);
+    let buf = common::one_request_bytes(REQUESTS_PER_BATCH as u32);
     let mut full_buf = buf.clone();
     for _ in 1..REQUESTS_PER_BATCH {
         full_buf.extend_from_slice(&buf);

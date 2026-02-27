@@ -1,39 +1,19 @@
 //! Full pipeline integration test: request_flow → batch processor → response_flow (no io_uring).
 
-use std::os::unix::io::RawFd;
+mod common;
 
 use disruptor::{BusySpin, build_single_producer};
 
 use disrust::batch_processor::BatchProcessor;
-use disrust::buffer_pool::{BufferPool, set_factory_pool};
+use disrust::buffer_pool::BufferPool;
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::request_flow;
 use disrust::response_flow;
 use disrust::ring_types::InferenceEvent;
 
-fn init_factory_pool() {
-    let _ = set_factory_pool(BufferPool::new_boxed(1));
-}
-
-fn create_eventfd() -> RawFd {
-    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
-}
-
-fn one_request_bytes(num_vectors: u32, feature_values: &[f32]) -> Vec<u8> {
-    assert!(num_vectors as usize * FEATURE_DIM <= feature_values.len());
-    let mut buf = num_vectors.to_le_bytes().to_vec();
-    for val in feature_values
-        .iter()
-        .take(num_vectors as usize * FEATURE_DIM)
-    {
-        buf.extend_from_slice(&val.to_le_bytes());
-    }
-    buf
-}
-
 #[test]
 fn pipeline_request_to_response_end_to_end() {
-    init_factory_pool();
+    common::init_factory_pool();
     const RING_SIZE: usize = 256;
     const RESPONSE_QUEUE_SIZE: usize = 256;
     const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * 16;
@@ -42,7 +22,7 @@ fn pipeline_request_to_response_end_to_end() {
     let (request_poller, builder) = builder.event_poller();
     let mut request_producer = builder.build();
     let request_pool = BufferPool::leak_new(RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM);
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
     let (resp_producer, mut response_poller) =
         disrust::response_queue::build_response_channel(RESPONSE_QUEUE_SIZE, efd);
@@ -61,7 +41,7 @@ fn pipeline_request_to_response_end_to_end() {
     let features: Vec<f32> = (0..num_vectors as usize * FEATURE_DIM)
         .map(|i| (i / FEATURE_DIM + 1) as f32)
         .collect();
-    let buf = one_request_bytes(num_vectors, &features);
+    let buf = common::one_request_bytes(num_vectors, &features);
 
     let result = request_flow::process_requests_from_buffer(
         &buf,
@@ -100,7 +80,7 @@ fn pipeline_request_to_response_end_to_end() {
 
 #[test]
 fn pipeline_multiple_requests_same_conn() {
-    init_factory_pool();
+    common::init_factory_pool();
     const RING_SIZE: usize = 256;
     const RESPONSE_QUEUE_SIZE: usize = 256;
     const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * 16;
@@ -109,7 +89,7 @@ fn pipeline_multiple_requests_same_conn() {
     let (request_poller, builder) = builder.event_poller();
     let mut request_producer = builder.build();
     let request_pool = BufferPool::leak_new(RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM);
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
     let (resp_producer, mut response_poller) =
         disrust::response_queue::build_response_channel(RESPONSE_QUEUE_SIZE, efd);
@@ -124,8 +104,8 @@ fn pipeline_multiple_requests_same_conn() {
     let conn_id = 2u16;
     let thread_id = 0u8;
     let mut request_seq = 0u64;
-    let r1 = one_request_bytes(1, &[1.0f32; FEATURE_DIM]);
-    let r2 = one_request_bytes(1, &[2.0f32; FEATURE_DIM]);
+    let r1 = common::one_request_bytes(1, &[1.0f32; FEATURE_DIM]);
+    let r2 = common::one_request_bytes(1, &[2.0f32; FEATURE_DIM]);
     let mut buf = r1;
     buf.extend_from_slice(&r2);
 

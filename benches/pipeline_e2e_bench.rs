@@ -1,33 +1,20 @@
 //! End-to-end benchmark: request_flow -> batch processor -> response_flow (no io_uring).
 
+mod common;
+
 use std::hint::black_box;
-use std::os::unix::io::RawFd;
 
 use disruptor::{BusySpin, build_single_producer};
 
 use disrust::batch_processor::BatchProcessor;
-use disrust::buffer_pool::{BufferPool, set_factory_pool};
+use disrust::buffer_pool::BufferPool;
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::request_flow;
 use disrust::response_flow;
 use disrust::ring_types::InferenceEvent;
 
-fn init_factory_pool() {
-    let _ = set_factory_pool(BufferPool::new_boxed(1));
-}
-
-fn create_eventfd() -> RawFd {
-    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
-}
-
-fn one_request_bytes(num_vectors: u32) -> Vec<u8> {
-    let mut buf = num_vectors.to_le_bytes().to_vec();
-    buf.resize(4 + num_vectors as usize * FEATURE_DIM * 4, 0u8);
-    buf
-}
-
 fn main() {
-    init_factory_pool();
+    common::init_factory_pool();
 
     const RING_SIZE: usize = 65536;
     const RESPONSE_QUEUE_SIZE: usize = 65536;
@@ -39,7 +26,7 @@ fn main() {
     let mut request_producer = builder.build();
 
     let request_pool = BufferPool::leak_new(RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM);
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
     let (resp_producer, mut response_poller) =
         disrust::response_queue::build_response_channel(RESPONSE_QUEUE_SIZE, efd);
@@ -51,7 +38,7 @@ fn main() {
         result_pools: vec![result_pool],
     };
 
-    let buf = one_request_bytes(REQUESTS_PER_BATCH as u32);
+    let buf = common::one_request_bytes(REQUESTS_PER_BATCH as u32);
     let mut full_buf = buf.clone();
     for _ in 1..REQUESTS_PER_BATCH {
         full_buf.extend_from_slice(&buf);

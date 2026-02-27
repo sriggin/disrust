@@ -1,17 +1,13 @@
 //! Integration test: response path (guard → wire bytes per conn) without io_uring.
 
-use std::os::unix::io::RawFd;
+mod common;
 
 use disrust::response_flow;
 use disrust::ring_types::InferenceResponse;
 
-fn create_eventfd() -> RawFd {
-    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
-}
-
 #[test]
 fn response_flow_guard_to_wire_per_conn_single_response() {
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
 
     let (mut producer, mut poller) = disrust::response_queue::build_response_channel(256, efd);
@@ -41,7 +37,7 @@ fn response_flow_guard_to_wire_per_conn_single_response() {
 
 #[test]
 fn response_flow_guard_to_wire_per_conn_multiple_conns() {
-    let efd = create_eventfd();
+    let efd = common::create_eventfd();
     assert!(efd >= 0);
 
     let (mut producer, mut poller) = disrust::response_queue::build_response_channel(256, efd);
