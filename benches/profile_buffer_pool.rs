@@ -1,9 +1,9 @@
 use disrust::buffer_pool::BufferPool;
+use disrust::constants::FEATURE_DIM;
 use std::env;
 use std::hint::black_box;
 
-const FEATURE_DIM: usize = 128;
-const POOL_CAPACITY: usize = 64 * 1024 * FEATURE_DIM; // 64MB pool
+const POOL_CAPACITY: usize = 64 * 1024 * FEATURE_DIM; // 64MB pool with FEATURE_DIM=16
 const DEFAULT_ITERATIONS: usize = 100_000_000; // 100M iterations ~= 7-10 seconds
 
 fn main() {

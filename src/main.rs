@@ -1,9 +1,12 @@
 mod batch_processor;
 mod buffer_pool;
+mod config;
 mod constants;
 mod io_thread;
 mod metrics;
 mod protocol;
+mod request_flow;
+mod response_flow;
 mod response_queue;
 mod ring_types;
 
@@ -24,30 +27,12 @@ struct Args {
 
 use batch_processor::BatchProcessor;
 use buffer_pool::{BufferPool, set_factory_pool};
-use constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
+use config::{
+    BUFFER_POOL_CAPACITY, DISRUPTOR_SIZE, MAX_IO_THREADS, RESPONSE_QUEUE_SIZE, RESULT_POOL_CAPACITY,
+};
 use io_thread::IoThread;
 use response_queue::build_response_channel;
 use ring_types::InferenceEvent;
-
-/// io_thread_id is u8 in InferenceEvent; do not spawn more than this many IO threads.
-const MAX_IO_THREADS: usize = 256;
-
-const DISRUPTOR_SIZE: usize = 65536;
-const RESPONSE_QUEUE_SIZE: usize = DISRUPTOR_SIZE; // must be >= DISRUPTOR_SIZE to avoid deadlock
-
-// Size each buffer pool to handle all in-flight requests at max size.
-// CRITICAL: Pool must be >= disruptor capacity * max request size to prevent
-// wraparound from overwriting unread data. This is worst-case sizing (conservative).
-//
-// PERFORMANCE NOTE: This creates 2GB pools which will have poor cache behavior.
-// Real workloads are mostly 1-8 vectors (not 64), so this is very conservative.
-// See PERFORMANCE.md for right-sizing opportunities based on typical workload.
-const BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
-
-// Result pool capacity (for responses >INLINE_RESULT_CAPACITY vectors).
-// Tunable based on expected workload. Most responses are inline (≤10 vectors).
-// Min: Enough for a few large responses. Max: All response queue slots at max size.
-const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * 16; // Conservative: ~16 vectors average
 
 fn create_listener(port: u16) -> Socket {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -76,34 +61,18 @@ fn create_listener(port: u16) -> Socket {
     socket
 }
 
-fn create_eventfd() -> RawFd {
-    unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) }
+fn create_eventfd() -> std::io::Result<RawFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
 }
 
 fn main() {
     metrics::spawn_reporter();
     let args = Args::parse();
     let port = args.port;
-
-    // Safety checks: ensure pool capacities are within valid bounds
-    const MIN_BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * FEATURE_DIM;
-    const MIN_RESULT_POOL_CAPACITY: usize = MAX_VECTORS_PER_REQUEST * 4;
-    const MAX_RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * MAX_VECTORS_PER_REQUEST;
-
-    const {
-        assert!(
-            BUFFER_POOL_CAPACITY >= MIN_BUFFER_POOL_CAPACITY,
-            "buffer pool capacity is too small for disruptor size"
-        );
-        assert!(
-            RESULT_POOL_CAPACITY >= MIN_RESULT_POOL_CAPACITY,
-            "result pool capacity is too small"
-        );
-        assert!(
-            RESULT_POOL_CAPACITY <= MAX_RESULT_POOL_CAPACITY,
-            "result pool capacity exceeds maximum needed"
-        );
-    }
 
     eprintln!("disrust: 1 IO thread, port {}", port);
     eprintln!(
@@ -125,8 +94,7 @@ fn main() {
     let producer = builder.build();
 
     // Build response channel for the IO thread
-    let efd = create_eventfd();
-    assert!(efd >= 0, "failed to create eventfd");
+    let efd = create_eventfd().expect("failed to create eventfd");
     let (resp_prod, resp_poll) = build_response_channel(RESPONSE_QUEUE_SIZE, efd);
 
     // Create result buffer pool (for large responses >INLINE_RESULT_CAPACITY vectors)

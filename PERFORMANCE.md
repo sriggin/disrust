@@ -32,7 +32,7 @@ Benchmark results show **pool size affects performance**:
 | 16 MB - 128 MB | ~23-30 ns/op | 2.2x | Cache thrashing / DRAM |
 | 256 MB - 1 GB | ~29-32 ns/op | 2.6x | DRAM latency dominates |
 
-**Production config:** 2 GB pool per IO thread (DISRUPTOR_SIZE × MAX_VECTORS × FEATURE_DIM)
+**Production config:** Pool per IO thread = DISRUPTOR_SIZE × MAX_VECTORS × FEATURE_DIM (see config). With FEATURE_DIM=16 this is much smaller than 2 GB; adjust for your vector dimension.
 - Sized for worst-case: all in-flight requests at max size
 - Expected performance: ~30-32 ns/op (DRAM latency dominates at this size)
 - Real workloads are mostly 1-8 vectors, not 64
@@ -40,11 +40,11 @@ Benchmark results show **pool size affects performance**:
 
 ### Allocation Size Effects
 
-With a 2 GB pool (DRAM-latency dominated), allocation size has minimal impact:
+With a large pool (DRAM-latency dominated), allocation size has minimal impact:
 
 | Allocation | Performance |
 |------------|-------------|
-| 1 vector (128 f32) | ~38 ns/op |
+| 1 vector (16 f32) | ~38 ns/op |
 | 2-16 vectors | ~33-35 ns/op |
 | 32-64 vectors | ~30-32 ns/op |
 

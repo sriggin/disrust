@@ -64,9 +64,11 @@ pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u8) {
 }
 
 /// Serialize a response into the write buffer.
-/// Wire format: [u32 num_vectors] [f32 * num_vectors] (u32 for compatibility).
+/// Wire format: [u8 num_vectors] [f32 * num_vectors].
+/// Kept for tests/reference; IO thread uses iovec/Writev path instead.
+#[allow(dead_code)]
 pub fn write_response(buf: &mut Vec<u8>, num_vectors: u8, results: &[f32]) {
-    buf.extend_from_slice(&(num_vectors as u32).to_le_bytes());
+    buf.push(num_vectors);
     for &val in &results[..num_vectors as usize] {
         buf.extend_from_slice(&val.to_le_bytes());
     }

@@ -73,11 +73,11 @@ fn build_request(num_vectors: u32) -> (Vec<u8>, Vec<f32>) {
 }
 
 fn read_response(stream: &mut TcpStream, expected: u32) -> Vec<f32> {
-    let mut header = [0u8; 4];
+    let mut header = [0u8; 1];
     stream
         .read_exact(&mut header)
         .expect("failed to read response header");
-    let num_vectors = u32::from_le_bytes(header);
+    let num_vectors = header[0] as u32;
 
     assert_eq!(
         num_vectors, expected,

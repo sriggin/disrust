@@ -26,6 +26,21 @@ name = "profile_buffer_pool"
 path = "benches/profile_buffer_pool.rs"
 harness = false
 
+[[bench]]
+name = "request_flow_bench"
+path = "benches/request_flow_bench.rs"
+harness = false
+
+[[bench]]
+name = "response_flow_bench"
+path = "benches/response_flow_bench.rs"
+harness = false
+
+[[bench]]
+name = "pipeline_e2e_bench"
+path = "benches/pipeline_e2e_bench.rs"
+harness = false
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 disruptor = "3.7.1"

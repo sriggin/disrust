@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`disrust` is a high-performance TCP inference server built with Rust, using io_uring for asynchronous I/O and the LMAX disruptor pattern for lock-free inter-thread communication. The server processes fixed-size feature vectors (128 f32 values) and returns inference results with minimal latency.
+`disrust` is a high-performance TCP inference server built with Rust, using io_uring for asynchronous I/O and the LMAX disruptor pattern for lock-free inter-thread communication. The server processes fixed-size feature vectors (16 f32 values per vector; see `constants::FEATURE_DIM`) and returns inference results with minimal latency.
 
 ## Build and Run Commands
 
@@ -87,7 +87,7 @@ The server uses a multi-threaded architecture with clear separation of concerns:
 - **SO_REUSEPORT**: Multiple IO threads bind to the same port, kernel load-balances incoming connections
 - **Disruptor Pattern**: Lock-free ring buffers with busy-spin for ultra-low latency
 - **Slab Allocator**: Connection state stored in `Slab<Connection>` for efficient allocation/deallocation
-- **Buffer Pool**: Per-thread ring-based buffer pools allocate variable-length feature data. Each IO thread has a dedicated `BufferPool` (currently 2GB worst-case sizing, but can be right-sized to 8-32 MB for typical workloads). Features are allocated as `PoolSlice` which automatically returns memory when dropped. Pool size critically affects performance due to cache locality - see PERFORMANCE.md
+- **Buffer Pool**: Per-thread ring-based buffer pools allocate variable-length feature data. Each IO thread has a dedicated `BufferPool` (sized in config; see PERFORMANCE.md). Features are allocated as `PoolSlice` which automatically returns memory when dropped. Pool size critically affects performance due to cache locality - see PERFORMANCE.md
 
 ### Protocol
 
@@ -95,24 +95,20 @@ Wire format is little-endian binary:
 
 **Request**: `[u32 num_vectors][f32 * num_vectors * FEATURE_DIM]`
 - `num_vectors`: 1-64 vectors per request
-- Each vector: 128 f32 values (FEATURE_DIM = 128)
+- Each vector: 16 f32 values (FEATURE_DIM = 16)
 
-**Response**: `[u32 num_vectors][f32 * num_vectors]`
+**Response**: `[u8 num_vectors][f32 * num_vectors]`
 - One f32 result per input vector
 
 ### Critical Constants
 
-- `DISRUPTOR_SIZE: 65536` - Request ring buffer size
-- `RESPONSE_QUEUE_SIZE: 8192` - Per-thread response queue size
-- `FEATURE_DIM: 128` - Fixed feature vector dimension
-- `MAX_VECTORS_PER_REQUEST: 64` - Protocol limit
-- `READ_BUF_SIZE: 65536` - Per-connection read buffer
-- `BUFFER_POOL_CAPACITY: DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM` - Per-thread buffer pool size (~2GB). **Note:** This is worst-case sizing assuming all in-flight requests are at max size. Real workloads are typically 1-8 vectors, so this could be reduced to 8-32 MB for significant performance gains (2.5x speedup due to better cache locality). Minimum: `DISRUPTOR_SIZE * FEATURE_DIM` (~32MB)
+- Sizing and operational values live in the **config** module (`config.rs`): `DISRUPTOR_SIZE`, `RESPONSE_QUEUE_SIZE`, `BUFFER_POOL_CAPACITY`, `RESULT_POOL_CAPACITY`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`.
+- Protocol constants live in **constants** (`constants.rs`): `FEATURE_DIM: 16`, `MAX_VECTORS_PER_REQUEST: 64`.
 
 ## File Organization
 
-- `main.rs`: Entry point, spawns IO threads and batch processor, creates sockets with SO_REUSEPORT
-- `io_thread.rs`: IoThread implementation, io_uring event loop, connection management
+- `main.rs`: Entry point, spawns IO threads and batch processor, creates sockets with SO_REUSEPORT. **The binary is the only io_uring entrypoint;** `io_thread` is not exposed from the library.
+- `io_thread.rs`: IoThread implementation, io_uring event loop, connection management (used only by the binary)
 - `batch_processor.rs`: BatchProcessor implementation, consumes requests and produces responses
 - `protocol.rs`: Wire protocol parsing and serialization (try_parse_request, copy_features, write_response)
 - `ring_types.rs`: Disruptor event types (InferenceEvent, InferenceResponse) and constants

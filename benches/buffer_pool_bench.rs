@@ -1,9 +1,9 @@
 use disrust::buffer_pool::{AllocError, BufferPool};
+use disrust::constants::FEATURE_DIM;
 use std::cell::Cell;
 use std::env;
 use std::hint::black_box;
 
-const FEATURE_DIM: usize = 128;
 const DEFAULT_POOL_CAPACITY: usize = 65536 * 64 * FEATURE_DIM; // Same as real config
 const ITERATIONS: usize = 50_000_000;
 
@@ -16,6 +16,7 @@ struct NonAtomicBufferPool {
 
 struct NonAtomicSlice {
     pool: &'static NonAtomicBufferPool,
+    #[allow(dead_code)]
     data: *const f32,
     len: usize,
 }
@@ -126,7 +127,7 @@ fn bench_size(pool: &'static BufferPool, size: usize, label: &str) {
     // Size ring to use ~50% of pool capacity to allow headroom
     let (_, pool_capacity) = pool.utilization();
     let max_possible = pool_capacity / size; // Max allocations that fit in pool
-    let ring_size = (max_possible / 2).max(1).min(1024);
+    let ring_size = (max_possible / 2).clamp(1, 1024);
     let mut ring: Vec<_> = (0..ring_size)
         .map(|_| pool.alloc(size).unwrap().freeze())
         .collect();
@@ -168,7 +169,7 @@ fn bench_size_nonatomic(pool: &'static NonAtomicBufferPool, size: usize, label: 
 
     let (_, pool_capacity) = pool.utilization();
     let max_possible = pool_capacity / size;
-    let ring_size = (max_possible / 2).max(1).min(1024);
+    let ring_size = (max_possible / 2).clamp(1, 1024);
     let mut ring: Vec<_> = (0..ring_size)
         .map(|_| pool.alloc(size).unwrap().freeze())
         .collect();
@@ -218,7 +219,7 @@ fn main() {
             } else {
                 format!("{} MB pool", size_bytes / (1024 * 1024))
             };
-            bench_size(&pool, alloc_size, &label);
+            bench_size(pool, alloc_size, &label);
         }
     } else if args.len() > 1 && args[1] == "--alloc-sizes" {
         // Benchmark different allocation sizes with fixed pool
@@ -230,13 +231,13 @@ fn main() {
         );
         eprintln!("Benchmarking different allocation sizes\n");
 
-        bench_size(&pool, FEATURE_DIM, "1 vector (128 f32)");
-        bench_size(&pool, FEATURE_DIM * 2, "2 vectors (256 f32)");
-        bench_size(&pool, FEATURE_DIM * 4, "4 vectors (512 f32)");
-        bench_size(&pool, FEATURE_DIM * 8, "8 vectors (1024 f32)");
-        bench_size(&pool, FEATURE_DIM * 16, "16 vectors (2048 f32)");
-        bench_size(&pool, FEATURE_DIM * 32, "32 vectors (4096 f32)");
-        bench_size(&pool, FEATURE_DIM * 64, "64 vectors (8192 f32)");
+        bench_size(pool, FEATURE_DIM, "1 vector (16 f32)");
+        bench_size(pool, FEATURE_DIM * 2, "2 vectors (32 f32)");
+        bench_size(pool, FEATURE_DIM * 4, "4 vectors (64 f32)");
+        bench_size(pool, FEATURE_DIM * 8, "8 vectors (128 f32)");
+        bench_size(pool, FEATURE_DIM * 16, "16 vectors (256 f32)");
+        bench_size(pool, FEATURE_DIM * 32, "32 vectors (512 f32)");
+        bench_size(pool, FEATURE_DIM * 64, "64 vectors (1024 f32)");
     } else if args.len() > 1 && args[1] == "--pool-sizes-nonatomic" {
         let alloc_size = FEATURE_DIM * 8;
         eprintln!(
@@ -256,7 +257,7 @@ fn main() {
             } else {
                 format!("{} MB pool", size_bytes / (1024 * 1024))
             };
-            bench_size_nonatomic(&pool, alloc_size, &label);
+            bench_size_nonatomic(pool, alloc_size, &label);
         }
     } else if args.len() > 1 && args[1] == "--alloc-sizes-nonatomic" {
         let pool = NonAtomicBufferPool::leak_new(DEFAULT_POOL_CAPACITY);
@@ -267,13 +268,13 @@ fn main() {
         );
         eprintln!("Benchmarking different allocation sizes (non-atomic)\n");
 
-        bench_size_nonatomic(&pool, FEATURE_DIM, "1 vector (128 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 2, "2 vectors (256 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 4, "4 vectors (512 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 8, "8 vectors (1024 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 16, "16 vectors (2048 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 32, "32 vectors (4096 f32)");
-        bench_size_nonatomic(&pool, FEATURE_DIM * 64, "64 vectors (8192 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM, "1 vector (16 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 2, "2 vectors (32 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 4, "4 vectors (64 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 8, "8 vectors (128 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 16, "16 vectors (256 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 32, "32 vectors (512 f32)");
+        bench_size_nonatomic(pool, FEATURE_DIM * 64, "64 vectors (1024 f32)");
     } else {
         eprintln!("Usage:");
         eprintln!(

@@ -100,7 +100,7 @@ impl PoolSliceMut {
 ///
 /// # Performance Characteristics
 ///
-/// **Single-threaded access:** Despite using Arc and atomics, all pool operations happen
+/// **Single-threaded access:** Despite using atomics, all pool operations happen
 /// on a single IO thread. Allocations happen on the IO thread, and drops (via PoolSlice)
 /// also happen on the IO thread when the disruptor wraps around. Uses Relaxed ordering
 /// since no cross-thread synchronization is needed.

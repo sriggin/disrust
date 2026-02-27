@@ -88,6 +88,12 @@ const _: () = assert!(
     "Inline capacity should handle typical workloads (1-8 vectors)"
 );
 
+impl Default for InferenceResponse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InferenceResponse {
     /// Create a new response. Automatically chooses inline vs pooled storage.
     ///

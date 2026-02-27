@@ -45,10 +45,13 @@ impl ResponseProducer {
     }
 
     /// Signal the IO thread's io_uring via eventfd. Call after sending a batch.
+    /// Logs to stderr if the write fails (e.g. eventfd closed).
     pub fn signal(&self) {
         let val: u64 = 1;
-        unsafe {
-            libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8);
+        let ret =
+            unsafe { libc::write(self.eventfd, &val as *const u64 as *const libc::c_void, 8) };
+        if ret != 8 {
+            eprintln!("eventfd write failed: {}", std::io::Error::last_os_error());
         }
     }
 }
