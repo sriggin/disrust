@@ -62,13 +62,22 @@ impl BipWriteState {
         self.in_flight_lens.push_back(len);
     }
 
-    /// Call when a write CQE completes; written is the CQE result (bytes written).
+    /// Call when a write CQE completes.
+    /// `written` is the CQE result (actual bytes written by the kernel).
+    /// Consumes exactly `written` bytes from the bip buffer. If the kernel wrote fewer
+    /// than submitted (partial write), the remainder is re-queued at the front so
+    /// submit_write resubmits it on the next iteration.
     fn on_complete(&mut self, written: usize) {
-        let _ = self
+        let submitted = self
             .in_flight_lens
             .pop_front()
             .expect("in-flight queue empty");
         self.reader.consume(written);
+        let remaining = submitted - written;
+        if remaining > 0 {
+            // Partial write: re-queue remainder at front for immediate resubmission.
+            self.in_flight_lens.push_front(remaining);
+        }
     }
 
     fn in_flight_count(&self) -> usize {
@@ -108,14 +117,15 @@ impl IoUring {
             .expect("submit_and_wait failed");
     }
 
-    /// Drain all pending completions into a `(user_data, result)` vec.
+    /// Drain all pending completions into the provided buffer.
     /// Collects eagerly so the borrow on the completion queue is released
     /// before any SQE submissions happen in the same loop iteration.
-    fn drain_cqes(&mut self) -> Vec<(u64, i32)> {
-        self.inner
-            .completion()
-            .map(|cqe| (cqe.user_data(), cqe.result()))
-            .collect()
+    fn drain_cqes_into(&mut self, buf: &mut Vec<(u64, i32)>) {
+        buf.extend(
+            self.inner
+                .completion()
+                .map(|cqe| (cqe.user_data(), cqe.result())),
+        );
     }
 }
 
@@ -193,8 +203,8 @@ struct RunState {
 
 impl RunState {
     /// Process one batch of CQEs.
-    fn process_completions(&mut self, response_poller: &mut RespPoller, cqes: Vec<(u64, i32)>) {
-        for (user_data, result) in cqes {
+    fn process_completions(&mut self, response_poller: &mut RespPoller, cqes: &[(u64, i32)]) {
+        for &(user_data, result) in cqes {
             let (op, key) = decode_user_data(user_data);
             match op {
                 OP_ACCEPT => self.handle_accept(result),
@@ -238,7 +248,9 @@ impl RunState {
                                         // Dispatch write/read/accept CQEs directly — we must not
                                         // poll the disruptor again while holding the guard.
                                         self.ring.wait(1);
-                                        for (ud, res) in self.ring.drain_cqes() {
+                                        let mut inner_cqes: Vec<(u64, i32)> = Vec::new();
+                                        self.ring.drain_cqes_into(&mut inner_cqes);
+                                        for &(ud, res) in &inner_cqes {
                                             let (iop, ikey) = decode_user_data(ud);
                                             match iop {
                                                 OP_ACCEPT => self.handle_accept(res),
@@ -254,7 +266,7 @@ impl RunState {
                                         }
                                     }
                                 }
-                                // Release pool slice in all outcomes: written into bip,
+                                // Release result pool slice in all outcomes: written into bip,
                                 // conn gone before write, or conn gone during wait.
                                 if let ResultStorage::Pooled(slice) = &resp.results {
                                     slice.release();
@@ -263,7 +275,9 @@ impl RunState {
                             write_keys.sort_unstable();
                             write_keys.dedup();
                             for key in write_keys {
-                                submit_write(&mut self.ring, &mut self.conns, key);
+                                if self.conns.contains(key as usize) {
+                                    submit_write(&mut self.ring, &mut self.conns, key);
+                                }
                             }
                         }
                         Err(Polling::NoEvents) => {}
@@ -295,7 +309,9 @@ impl RunState {
         }
 
         let bytes_read = result as usize;
-        let conn = &mut self.conns[key_usize];
+        let Some(conn) = self.conns.get_mut(key_usize) else {
+            return;
+        };
         conn.read_inflight = false;
         conn.read_len += bytes_read;
 
@@ -361,10 +377,12 @@ impl IoThread {
         submit_accept(&mut state.ring, state.listen_fd);
         submit_eventfd_read(&mut state.ring, state.eventfd, &mut state.eventfd_buf);
 
+        let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
         loop {
             state.ring.wait(1);
-            let cqes = state.ring.drain_cqes();
-            state.process_completions(&mut response_poller, cqes);
+            cqe_buf.clear();
+            state.ring.drain_cqes_into(&mut cqe_buf);
+            state.process_completions(&mut response_poller, &cqe_buf);
         }
     }
 }

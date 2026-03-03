@@ -1,3 +1,5 @@
+use std::os::unix::io::RawFd;
+
 use disruptor::{
     BusySpin, EventPoller, Producer, SingleConsumerBarrier, SingleProducer, SingleProducerBarrier,
     build_single_producer,
@@ -13,7 +15,7 @@ pub type RespPoller = EventPoller<InferenceResponse, SingleProducerBarrier>;
 /// Producer half lives on the batch processor thread.
 pub struct ResponseProducer {
     pub producer: RespProducer,
-    pub eventfd: i32,
+    pub eventfd: RawFd,
 }
 
 impl ResponseProducer {
@@ -57,7 +59,7 @@ impl ResponseProducer {
 }
 
 /// Build a matched producer/poller pair for one IO thread's response channel.
-pub fn build_response_channel(capacity: usize, eventfd: i32) -> (ResponseProducer, RespPoller) {
+pub fn build_response_channel(capacity: usize, eventfd: RawFd) -> (ResponseProducer, RespPoller) {
     let builder = build_single_producer(capacity, InferenceResponse::new, BusySpin);
     let (poller, builder) = builder.event_poller();
     let producer = builder.build();

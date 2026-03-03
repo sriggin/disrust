@@ -15,20 +15,36 @@ pub struct BatchProcessor {
     pub poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
     pub response_producers: Vec<ResponseProducer>,
     pub result_pools: Vec<&'static BufferPool>,
+    /// Reusable per-thread signal flags — avoids a heap allocation per poll cycle.
+    signaled: Vec<bool>,
+}
+
+impl BatchProcessor {
+    pub fn new(
+        poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
+        response_producers: Vec<ResponseProducer>,
+        result_pools: Vec<&'static BufferPool>,
+    ) -> Self {
+        let num_threads = response_producers.len();
+        Self {
+            poller,
+            response_producers,
+            result_pools,
+            signaled: vec![false; num_threads],
+        }
+    }
 }
 
 pub type PollCycleResult = Result<(), Polling>;
 
 impl BatchProcessor {
     pub fn process_one_poll_cycle(&mut self) -> PollCycleResult {
-        let num_threads = self.response_producers.len();
-        let mut signaled = vec![false; num_threads];
         let mut temp_results = [0.0f32; MAX_VECTORS_PER_REQUEST];
 
         match self.poller.poll() {
             Ok(mut guard) => {
                 crate::metrics::inc_poll_events();
-                signaled.iter_mut().for_each(|s| *s = false);
+                self.signaled.iter_mut().for_each(|s| *s = false);
 
                 for event in &mut guard {
                     let num_vecs = event.num_vectors as usize;
@@ -67,11 +83,11 @@ impl BatchProcessor {
                     };
 
                     self.response_producers[thread_id].send(response);
-                    signaled[thread_id] = true;
+                    self.signaled[thread_id] = true;
                     crate::metrics::dec_req_occ();
                 }
 
-                for (i, &had_responses) in signaled.iter().enumerate() {
+                for (i, &had_responses) in self.signaled.iter().enumerate() {
                     if had_responses {
                         self.response_producers[i].signal();
                     }

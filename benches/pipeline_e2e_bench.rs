@@ -32,11 +32,7 @@ fn main() {
         disrust::response_queue::build_response_channel(RESPONSE_QUEUE_SIZE, efd);
     let result_pool = BufferPool::leak_new(RESULT_POOL_CAPACITY);
 
-    let mut batch = BatchProcessor {
-        poller: request_poller,
-        response_producers: vec![resp_producer],
-        result_pools: vec![result_pool],
-    };
+    let mut batch = BatchProcessor::new(request_poller, vec![resp_producer], vec![result_pool]);
 
     let buf = common::one_request_bytes(REQUESTS_PER_BATCH as u32);
     let mut full_buf = buf.clone();

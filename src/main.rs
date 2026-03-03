@@ -95,11 +95,7 @@ fn main() {
     );
 
     // Spawn batch processor thread
-    let batch = BatchProcessor {
-        poller: request_poller,
-        response_producers: vec![resp_prod],
-        result_pools: vec![result_pool],
-    };
+    let batch = BatchProcessor::new(request_poller, vec![resp_prod], vec![result_pool]);
     assert!(
         batch.response_producers.len() <= MAX_IO_THREADS,
         "io_thread_id is u8; max {} IO threads",

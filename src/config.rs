@@ -32,8 +32,10 @@ pub const BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST
 
 /// Result pool capacity (for responses > INLINE_RESULT_CAPACITY vectors).
 /// Tunable based on expected workload. Most responses are inline.
-/// Min: enough for a few large responses. Max: all response queue slots at max size.
-pub const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * 16;
+/// Sized to hold one full response queue worth of max-size results,
+/// divided by 4 as a conservative default (most responses are inline,
+/// so the pool rarely needs to hold more than a fraction of queue capacity).
+pub const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * MAX_VECTORS_PER_REQUEST / 4;
 
 // Compile-time sanity checks
 const _: () = assert!(

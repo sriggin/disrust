@@ -29,7 +29,7 @@ unsafe impl Sync for PoolSlice {}
 
 impl Drop for PoolSlice {
     fn drop(&mut self) {
-        if self.len > 0 && !self.freed.swap(true, Ordering::AcqRel) {
+        if self.len > 0 && !self.freed.swap(true, Ordering::Relaxed) {
             self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
         }
     }
@@ -65,7 +65,7 @@ impl PoolSlice {
 
     /// Release this slice back to the pool early. Safe to call at most once.
     pub fn release(&self) {
-        if self.len > 0 && !self.freed.swap(true, Ordering::AcqRel) {
+        if self.len > 0 && !self.freed.swap(true, Ordering::Relaxed) {
             self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
         }
     }
@@ -100,10 +100,9 @@ impl PoolSliceMut {
 ///
 /// # Performance Characteristics
 ///
-/// **Single-threaded access:** Despite using atomics, all pool operations happen
-/// on a single IO thread. Allocations happen on the IO thread, and drops (via PoolSlice)
-/// also happen on the IO thread when the disruptor wraps around. Uses Relaxed ordering
-/// since no cross-thread synchronization is needed.
+/// **Cross-thread access:** `write_cursor` is written only by the IO thread; `read_cursor`
+/// is advanced by the batch processor thread via `PoolSlice::drop` / `release`. The
+/// `Acquire`/`Release` ordering on cursor operations provides the necessary synchronization.
 ///
 /// **Cache locality is critical:** Pool size dramatically impacts performance:
 /// - Small pools (< 8MB): ~21 ns/op - fits in cache
@@ -183,9 +182,9 @@ impl BufferPool {
         let offset = write % self.capacity;
         let actual_offset = if offset + len > self.capacity {
             // Would straddle the end, wrap to 0 only if physical [0, len) is free.
-            // That region is free iff the consumer has freed at least `len` bytes from the
-            // start of the ring, i.e. read >= len (logical).
-            if read < len {
+            // That region is free iff the physical read offset is >= len, i.e. the
+            // consumer has advanced past the first `len` physical slots.
+            if read % self.capacity < len {
                 metrics::inc_pool_exhausted();
                 return Err(AllocError::Exhausted {
                     in_use,
@@ -306,12 +305,6 @@ mod tests {
         });
     }
 
-    /// Demonstrates the wraparound bug fix: when alloc would wrap to physical [0, len),
-    /// that region may still be in use (read has not advanced enough). We must not use
-    /// it; instead return Exhausted so the producer gets backpressure.
-    /// Setup: read=9, write=91 (one held slice at physical [9, 91)), then alloc(10)
-    /// would straddle and wrap. With the fix, alloc(10) returns Exhausted and the
-    /// held slice is never corrupted.
     #[test]
     fn wraparound_overwrites_in_use_region() {
         with_pool(100, |pool| {
@@ -338,6 +331,43 @@ mod tests {
                 42.0,
                 "held slice must not be corrupted"
             );
+            drop(slice_mid);
+        });
+    }
+
+    #[test]
+    fn wraparound_overwrites_in_use_region_multi_lap() {
+        // Exercises the fix to the straddle check: uses read % capacity, not raw read.
+        // After many laps, raw `read` is large; the old `read < len` check would always
+        // pass, allowing an overwrite. The correct check is `read % capacity < len`.
+        with_pool(100, |pool| {
+            // Drive the cursors up by doing many full-capacity alloc+free cycles.
+            // Each cycle advances write and read by 100 (one full lap).
+            for _ in 0..1000 {
+                let s = pool.alloc(100).expect("alloc failed").freeze();
+                drop(s);
+            }
+            // read = write = 100_000. physical offset = 0.
+
+            // Now partially free the start: free 9, leaving read at 100_009, physical read = 9.
+            let s_head = pool.alloc(9).expect("alloc failed").freeze();
+            drop(s_head);
+
+            // Allocate 82 bytes at physical [9, 91). Hold this slice.
+            let mut m_mid = pool.alloc(82).expect("alloc failed");
+            m_mid.as_mut_slice().fill(99.0);
+            let slice_mid = m_mid.freeze();
+
+            // write % 100 = 91, read % 100 = 9.
+            // alloc(10) would straddle: offset 91 + 10 > 100, so it tries to wrap to 0.
+            // Physical read offset is 9, which is < 10, so it must return Exhausted.
+            let result = pool.alloc(10);
+            assert!(
+                matches!(result, Err(AllocError::Exhausted { .. })),
+                "multi-lap: alloc(10) must return Exhausted when physical read offset < len"
+            );
+            assert_eq!(slice_mid.as_slice()[0], 99.0, "held slice corrupted");
+            drop(slice_mid);
         });
     }
 
