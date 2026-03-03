@@ -6,6 +6,7 @@
 
 pub mod batch_processor;
 pub mod buffer_pool;
+pub mod config;
 pub mod constants;
 pub mod metrics;
 pub mod protocol;

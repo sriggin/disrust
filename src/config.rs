@@ -20,6 +20,10 @@ pub const READ_BUF_SIZE: usize = 65536;
 /// Max concurrent connections per IO thread. Must fit in u16 (conn_id).
 pub const SLAB_CAPACITY: usize = 4096;
 
+/// Per-connection write bip buffer capacity (bytes). Queues serialized response bytes
+/// for in-flight writes; sized to absorb a full batch of pipelined responses per connection.
+pub const WRITE_BIP_CAPACITY: usize = 65536;
+
 /// Size each buffer pool to handle all in-flight requests at max size.
 /// CRITICAL: Pool must be >= disruptor capacity * max request size to prevent
 /// wraparound from overwriting unread data. Worst-case sizing (conservative).

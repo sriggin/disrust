@@ -48,6 +48,7 @@ io-uring = "0.7"
 socket2 = { version = "0.5", features = ["all"] }
 slab = "0.4"
 libc = "0.2"
+spsc-bip-buffer = "0.2"
 
 [features]
 metrics = []

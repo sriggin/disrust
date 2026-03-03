@@ -11,7 +11,9 @@
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:docs.nvidia.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:forums.developer.nvidia.com)"
+      "WebFetch(domain:forums.developer.nvidia.com)",
+      "WebFetch(domain:developer.download.nvidia.com)",
+      "Bash(echo Failed:*)"
     ]
   }
 }

@@ -2,13 +2,15 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
+use std::collections::VecDeque;
+
 use disruptor::{Polling, SingleConsumerBarrier, SingleProducer};
 use io_uring::{opcode, squeue::Entry, types::Fd};
-use libc::iovec;
 use slab::Slab;
+use spsc_bip_buffer::bip_buffer_with_len;
 
 use crate::buffer_pool::BufferPool;
-use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY};
+use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY, WRITE_BIP_CAPACITY};
 use crate::metrics;
 use crate::request_flow;
 use crate::response_queue::RespPoller;
@@ -26,6 +28,52 @@ fn encode_user_data(op: u64, key: u16) -> u64 {
 
 fn decode_user_data(user_data: u64) -> (u64, u16) {
     (user_data >> 32, user_data as u16)
+}
+
+/// Max in-flight Write SQEs per connection. Allows pipelining without spinning.
+const MAX_WRITES_IN_FLIGHT_PER_CONN: usize = 4;
+
+/// Wraps the bip reader so we can have multiple writes in flight: we track submitted-but-not-yet-
+/// consumed lengths and expose only the "not yet submitted" suffix of valid().
+struct BipWriteState {
+    reader: spsc_bip_buffer::BipBufferReader,
+    in_flight_lens: VecDeque<usize>,
+}
+
+impl BipWriteState {
+    fn new(reader: spsc_bip_buffer::BipBufferReader) -> Self {
+        Self {
+            reader,
+            in_flight_lens: VecDeque::new(),
+        }
+    }
+
+    /// Bytes available to submit (excluding already-in-flight).
+    fn valid_available(&mut self) -> &[u8] {
+        let skip: usize = self.in_flight_lens.iter().sum();
+        let v = self.reader.valid();
+        if skip >= v.len() {
+            return &[];
+        }
+        &v[skip..]
+    }
+
+    fn submit(&mut self, len: usize) {
+        self.in_flight_lens.push_back(len);
+    }
+
+    /// Call when a write CQE completes; written is the CQE result (bytes written).
+    fn on_complete(&mut self, written: usize) {
+        let _ = self
+            .in_flight_lens
+            .pop_front()
+            .expect("in-flight queue empty");
+        self.reader.consume(written);
+    }
+
+    fn in_flight_count(&self) -> usize {
+        self.in_flight_lens.len()
+    }
 }
 
 /// Thin zero-cost wrapper around `IoUring` that centralises submission helpers.
@@ -75,31 +123,23 @@ struct Connection {
     fd: RawFd,
     read_buf: Box<[u8; READ_BUF_SIZE]>,
     read_len: usize,
-    /// 1-byte header per response (num_vectors). Filled before building iovecs.
-    write_headers: Vec<u8>,
-    /// Raw f32 bytes (LE) for all responses. One bulk copy per response.
-    write_payloads: Vec<u8>,
-    write_segments: Vec<(usize, usize, usize)>,
-    /// Scatter-gather list for Writev: [header_i, payload_i] per response. Built after headers/payloads are filled.
-    pending_iovecs: Vec<iovec>,
+    write_bip_writer: spsc_bip_buffer::BipBufferWriter,
+    write_bip: BipWriteState,
     next_request_seq: u64,
     read_inflight: bool,
-    write_inflight: bool,
 }
 
 impl Connection {
     fn new(fd: RawFd) -> Self {
+        let (write_bip_writer, write_bip_reader) = bip_buffer_with_len(WRITE_BIP_CAPACITY);
         Self {
             fd,
             read_buf: Box::new([0u8; READ_BUF_SIZE]),
             read_len: 0,
-            write_headers: Vec::with_capacity(256),
-            write_payloads: Vec::with_capacity(4096),
-            write_segments: Vec::with_capacity(128),
-            pending_iovecs: Vec::with_capacity(512),
+            write_bip_writer,
+            write_bip: BipWriteState::new(write_bip_reader),
             next_request_seq: 0,
             read_inflight: false,
-            write_inflight: false,
         }
     }
 
@@ -110,24 +150,6 @@ impl Connection {
             unsafe { self.read_buf.as_mut_ptr().add(self.read_len) },
             (READ_BUF_SIZE - self.read_len) as u32,
         )
-    }
-
-    /// Rebuild pending_iovecs from write_headers/write_payloads/write_segments.
-    /// Must only be called when write_inflight is false (buffers must not reallocate while in flight).
-    fn build_iovecs(&mut self) {
-        self.pending_iovecs.clear();
-        let hdr = self.write_headers.as_ptr();
-        let pay = self.write_payloads.as_ptr();
-        for &(ho, ps, pl) in &self.write_segments {
-            self.pending_iovecs.push(iovec {
-                iov_base: unsafe { hdr.add(ho) as *mut libc::c_void },
-                iov_len: 1,
-            });
-            self.pending_iovecs.push(iovec {
-                iov_base: unsafe { pay.add(ps) as *mut libc::c_void },
-                iov_len: pl,
-            });
-        }
     }
 }
 
@@ -157,58 +179,123 @@ pub struct IoThread {
     pub buffer_pool: &'static BufferPool,
 }
 
-impl IoThread {
-    pub fn run(mut self) {
-        let mut ring = IoUring::new(4096).expect("failed to create io_uring");
-        let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
-        let mut eventfd_buf: u64 = 0;
+/// All mutable state owned by a running IO thread.
+struct RunState {
+    ring: IoUring,
+    conns: Slab<Connection>,
+    eventfd_buf: u64,
+    listen_fd: RawFd,
+    producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    buffer_pool: &'static BufferPool,
+    thread_id: u8,
+    eventfd: RawFd,
+}
 
-        submit_accept(&mut ring, self.listen_fd);
-        submit_eventfd_read(&mut ring, self.eventfd, &mut eventfd_buf);
+impl RunState {
+    /// Process one batch of CQEs.
+    fn process_completions(&mut self, response_poller: &mut RespPoller, cqes: Vec<(u64, i32)>) {
+        for (user_data, result) in cqes {
+            let (op, key) = decode_user_data(user_data);
+            match op {
+                OP_ACCEPT => self.handle_accept(result),
+                OP_READ => self.handle_read(key, result),
+                OP_WRITE => self.handle_write(key, result),
+                OP_EVENTFD => {
+                    match response_poller.poll() {
+                        Ok(mut guard) => {
+                            let mut write_keys: Vec<u16> = Vec::new();
+                            for resp in &mut guard {
+                                let conn_id = resp.conn_id;
+                                let num_vectors = resp.num_vectors;
+                                let results = resp.results_slice();
+                                let len = 1 + results.len() * 4;
+                                metrics::dec_resp_occ();
 
-        loop {
-            ring.wait(1);
-
-            for (user_data, result) in ring.drain_cqes() {
-                let (op, key) = decode_user_data(user_data);
-                match op {
-                    OP_ACCEPT => self.handle_accept(&mut ring, &mut conns, result),
-                    OP_READ => self.handle_read(&mut ring, &mut conns, key, result),
-                    OP_WRITE => self.handle_write(&mut ring, &mut conns, key, result),
-                    OP_EVENTFD => self.handle_eventfd(&mut ring, &mut conns, &mut eventfd_buf),
-                    _ => {}
+                                // Skip silently if the connection was closed before
+                                // we got to write the response.
+                                if self.conns.contains(conn_id as usize) {
+                                    loop {
+                                        // Connection may have been removed by a write/read
+                                        // error handled during the wait below; if so, stop.
+                                        let Some(conn) = self.conns.get_mut(conn_id as usize)
+                                        else {
+                                            break;
+                                        };
+                                        if let Some(mut r) = conn.write_bip_writer.reserve(len) {
+                                            r[0] = num_vectors;
+                                            r[1..].copy_from_slice(f32_slice_as_bytes(results));
+                                            r.send();
+                                            if conn.write_bip.in_flight_count()
+                                                < MAX_WRITES_IN_FLIGHT_PER_CONN
+                                                && !conn.write_bip.valid_available().is_empty()
+                                            {
+                                                write_keys.push(conn_id);
+                                            }
+                                            metrics::inc_responses_sent();
+                                            break;
+                                        }
+                                        // Bip full: await at least one completion to free space.
+                                        // Dispatch write/read/accept CQEs directly — we must not
+                                        // poll the disruptor again while holding the guard.
+                                        self.ring.wait(1);
+                                        for (ud, res) in self.ring.drain_cqes() {
+                                            let (iop, ikey) = decode_user_data(ud);
+                                            match iop {
+                                                OP_ACCEPT => self.handle_accept(res),
+                                                OP_READ => self.handle_read(ikey, res),
+                                                OP_WRITE => self.handle_write(ikey, res),
+                                                OP_EVENTFD => submit_eventfd_read(
+                                                    &mut self.ring,
+                                                    self.eventfd,
+                                                    &mut self.eventfd_buf,
+                                                ),
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                // Release pool slice in all outcomes: written into bip,
+                                // conn gone before write, or conn gone during wait.
+                                if let ResultStorage::Pooled(slice) = &resp.results {
+                                    slice.release();
+                                }
+                            }
+                            write_keys.sort_unstable();
+                            write_keys.dedup();
+                            for key in write_keys {
+                                submit_write(&mut self.ring, &mut self.conns, key);
+                            }
+                        }
+                        Err(Polling::NoEvents) => {}
+                        Err(Polling::Shutdown) => return,
+                    }
+                    submit_eventfd_read(&mut self.ring, self.eventfd, &mut self.eventfd_buf);
                 }
+                _ => {}
             }
         }
     }
 
-    fn handle_accept(&mut self, ring: &mut IoUring, conns: &mut Slab<Connection>, result: i32) {
+    fn handle_accept(&mut self, result: i32) {
         if result >= 0 {
             let client_fd = result as RawFd;
-            let entry = conns.vacant_entry();
+            let entry = self.conns.vacant_entry();
             let key = entry.key();
             entry.insert(Connection::new(client_fd));
-            // key is always < SLAB_CAPACITY, which is asserted to fit in u16
-            submit_read(ring, conns, key as u16);
+            submit_read(&mut self.ring, &mut self.conns, key as u16);
         }
-        submit_accept(ring, self.listen_fd);
+        submit_accept(&mut self.ring, self.listen_fd);
     }
 
-    fn handle_read(
-        &mut self,
-        ring: &mut IoUring,
-        conns: &mut Slab<Connection>,
-        key: u16,
-        result: i32,
-    ) {
+    fn handle_read(&mut self, key: u16, result: i32) {
         let key_usize = key as usize;
         if result <= 0 {
-            conns.try_remove(key_usize);
+            self.conns.try_remove(key_usize);
             return;
         }
 
         let bytes_read = result as usize;
-        let conn = &mut conns[key_usize];
+        let conn = &mut self.conns[key_usize];
         conn.read_inflight = false;
         conn.read_len += bytes_read;
 
@@ -236,81 +323,49 @@ impl IoThread {
                     "io-{}: request flow error ({:?}), closing conn {}",
                     self.thread_id, e, key
                 );
-                conns.remove(key_usize);
+                self.conns.remove(key_usize);
                 return;
             }
         }
 
-        submit_read(ring, conns, key);
+        submit_read(&mut self.ring, &mut self.conns, key);
     }
 
-    fn handle_write(
-        &mut self,
-        _ring: &mut IoUring,
-        conns: &mut Slab<Connection>,
-        key: u16,
-        result: i32,
-    ) {
+    fn handle_write(&mut self, key: u16, result: i32) {
         let key_usize = key as usize;
         if result < 0 {
-            conns.try_remove(key_usize);
+            self.conns.try_remove(key_usize);
             return;
         }
 
-        let conn = &mut conns[key_usize];
-        conn.write_inflight = false;
-        conn.write_headers.clear();
-        conn.write_payloads.clear();
-        conn.write_segments.clear();
-        conn.pending_iovecs.clear();
-
-        // If more data was queued while write was in flight, it's in the same buffers; we only
-        // submit one write per drain, so no resubmit here.
+        let conn = &mut self.conns[key_usize];
+        conn.write_bip.on_complete(result as usize);
+        submit_write(&mut self.ring, &mut self.conns, key);
     }
+}
 
-    fn handle_eventfd(
-        &mut self,
-        ring: &mut IoUring,
-        conns: &mut Slab<Connection>,
-        eventfd_buf: &mut u64,
-    ) {
-        match self.response_poller.poll() {
-            Ok(mut guard) => {
-                let mut write_keys: Vec<u16> = Vec::new();
-                for resp in &mut guard {
-                    if let Some(conn) = conns.get_mut(resp.conn_id as usize) {
-                        let header_off = conn.write_headers.len();
-                        conn.write_headers.push(resp.num_vectors);
-                        let payload_start = conn.write_payloads.len();
-                        let results = resp.results_slice();
-                        let payload_len = results.len() * 4;
-                        conn.write_payloads
-                            .extend_from_slice(f32_slice_as_bytes(results));
-                        conn.write_segments
-                            .push((header_off, payload_start, payload_len));
-                        if !conn.write_inflight {
-                            write_keys.push(resp.conn_id);
-                        }
-                    }
-                    if let ResultStorage::Pooled(slice) = &resp.results {
-                        slice.release();
-                    }
-                    metrics::dec_resp_occ();
-                    metrics::inc_responses_sent();
-                }
-                write_keys.dedup();
-                for key in write_keys {
-                    if let Some(conn) = conns.get_mut(key as usize) {
-                        conn.build_iovecs();
-                    }
-                    submit_write(ring, conns, key);
-                }
-            }
-            Err(Polling::NoEvents) => {}
-            Err(Polling::Shutdown) => return,
+impl IoThread {
+    pub fn run(self) {
+        let mut state = RunState {
+            ring: IoUring::new(4096).expect("failed to create io_uring"),
+            conns: Slab::with_capacity(SLAB_CAPACITY),
+            eventfd_buf: 0,
+            listen_fd: self.listen_fd,
+            producer: self.producer,
+            buffer_pool: self.buffer_pool,
+            thread_id: self.thread_id,
+            eventfd: self.eventfd,
+        };
+        let mut response_poller = self.response_poller;
+
+        submit_accept(&mut state.ring, state.listen_fd);
+        submit_eventfd_read(&mut state.ring, state.eventfd, &mut state.eventfd_buf);
+
+        loop {
+            state.ring.wait(1);
+            let cqes = state.ring.drain_cqes();
+            state.process_completions(&mut response_poller, cqes);
         }
-
-        submit_eventfd_read(ring, self.eventfd, eventfd_buf);
     }
 }
 
@@ -337,18 +392,21 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
 
 fn submit_write(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let conn = &mut conns[key as usize];
-    if conn.write_inflight || conn.pending_iovecs.is_empty() {
-        return;
+    while conn.write_bip.in_flight_count() < MAX_WRITES_IN_FLIGHT_PER_CONN {
+        let available = conn.write_bip.valid_available();
+        if available.is_empty() {
+            break;
+        }
+        let chunk_len = available.len().min(u32::MAX as usize) as u32;
+        let buf_ptr = available.as_ptr();
+
+        conn.write_bip.submit(chunk_len as usize);
+
+        let sqe = opcode::Write::new(Fd(conn.fd), buf_ptr, chunk_len)
+            .build()
+            .user_data(encode_user_data(OP_WRITE, key));
+        ring.push(&sqe);
     }
-    conn.write_inflight = true;
-
-    let iovecs_ptr = conn.pending_iovecs.as_ptr();
-    let iovecs_len = conn.pending_iovecs.len() as u32;
-
-    let sqe = opcode::Writev::new(Fd(conn.fd), iovecs_ptr, iovecs_len)
-        .build()
-        .user_data(encode_user_data(OP_WRITE, key));
-    ring.push(&sqe);
 }
 
 fn submit_eventfd_read(ring: &mut IoUring, eventfd: RawFd, buf: &mut u64) {
