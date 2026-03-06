@@ -1,3 +1,12 @@
+//! # Protocol Invariant
+//!
+//! **Every request produces exactly one response, in order, on the same connection.**
+//!
+//! This is an absolute guarantee of the wire protocol. Responses are never reordered
+//! and never elided — a client that sends N requests on a connection will receive
+//! exactly N responses in the same order. Any server-side code path that silently
+//! drops or reorders a response is a protocol violation.
+
 use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 
 /// Wire format sizes — single source of truth for both sides of the protocol.
@@ -58,24 +67,18 @@ pub fn try_parse_request(buf: &[u8]) -> ParseResult {
     }
 }
 
+/// Encode a response into `dst`. Caller must ensure `dst.len() == response_size(results.len())`.
+pub fn encode_response(num_vectors: u8, results: &[f32], dst: &mut [u8]) {
+    dst[0] = num_vectors;
+    dst[1..].copy_from_slice(bytemuck::cast_slice(results));
+}
+
 /// Copy feature data from a raw byte buffer (starting after the 4-byte header)
 /// into the pre-allocated f32 slice in the disruptor event.
 ///
-/// # Safety
-/// Caller must ensure `src` has at least `num_vectors * FEATURE_DIM * 4` bytes
-/// and `dst` has at least `num_vectors * FEATURE_DIM` f32 slots.
+/// Casts the destination (pool-allocated, f32-aligned) to bytes and copies
+/// directly — valid on little-endian platforms where f32 wire bytes are native.
 pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u8) {
     let count = num_vectors as usize * FEATURE_DIM;
-    // SAFETY: f32 and [u8; 4] have the same size, and we're just reinterpreting
-    // little-endian bytes as f32. This is safe on little-endian platforms.
-    // For portability, use from_le_bytes per element.
-    for (i, dst_elem) in dst.iter_mut().enumerate().take(count) {
-        let offset = i * 4;
-        *dst_elem = f32::from_le_bytes([
-            src[offset],
-            src[offset + 1],
-            src[offset + 2],
-            src[offset + 3],
-        ]);
-    }
+    bytemuck::cast_slice_mut::<f32, u8>(&mut dst[..count]).copy_from_slice(&src[..count * 4]);
 }

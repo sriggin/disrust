@@ -175,12 +175,6 @@ impl Drop for Connection {
     }
 }
 
-/// Reinterpret a slice of f32 as raw little-endian bytes.
-/// Safety: f32 has no padding; any bit pattern is valid; alignment of u8 <= f32.
-fn f32_slice_as_bytes(slice: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4) }
-}
-
 pub struct IoThread {
     thread_id: u8,
     listen_fd: RawFd,
@@ -284,8 +278,7 @@ impl RunState {
                                             break;
                                         };
                                         if let Some(mut r) = conn.write_bip_writer.reserve(len) {
-                                            r[0] = num_vectors;
-                                            r[1..].copy_from_slice(f32_slice_as_bytes(results));
+                                            protocol::encode_response(num_vectors, results, &mut r);
                                             r.send();
                                             if conn.write_bip.in_flight_count()
                                                 < MAX_WRITES_IN_FLIGHT_PER_CONN

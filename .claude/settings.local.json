@@ -13,7 +13,9 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:forums.developer.nvidia.com)",
       "WebFetch(domain:developer.download.nvidia.com)",
-      "Bash(echo Failed:*)"
+      "Bash(echo Failed:*)",
+      "Bash(cargo rustc:*)",
+      "Bash(cargo build:*)"
     ]
   }
 }

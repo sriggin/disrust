@@ -19,12 +19,11 @@ where
 {
     let mut map: HashMap<u16, Vec<u8>> = HashMap::new();
     for resp in guard {
-        let buf = map.entry(resp.conn_id).or_default();
-        buf.push(resp.num_vectors);
         let results = resp.results_slice();
-        for &val in results {
-            buf.extend_from_slice(&val.to_le_bytes());
-        }
+        let buf = map.entry(resp.conn_id).or_default();
+        let offset = buf.len();
+        buf.resize(offset + crate::protocol::response_size(results.len()), 0);
+        crate::protocol::encode_response(resp.num_vectors, results, &mut buf[offset..]);
     }
     map
 }

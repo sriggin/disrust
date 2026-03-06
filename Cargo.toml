@@ -18,7 +18,7 @@ path = "src/bin/client.rs"
 
 [[bin]]
 name = "disrust-gpu"
-path = "src/bin/disrust_gpu.rs"
+path = "src/bin/disrust_gpu/main.rs"
 
 [[bench]]
 name = "buffer_pool_bench"
@@ -36,11 +36,6 @@ path = "benches/request_flow_bench.rs"
 harness = false
 
 [[bench]]
-name = "response_flow_bench"
-path = "benches/response_flow_bench.rs"
-harness = false
-
-[[bench]]
 name = "pipeline_e2e_bench"
 path = "benches/pipeline_e2e_bench.rs"
 harness = false
@@ -53,6 +48,7 @@ socket2 = { version = "0.5", features = ["all"] }
 slab = "0.4"
 libc = "0.2"
 spsc-bip-buffer = "0.2"
+bytemuck = { version = "1", features = ["min_const_generics"] }
 
 [features]
 metrics = []

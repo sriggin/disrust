@@ -186,14 +186,14 @@ impl IoThreadGpu {
                     stall_keys.push(k as u16);
                 }
             }
-            for i in 0..stall_keys.len() {
+            for &key in &stall_keys {
                 parse_and_maybe_read(
                     &mut ring,
                     &mut conns,
                     &mut self.producer,
                     self.buffer_pool,
                     self.thread_id,
-                    stall_keys[i],
+                    key,
                 );
             }
         }

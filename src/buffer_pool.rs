@@ -29,9 +29,7 @@ unsafe impl Sync for PoolSlice {}
 
 impl Drop for PoolSlice {
     fn drop(&mut self) {
-        if self.len > 0 && !self.freed.swap(true, Ordering::Relaxed) {
-            self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
-        }
+        self.release();
     }
 }
 
@@ -71,9 +69,43 @@ impl PoolSlice {
 
     /// Release this slice back to the pool early. Safe to call at most once.
     pub fn release(&self) {
-        if self.len > 0 && !self.freed.swap(true, Ordering::Relaxed) {
-            self.pool.read_cursor.fetch_add(self.len, Ordering::Release);
+        if self.len == 0 || self.freed.swap(true, Ordering::Relaxed) {
+            return;
         }
+
+        // Reclaim wrap padding when the next live slice starts at offset 0.
+        // alloc() advances write by (padding + len) on wrap; read must mirror that.
+        let read = self.pool.read_cursor.load(Ordering::Acquire);
+        let read_mod = read % self.pool.capacity;
+
+        let base = self.pool.data as usize;
+        let ptr = self.data as usize;
+        let slice_offset = (ptr - base) / std::mem::size_of::<f32>();
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(ptr >= base, "slice pointer before pool base");
+            debug_assert_eq!(
+                (ptr - base) % std::mem::size_of::<f32>(),
+                0,
+                "slice pointer misaligned"
+            );
+            debug_assert!(
+                slice_offset < self.pool.capacity,
+                "slice offset out of pool bounds"
+            );
+        }
+
+        let advance = if slice_offset == read_mod {
+            self.len
+        } else if slice_offset == 0 && read_mod != 0 {
+            (self.pool.capacity - read_mod) + self.len
+        } else {
+            // Preserve release-build behavior under invariant violations.
+            self.len
+        };
+
+        self.pool.read_cursor.fetch_add(advance, Ordering::Release);
     }
 }
 
@@ -211,7 +243,8 @@ impl BufferPool {
             // Would straddle the end, wrap to 0 only if physical [0, len) is free.
             // That region is free iff the physical read offset is >= len, i.e. the
             // consumer has advanced past the first `len` physical slots.
-            if read % self.capacity < len {
+            // Exception: when in_use == 0, the pool is empty and [0, len) is free.
+            if in_use != 0 && read % self.capacity < len {
                 metrics::inc_pool_exhausted();
                 return Err(AllocError::Exhausted {
                     in_use,
@@ -588,6 +621,35 @@ mod tests {
 
             assert_eq!(sa.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
             assert_eq!(sb.as_slice(), &[5.0, 6.0, 7.0, 8.0]);
+        });
+    }
+
+    #[test]
+    fn wrap_padding_is_reclaimed_after_drop() {
+        with_pool(10, |pool| {
+            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+            drop(s1);
+
+            // Forces wrap: offset=7, len=7 => padding=3.
+            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            drop(s2);
+
+            // After all drops, utilization should return to zero.
+            assert_eq!(pool.utilization(), (0, 10));
+        });
+    }
+
+    #[test]
+    fn full_capacity_reusable_after_wrap_cycle() {
+        with_pool(10, |pool| {
+            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+            drop(s1);
+
+            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            drop(s2);
+
+            // Full capacity should be available again if wrap padding was reclaimed.
+            assert!(pool.alloc(10).is_ok());
         });
     }
 }
