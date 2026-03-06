@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "client"
 path = "src/bin/client.rs"
 
+[[bin]]
+name = "disrust-gpu"
+path = "src/bin/disrust_gpu.rs"
+
 [[bench]]
 name = "buffer_pool_bench"
 path = "benches/buffer_pool_bench.rs"
