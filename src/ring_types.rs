@@ -29,6 +29,7 @@ pub const INLINE_RESULT_CAPACITY: usize = {
 pub struct InferenceEvent {
     pub io_thread_id: u8,
     pub conn_id: u16,
+    pub fd: i32,
     pub request_seq: u64,
     pub num_vectors: u8,
     pub features: PoolSlice,
@@ -40,6 +41,7 @@ impl InferenceEvent {
         Self {
             io_thread_id: 0,
             conn_id: 0,
+            fd: 0,
             request_seq: 0,
             num_vectors: 0,
             features: PoolSlice::empty(),
@@ -142,6 +144,9 @@ impl InferenceResponse {
     }
 
     /// Get result slice for reading (works for both inline and pooled).
+    /// For `Inline`, the array is `INLINE_RESULT_CAPACITY` elements but only the
+    /// first `num_vectors` are valid. For `Pooled`, the `PoolSlice` was allocated
+    /// with exactly `num_vectors` elements, so `as_slice()` is already the right length.
     pub fn results_slice(&self) -> &[f32] {
         match &self.results {
             ResultStorage::Inline(arr) => &arr[..self.num_vectors as usize],

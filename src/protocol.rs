@@ -1,5 +1,23 @@
 use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 
+/// Wire format sizes — single source of truth for both sides of the protocol.
+///
+/// Request:  `[u32 num_vectors LE][f32 × num_vectors × FEATURE_DIM LE]`
+/// Response: `[u8 num_vectors][f32 × num_vectors LE]`
+pub const REQUEST_HEADER_BYTES: usize = 4; // u32 num_vectors
+pub const RESPONSE_HEADER_BYTES: usize = 1; // u8 num_vectors
+pub const BYTES_PER_F32: usize = 4;
+
+/// Total byte length of a request carrying `num_vectors` vectors.
+pub const fn request_size(num_vectors: usize) -> usize {
+    REQUEST_HEADER_BYTES + num_vectors * FEATURE_DIM * BYTES_PER_F32
+}
+
+/// Total byte length of a response carrying `num_vectors` results.
+pub const fn response_size(num_vectors: usize) -> usize {
+    RESPONSE_HEADER_BYTES + num_vectors * BYTES_PER_F32
+}
+
 /// Result of attempting to parse a request from a byte buffer.
 #[allow(dead_code)]
 pub enum ParseResult {
@@ -17,8 +35,8 @@ pub enum ParseResult {
 /// Try to parse a request from the buffer. Returns how many bytes were consumed
 /// and the number of vectors. Feature data starts at offset 4 in the buffer.
 pub fn try_parse_request(buf: &[u8]) -> ParseResult {
-    if buf.len() < 4 {
-        return ParseResult::Incomplete(4 - buf.len());
+    if buf.len() < REQUEST_HEADER_BYTES {
+        return ParseResult::Incomplete(REQUEST_HEADER_BYTES - buf.len());
     }
 
     let num_vectors_u32 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -28,8 +46,7 @@ pub fn try_parse_request(buf: &[u8]) -> ParseResult {
     }
 
     let num_vectors = num_vectors_u32 as u8;
-    let payload_size = num_vectors as usize * FEATURE_DIM * 4;
-    let total_size = 4 + payload_size;
+    let total_size = request_size(num_vectors as usize);
 
     if buf.len() < total_size {
         return ParseResult::Incomplete(total_size - buf.len());
@@ -60,16 +77,5 @@ pub fn copy_features(src: &[u8], dst: &mut [f32], num_vectors: u8) {
             src[offset + 2],
             src[offset + 3],
         ]);
-    }
-}
-
-/// Serialize a response into the write buffer.
-/// Wire format: [u8 num_vectors] [f32 * num_vectors].
-/// Kept for tests/reference; IO thread uses iovec/Writev path instead.
-#[allow(dead_code)]
-pub fn write_response(buf: &mut Vec<u8>, num_vectors: u8, results: &[f32]) {
-    buf.push(num_vectors);
-    for &val in &results[..num_vectors as usize] {
-        buf.extend_from_slice(&val.to_le_bytes());
     }
 }

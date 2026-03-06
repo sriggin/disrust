@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 
 use disrust::constants::FEATURE_DIM;
+use disrust::protocol::{RESPONSE_HEADER_BYTES, request_size, response_size};
 
 #[derive(Parser)]
 #[command(about = "Test client for disrust inference server")]
@@ -55,7 +56,7 @@ enum Command {
 }
 
 fn build_request(num_vectors: u32) -> (Vec<u8>, Vec<f32>) {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(request_size(num_vectors as usize));
     buf.extend_from_slice(&num_vectors.to_le_bytes());
 
     let mut expected_sums = Vec::with_capacity(num_vectors as usize);
@@ -73,7 +74,7 @@ fn build_request(num_vectors: u32) -> (Vec<u8>, Vec<f32>) {
 }
 
 fn read_response(stream: &mut TcpStream, expected: u32) -> Vec<f32> {
-    let mut header = [0u8; 1];
+    let mut header = [0u8; RESPONSE_HEADER_BYTES];
     stream
         .read_exact(&mut header)
         .expect("failed to read response header");
@@ -199,7 +200,7 @@ fn bench_test(addr: &str, num_connections: usize, requests_per_conn: usize) {
     );
 
     let (req, _) = build_request(1);
-    let response_size: usize = 4 + 4;
+    let per_response = response_size(1);
 
     let start = Instant::now();
 
@@ -220,8 +221,8 @@ fn bench_test(addr: &str, num_connections: usize, requests_per_conn: usize) {
                     }
                 });
 
-                let mut resp_buf = vec![0u8; response_size * 1024];
-                let mut total_bytes_needed = requests_per_conn * response_size;
+                let mut resp_buf = vec![0u8; per_response * 1024];
+                let mut total_bytes_needed = requests_per_conn * per_response;
                 while total_bytes_needed > 0 {
                     let to_read = total_bytes_needed.min(resp_buf.len());
                     let n = reader.read(&mut resp_buf[..to_read]).expect("read failed");

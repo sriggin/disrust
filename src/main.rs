@@ -27,9 +27,7 @@ struct Args {
 
 use batch_processor::BatchProcessor;
 use buffer_pool::{BufferPool, set_factory_pool};
-use config::{
-    BUFFER_POOL_CAPACITY, DISRUPTOR_SIZE, MAX_IO_THREADS, RESPONSE_QUEUE_SIZE, RESULT_POOL_CAPACITY,
-};
+use config::{BUFFER_POOL_CAPACITY, DISRUPTOR_SIZE, RESPONSE_QUEUE_SIZE, RESULT_POOL_CAPACITY};
 use io_thread::IoThread;
 use response_queue::build_response_channel;
 use ring_types::InferenceEvent;
@@ -73,7 +71,7 @@ fn main() {
     let factory_pool = BufferPool::new_boxed(1);
     set_factory_pool(factory_pool);
 
-    // Build the request disruptor (SPSC: one IO thread → batch processor).
+    // Build the request disruptor (SPSC: one IO thread -> batch processor).
     // To support multiple IO threads, switch to build_multi_producer, change
     // IoThread::producer to MultiProducer (Clone), and BatchProcessor::poller
     // to EventPoller<InferenceEvent, MultiProducerBarrier>.
@@ -96,11 +94,6 @@ fn main() {
 
     // Spawn batch processor thread
     let batch = BatchProcessor::new(request_poller, vec![resp_prod], vec![result_pool]);
-    assert!(
-        batch.response_producers.len() <= MAX_IO_THREADS,
-        "io_thread_id is u8; max {} IO threads",
-        MAX_IO_THREADS
-    );
     let batch_handle = thread::Builder::new()
         .name("batch-processor".into())
         .spawn(move || batch.run())
@@ -108,14 +101,14 @@ fn main() {
 
     // Spawn IO thread
     let listen_socket = create_listener(port);
-    let io = IoThread {
-        thread_id: 0,
-        listen_fd: listen_socket.into_raw_fd(),
+    let io = IoThread::new(
+        0,
+        listen_socket.into_raw_fd(),
         producer,
-        response_poller: resp_poll,
-        eventfd: efd,
-        buffer_pool: BufferPool::leak_new(BUFFER_POOL_CAPACITY),
-    };
+        resp_poll,
+        efd,
+        BufferPool::leak_new(BUFFER_POOL_CAPACITY),
+    );
     let io_handle = thread::Builder::new()
         .name("io-0".into())
         .spawn(move || io.run())

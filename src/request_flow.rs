@@ -1,4 +1,4 @@
-//! Request path: bytes in → parse → alloc → publish to request ring.
+//! Request path: bytes in -> parse -> publish to request ring.
 //!
 //! Extracted so integration tests and benchmarks can drive the flow without io_uring.
 
@@ -9,30 +9,36 @@ use crate::constants::FEATURE_DIM;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
 
-/// Error from processing request bytes (alloc or parse failure).
+/// Error from processing request bytes.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum ProcessRequestError {
-    Alloc(AllocError),
-    Parse(&'static str),
+    Parse(#[allow(dead_code)] &'static str),
 }
 
 /// Process all complete requests in `buf`, publishing each to the request ring.
-/// Returns (bytes consumed, number of requests published) on success.
+/// Returns `(bytes_consumed, num_published)` on success.
 ///
-/// On parse error or alloc TooLarge, returns `Err` and no further bytes are consumed.
-/// Pool exhaustion is handled by spinning until space is available (backpressure).
-/// Caller should close the connection only on parse error or TooLarge.
+/// Pool allocation happens inside the `try_publish` closure, which only runs when
+/// a ring slot is available. This means `RingBufferFull` never leaves a live
+/// `PoolSlice` outside the ring, so FIFO pool-release order is always preserved.
+///
+/// Pool exhaustion spins inside the closure until the batch processor releases
+/// slices on the other thread. `AllocError::TooLarge` cannot occur in practice
+/// because `num_vectors * FEATURE_DIM` is bounded far below pool capacity.
+///
+/// Returns `Err` only on a parse error; caller should close the connection.
 pub fn process_requests_from_buffer(
     buf: &[u8],
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     pool: &'static BufferPool,
     conn_id: u16,
+    fd: i32,
     thread_id: u8,
     request_seq: &mut u64,
 ) -> Result<(usize, usize), ProcessRequestError> {
     let mut consumed = 0;
     let mut num_published = 0;
+
     while consumed < buf.len() {
         let slice = &buf[consumed..];
         match protocol::try_parse_request(slice) {
@@ -40,33 +46,35 @@ pub fn process_requests_from_buffer(
                 num_vectors,
                 bytes_consumed,
             } => {
-                let feature_bytes = &slice[4..bytes_consumed];
+                let feature_bytes = &slice[protocol::REQUEST_HEADER_BYTES..bytes_consumed];
                 let seq = *request_seq;
-                *request_seq += 1;
-
                 let feature_count = num_vectors as usize * FEATURE_DIM;
-                let mut pool_slice = loop {
-                    match pool.alloc(feature_count) {
-                        Ok(s) => break s,
-                        Err(AllocError::Exhausted { .. }) => std::hint::spin_loop(),
-                        Err(e) => return Err(ProcessRequestError::Alloc(e)),
-                    }
-                };
-                protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
-                let mut features = Some(pool_slice.freeze());
 
-                loop {
-                    match producer.try_publish(|slot| {
-                        slot.io_thread_id = thread_id;
-                        slot.conn_id = conn_id;
-                        slot.request_seq = seq;
-                        slot.num_vectors = num_vectors;
-                        slot.features = features.take().expect("features already moved into ring");
-                    }) {
-                        Ok(_) => break,
-                        Err(RingBufferFull) => std::hint::spin_loop(),
-                    }
+                match producer.try_publish(|slot| {
+                    // Alloc inside the closure: only runs when a ring slot is available,
+                    // so RingBufferFull never leaves a live PoolSlice outside the ring.
+                    // Spin on Exhausted — the batch processor releases on the other thread.
+                    let mut pool_slice = loop {
+                        match pool.alloc(feature_count) {
+                            Ok(s) => break s,
+                            Err(AllocError::Exhausted { .. }) => std::hint::spin_loop(),
+                            Err(AllocError::TooLarge { .. }) => unreachable!(
+                                "feature_count {feature_count} cannot exceed pool capacity"
+                            ),
+                        }
+                    };
+                    protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
+                    slot.io_thread_id = thread_id;
+                    slot.conn_id = conn_id;
+                    slot.fd = fd;
+                    slot.request_seq = seq;
+                    slot.num_vectors = num_vectors;
+                    slot.features = pool_slice.freeze();
+                }) {
+                    Ok(_) => {}
+                    Err(RingBufferFull) => break,
                 }
+                *request_seq += 1;
                 num_published += 1;
                 consumed += bytes_consumed;
             }

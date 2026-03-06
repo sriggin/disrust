@@ -41,6 +41,7 @@ fn main() {
             &mut producer,
             pool,
             conn_id,
+            0,
             thread_id,
             &mut request_seq,
         );
@@ -60,6 +61,7 @@ fn main() {
             &mut producer,
             pool,
             conn_id,
+            0,
             thread_id,
             &mut request_seq,
         );

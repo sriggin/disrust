@@ -1,9 +1,12 @@
 use disruptor::{EventPoller, Polling, SingleProducerBarrier};
 
 use crate::buffer_pool::BufferPool;
+use crate::config::MAX_IO_THREADS;
 use crate::constants::MAX_VECTORS_PER_REQUEST;
 use crate::response_queue::ResponseProducer;
 use crate::ring_types::{INLINE_RESULT_CAPACITY, InferenceEvent, InferenceResponse};
+
+pub type PollCycleResult = Result<(), Polling>;
 
 /// Batch processor: consumes from the request disruptor, runs inference,
 /// pushes responses to per-IO-thread response channels.
@@ -12,9 +15,9 @@ use crate::ring_types::{INLINE_RESULT_CAPACITY, InferenceEvent, InferenceRespons
 /// To support multiple IO threads: switch to build_multi_producer in main.rs,
 /// use SingleProducer -> MultiProducer in IoThread, and MultiProducerBarrier here.
 pub struct BatchProcessor {
-    pub poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
-    pub response_producers: Vec<ResponseProducer>,
-    pub result_pools: Vec<&'static BufferPool>,
+    poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
+    response_producers: Vec<ResponseProducer>,
+    result_pools: Vec<&'static BufferPool>,
     /// Reusable per-thread signal flags — avoids a heap allocation per poll cycle.
     signaled: Vec<bool>,
 }
@@ -26,6 +29,11 @@ impl BatchProcessor {
         result_pools: Vec<&'static BufferPool>,
     ) -> Self {
         let num_threads = response_producers.len();
+        assert!(
+            num_threads <= MAX_IO_THREADS,
+            "io_thread_id is u8; max {} IO threads",
+            MAX_IO_THREADS
+        );
         Self {
             poller,
             response_producers,
@@ -33,11 +41,7 @@ impl BatchProcessor {
             signaled: vec![false; num_threads],
         }
     }
-}
 
-pub type PollCycleResult = Result<(), Polling>;
-
-impl BatchProcessor {
     pub fn process_one_poll_cycle(&mut self) -> PollCycleResult {
         let mut temp_results = [0.0f32; MAX_VECTORS_PER_REQUEST];
 
@@ -69,7 +73,7 @@ impl BatchProcessor {
                         None
                     };
 
-                    // Spin on recoverable failures (e.g. result pool exhausted until consumer frees).
+                    // Spin on recoverable failures (result pool exhausted until IO thread frees).
                     let response = loop {
                         match InferenceResponse::with_results(
                             event.conn_id,

@@ -37,6 +37,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
         &mut producer,
         pool,
         conn_id,
+        0,
         thread_id,
         &mut request_seq,
     );
@@ -92,6 +93,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
         &mut producer,
         pool,
         conn_id,
+        0,
         thread_id,
         &mut request_seq,
     );
@@ -142,6 +144,7 @@ fn request_flow_incomplete_returns_consumed_only() {
         pool,
         0,
         0,
+        0,
         &mut request_seq,
     );
 
@@ -169,6 +172,7 @@ fn request_flow_parse_error_returns_err() {
         &buf,
         &mut producer,
         pool,
+        0,
         0,
         0,
         &mut request_seq,

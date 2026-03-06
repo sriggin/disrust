@@ -44,6 +44,7 @@ fn pipeline_request_to_response_end_to_end() {
         &mut request_producer,
         request_pool,
         conn_id,
+        0,
         thread_id,
         &mut request_seq,
     );
@@ -106,6 +107,7 @@ fn pipeline_multiple_requests_same_conn() {
         &mut request_producer,
         request_pool,
         conn_id,
+        0,
         thread_id,
         &mut request_seq,
     );

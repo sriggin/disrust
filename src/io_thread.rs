@@ -12,6 +12,7 @@ use spsc_bip_buffer::bip_buffer_with_len;
 use crate::buffer_pool::BufferPool;
 use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY, WRITE_BIP_CAPACITY};
 use crate::metrics;
+use crate::protocol;
 use crate::request_flow;
 use crate::response_queue::RespPoller;
 use crate::ring_types::{InferenceEvent, ResultStorage};
@@ -181,12 +182,59 @@ fn f32_slice_as_bytes(slice: &[f32]) -> &[u8] {
 }
 
 pub struct IoThread {
-    pub thread_id: u8,
-    pub listen_fd: RawFd,
-    pub producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-    pub response_poller: RespPoller,
-    pub eventfd: RawFd,
-    pub buffer_pool: &'static BufferPool,
+    thread_id: u8,
+    listen_fd: RawFd,
+    producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    response_poller: RespPoller,
+    eventfd: RawFd,
+    buffer_pool: &'static BufferPool,
+}
+
+impl IoThread {
+    pub fn new(
+        thread_id: u8,
+        listen_fd: RawFd,
+        producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+        response_poller: RespPoller,
+        eventfd: RawFd,
+        buffer_pool: &'static BufferPool,
+    ) -> Self {
+        Self {
+            thread_id,
+            listen_fd,
+            producer,
+            response_poller,
+            eventfd,
+            buffer_pool,
+        }
+    }
+
+    pub fn run(self) {
+        let mut state = RunState {
+            ring: IoUring::new(4096).expect("failed to create io_uring"),
+            conns: Slab::with_capacity(SLAB_CAPACITY),
+            eventfd_buf: 0,
+            listen_fd: self.listen_fd,
+            producer: self.producer,
+            buffer_pool: self.buffer_pool,
+            thread_id: self.thread_id,
+            eventfd: self.eventfd,
+            write_keys: Vec::new(),
+            inner_cqes: Vec::new(),
+        };
+        let mut response_poller = self.response_poller;
+
+        submit_accept(&mut state.ring, state.listen_fd);
+        submit_eventfd_read(&mut state.ring, state.eventfd, &mut state.eventfd_buf);
+
+        let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
+        loop {
+            state.ring.wait(1);
+            cqe_buf.clear();
+            state.ring.drain_cqes_into(&mut cqe_buf);
+            state.process_completions(&mut response_poller, &cqe_buf);
+        }
+    }
 }
 
 /// All mutable state owned by a running IO thread.
@@ -199,6 +247,10 @@ struct RunState {
     buffer_pool: &'static BufferPool,
     thread_id: u8,
     eventfd: RawFd,
+    /// Reusable buffer: connection keys that need a write submitted after an OP_EVENTFD batch.
+    write_keys: Vec<u16>,
+    /// Reusable buffer: CQEs drained inside the bip-full retry loop.
+    inner_cqes: Vec<(u64, i32)>,
 }
 
 impl RunState {
@@ -213,12 +265,12 @@ impl RunState {
                 OP_EVENTFD => {
                     match response_poller.poll() {
                         Ok(mut guard) => {
-                            let mut write_keys: Vec<u16> = Vec::new();
+                            self.write_keys.clear();
                             for resp in &mut guard {
                                 let conn_id = resp.conn_id;
                                 let num_vectors = resp.num_vectors;
                                 let results = resp.results_slice();
-                                let len = 1 + results.len() * 4;
+                                let len = protocol::response_size(results.len());
                                 metrics::dec_resp_occ();
 
                                 // Skip silently if the connection was closed before
@@ -239,18 +291,23 @@ impl RunState {
                                                 < MAX_WRITES_IN_FLIGHT_PER_CONN
                                                 && !conn.write_bip.valid_available().is_empty()
                                             {
-                                                write_keys.push(conn_id);
+                                                self.write_keys.push(conn_id);
                                             }
                                             metrics::inc_responses_sent();
                                             break;
                                         }
-                                        // Bip full: await at least one completion to free space.
+                                        // Bip full: flush pending writes for this connection
+                                        // before waiting so OP_WRITE CQEs will arrive.
+                                        // Without this, no writes would be in-kernel and
+                                        // ring.wait(1) would block indefinitely.
+                                        submit_write(&mut self.ring, &mut self.conns, conn_id);
                                         // Dispatch write/read/accept CQEs directly — we must not
                                         // poll the disruptor again while holding the guard.
                                         self.ring.wait(1);
-                                        let mut inner_cqes: Vec<(u64, i32)> = Vec::new();
-                                        self.ring.drain_cqes_into(&mut inner_cqes);
-                                        for &(ud, res) in &inner_cqes {
+                                        self.inner_cqes.clear();
+                                        self.ring.drain_cqes_into(&mut self.inner_cqes);
+                                        for i in 0..self.inner_cqes.len() {
+                                            let (ud, res) = self.inner_cqes[i];
                                             let (iop, ikey) = decode_user_data(ud);
                                             match iop {
                                                 OP_ACCEPT => self.handle_accept(res),
@@ -272,12 +329,32 @@ impl RunState {
                                     slice.release();
                                 }
                             }
-                            write_keys.sort_unstable();
-                            write_keys.dedup();
-                            for key in write_keys {
+                            self.write_keys.sort_unstable();
+                            self.write_keys.dedup();
+                            for i in 0..self.write_keys.len() {
+                                let key = self.write_keys[i];
                                 if self.conns.contains(key as usize) {
                                     submit_write(&mut self.ring, &mut self.conns, key);
                                 }
+                            }
+
+                            // Retry any connections stalled by RingBufferFull.
+                            //
+                            // When the disruptor ring was full during a previous handle_read,
+                            // try_publish returned RingBufferFull immediately (without spinning).
+                            // If the read buffer was also full at that moment, no new OP_READ
+                            // was submitted, leaving the connection with unprocessed bytes but
+                            // no pending CQE to wake it up. Now that the ring has drained (we
+                            // just received responses), re-parse those buffers.
+                            self.write_keys.clear();
+                            for (k, c) in self.conns.iter() {
+                                if !c.read_inflight && c.read_len > 0 {
+                                    self.write_keys.push(k as u16);
+                                }
+                            }
+                            for i in 0..self.write_keys.len() {
+                                let key = self.write_keys[i];
+                                self.parse_and_maybe_read(key);
                             }
                         }
                         Err(Polling::NoEvents) => {}
@@ -315,12 +392,26 @@ impl RunState {
         conn.read_inflight = false;
         conn.read_len += bytes_read;
 
+        self.parse_and_maybe_read(key);
+    }
+
+    /// Parse the connection's existing read buffer and resubmit a read if space is available.
+    ///
+    /// Called both from `handle_read` (after new bytes arrive) and from the `OP_EVENTFD`
+    /// handler (to retry connections stalled by `RingBufferFull` with a full buffer).
+    fn parse_and_maybe_read(&mut self, key: u16) {
+        let key_usize = key as usize;
+        let Some(conn) = self.conns.get_mut(key_usize) else {
+            return;
+        };
         let buf = &conn.read_buf[..conn.read_len];
+        let fd = conn.fd;
         match request_flow::process_requests_from_buffer(
             buf,
             &mut self.producer,
             self.buffer_pool,
             key,
+            fd,
             self.thread_id,
             &mut conn.next_request_seq,
         ) {
@@ -344,7 +435,16 @@ impl RunState {
             }
         }
 
-        submit_read(&mut self.ring, &mut self.conns, key);
+        // Resubmit a read if there is room in the buffer.
+        // If read_len == READ_BUF_SIZE, either the ring was full (RingBufferFull broke
+        // out of the parse loop with consumed == 0) or pool exhaustion prevented alloc.
+        // In the ring-full case the OP_EVENTFD retry below will re-enter here once the
+        // ring has drained; in the pool-exhaustion case the closure spins until space
+        // is available, so this branch is only hit when the buffer is genuinely full.
+        let c = &self.conns[key as usize];
+        if c.read_len < READ_BUF_SIZE {
+            submit_read(&mut self.ring, &mut self.conns, key);
+        }
     }
 
     fn handle_write(&mut self, key: u16, result: i32) {
@@ -353,37 +453,11 @@ impl RunState {
             self.conns.try_remove(key_usize);
             return;
         }
-
-        let conn = &mut self.conns[key_usize];
+        let Some(conn) = self.conns.get_mut(key_usize) else {
+            return;
+        };
         conn.write_bip.on_complete(result as usize);
         submit_write(&mut self.ring, &mut self.conns, key);
-    }
-}
-
-impl IoThread {
-    pub fn run(self) {
-        let mut state = RunState {
-            ring: IoUring::new(4096).expect("failed to create io_uring"),
-            conns: Slab::with_capacity(SLAB_CAPACITY),
-            eventfd_buf: 0,
-            listen_fd: self.listen_fd,
-            producer: self.producer,
-            buffer_pool: self.buffer_pool,
-            thread_id: self.thread_id,
-            eventfd: self.eventfd,
-        };
-        let mut response_poller = self.response_poller;
-
-        submit_accept(&mut state.ring, state.listen_fd);
-        submit_eventfd_read(&mut state.ring, state.eventfd, &mut state.eventfd_buf);
-
-        let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
-        loop {
-            state.ring.wait(1);
-            cqe_buf.clear();
-            state.ring.drain_cqes_into(&mut cqe_buf);
-            state.process_completions(&mut response_poller, &cqe_buf);
-        }
     }
 }
 

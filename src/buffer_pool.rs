@@ -47,7 +47,6 @@ impl PoolSlice {
     }
 
     /// Get a slice view of the pooled data.
-    #[allow(dead_code)]
     pub fn as_slice(&self) -> &[f32] {
         if self.len == 0 {
             return &[];
@@ -61,6 +60,13 @@ impl PoolSlice {
         let end = start.saturating_add(feature_dim);
         assert!(end <= self.len, "vector index out of bounds");
         unsafe { std::slice::from_raw_parts(self.data.add(start), feature_dim) }
+    }
+
+    /// Returns true if `next` starts exactly where `self` ends.
+    /// Used by the Submission Consumer to detect pool ring wrap-around between
+    /// consecutive batch slots.
+    pub fn is_contiguous(&self, next: &PoolSlice) -> bool {
+        unsafe { self.data.add(self.len) == next.data }
     }
 
     /// Release this slice back to the pool early. Safe to call at most once.
@@ -110,7 +116,8 @@ impl PoolSliceMut {
 ///
 /// See PERFORMANCE.md for detailed benchmarking results and optimization opportunities.
 pub struct BufferPool {
-    data: Box<[UnsafeCell<f32>]>,
+    data: *const f32,
+    _backing: Option<Box<[UnsafeCell<f32>]>>,
     capacity: usize,
     write_cursor: AtomicUsize,
     read_cursor: AtomicUsize,
@@ -135,8 +142,28 @@ impl BufferPool {
             }
         }
 
+        let ptr = data.as_ptr() as *const f32;
         Box::new(Self {
-            data,
+            data: ptr,
+            _backing: Some(data),
+            capacity,
+            write_cursor: AtomicUsize::new(0),
+            read_cursor: AtomicUsize::new(0),
+        })
+    }
+
+    /// Create a pool over externally-allocated memory.
+    ///
+    /// The caller is responsible for page-touching and for ensuring `ptr` remains
+    /// valid for the pool's entire lifetime. The pool does not free this memory.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for reads and writes of `capacity` f32 values for the
+    /// pool's lifetime and must not alias any other live references.
+    pub unsafe fn from_raw_ptr(ptr: *mut f32, capacity: usize) -> Box<Self> {
+        Box::new(Self {
+            data: ptr as *const f32,
+            _backing: None,
             capacity,
             write_cursor: AtomicUsize::new(0),
             read_cursor: AtomicUsize::new(0),
@@ -199,8 +226,7 @@ impl BufferPool {
             offset
         };
 
-        let base = self.data.as_ptr() as *mut f32;
-        let ptr = unsafe { base.add(actual_offset) };
+        let ptr = unsafe { self.data.add(actual_offset) as *mut f32 };
         Ok(PoolSliceMut {
             pool: self,
             data: ptr,

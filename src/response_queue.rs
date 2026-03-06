@@ -14,7 +14,7 @@ pub type RespPoller = EventPoller<InferenceResponse, SingleProducerBarrier>;
 
 /// Producer half lives on the batch processor thread.
 pub struct ResponseProducer {
-    pub producer: RespProducer,
+    producer: RespProducer,
     pub eventfd: RawFd,
 }
 
@@ -26,6 +26,10 @@ impl ResponseProducer {
             num_vectors,
             results,
         } = response;
+        // `try_publish` takes `FnOnce(&mut E)` but may not call the closure on
+        // RingBufferFull — the closure would then drop the value without publishing.
+        // Wrapping `results` in an Option lets us move it into the slot on success
+        // while retaining it for the next retry attempt on failure.
         let mut results = Some(results);
         loop {
             match self.producer.try_publish(|slot| {
