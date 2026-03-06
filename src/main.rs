@@ -85,6 +85,7 @@ fn main() {
 
     // Create result buffer pool (for large responses >INLINE_RESULT_CAPACITY vectors)
     let result_pool = BufferPool::leak_new(RESULT_POOL_CAPACITY);
+    let result_allocator = result_pool.allocator();
 
     eprintln!(
         "  result pool: {} KB ({} f32s)",
@@ -93,7 +94,7 @@ fn main() {
     );
 
     // Spawn batch processor thread
-    let batch = BatchProcessor::new(request_poller, vec![resp_prod], vec![result_pool]);
+    let batch = BatchProcessor::new(request_poller, vec![resp_prod], vec![result_allocator]);
     let batch_handle = thread::Builder::new()
         .name("batch-processor".into())
         .spawn(move || batch.run())
@@ -101,13 +102,16 @@ fn main() {
 
     // Spawn IO thread
     let listen_socket = create_listener(port);
+    let request_pool = BufferPool::leak_new(BUFFER_POOL_CAPACITY);
+    let request_allocator = request_pool.allocator();
+
     let io = IoThread::new(
         0,
         listen_socket.into_raw_fd(),
         producer,
         resp_poll,
         efd,
-        BufferPool::leak_new(BUFFER_POOL_CAPACITY),
+        request_allocator,
     );
     let io_handle = thread::Builder::new()
         .name("io-0".into())

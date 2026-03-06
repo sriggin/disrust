@@ -20,6 +20,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
 
     let pool_capacity = RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
+    let mut allocator = pool.allocator();
 
     let conn_id = 1u16;
     let thread_id = 0u8;
@@ -35,7 +36,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
     let result = request_flow::process_requests_from_buffer(
         &buf,
         &mut producer,
-        pool,
+        &mut allocator,
         conn_id,
         0,
         thread_id,
@@ -77,6 +78,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
 
     let pool_capacity = RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
+    let mut allocator = pool.allocator();
 
     let conn_id = 2u16;
     let thread_id = 0u8;
@@ -91,7 +93,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     let result = request_flow::process_requests_from_buffer(
         &buf,
         &mut producer,
-        pool,
+        &mut allocator,
         conn_id,
         0,
         thread_id,
@@ -133,6 +135,7 @@ fn request_flow_incomplete_returns_consumed_only() {
     let mut producer = builder.build();
 
     let pool = BufferPool::leak_new(256 * FEATURE_DIM);
+    let mut allocator = pool.allocator();
 
     let mut request_seq = 0u64;
     // Only 4 bytes (num_vectors = 1) – no payload, so incomplete
@@ -141,7 +144,7 @@ fn request_flow_incomplete_returns_consumed_only() {
     let result = request_flow::process_requests_from_buffer(
         &buf,
         &mut producer,
-        pool,
+        &mut allocator,
         0,
         0,
         0,
@@ -163,6 +166,7 @@ fn request_flow_parse_error_returns_err() {
     let mut producer = builder.build();
 
     let pool = BufferPool::leak_new(256 * FEATURE_DIM);
+    let mut allocator = pool.allocator();
 
     let mut request_seq = 0u64;
     // num_vectors = 0 is invalid
@@ -171,7 +175,7 @@ fn request_flow_parse_error_returns_err() {
     let result = request_flow::process_requests_from_buffer(
         &buf,
         &mut producer,
-        pool,
+        &mut allocator,
         0,
         0,
         0,

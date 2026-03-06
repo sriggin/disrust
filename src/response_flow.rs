@@ -23,7 +23,7 @@ where
         let buf = map.entry(resp.conn_id).or_default();
         let offset = buf.len();
         buf.resize(offset + crate::protocol::response_size(results.len()), 0);
-        crate::protocol::encode_response(resp.num_vectors, results, &mut buf[offset..]);
+        crate::protocol::encode_response(results, &mut buf[offset..]);
     }
     map
 }

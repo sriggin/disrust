@@ -73,6 +73,7 @@ fn main() {
     // thread's feature data is pinned and device-mappable for zero-copy H2D.
     // For now, use a standard heap-backed pool.
     let buffer_pool = BufferPool::leak_new(BUFFER_POOL_CAPACITY);
+    let request_allocator = buffer_pool.allocator();
 
     // Request ring: IO thread -> SubmissionConsumer -> CompletionConsumer.
     let builder = build_single_producer(DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
@@ -85,7 +86,7 @@ fn main() {
 
     // Spawn IO thread.
     let listen_socket = create_listener(port);
-    let io = IoThreadGpu::new(0, listen_socket.into_raw_fd(), producer, buffer_pool);
+    let io = IoThreadGpu::new(0, listen_socket.into_raw_fd(), producer, request_allocator);
     let io_handle = thread::Builder::new()
         .name("io-gpu-0".into())
         .spawn(move || io.run())

@@ -1,4 +1,4 @@
-use crate::buffer_pool::{BufferPool, PoolSlice};
+use crate::buffer_pool::{PoolAllocator, PoolSlice};
 use crate::constants::FEATURE_DIM;
 use std::mem::size_of;
 
@@ -22,7 +22,7 @@ pub const INLINE_RESULT_CAPACITY: usize = {
 /// IO threads fill these in the publish closure; batch processor reads them.
 ///
 /// Invariants:
-/// - `io_thread_id`: index into batch processor's response_producers/result_pools (u8 → max 256 IO threads).
+/// - `io_thread_id`: index into batch processor's response_producers/result_allocators (u8 → max 256 IO threads).
 /// - `conn_id`: slab key from the IO thread's Slab<Connection> (u16 → slab capacity must be ≤ 65535).
 /// - `num_vectors`: 1..=MAX_VECTORS_PER_REQUEST (u8).
 #[repr(C, align(64))]
@@ -105,7 +105,7 @@ impl InferenceResponse {
         conn_id: u16,
         request_seq: u64,
         results: &[f32],
-        pool: Option<&'static BufferPool>,
+        allocator: Option<&mut PoolAllocator>,
     ) -> Result<Self, &'static str> {
         let num_vectors = results.len();
         assert!(
@@ -127,9 +127,9 @@ impl InferenceResponse {
             })
         } else {
             // Large results: allocate from pool
-            let pool = pool.ok_or("pool required for large results")?;
+            let allocator = allocator.ok_or("allocator required for large results")?;
 
-            let mut pool_slice = pool
+            let mut pool_slice = allocator
                 .alloc(results.len())
                 .map_err(|_| "pool allocation failed")?;
             pool_slice.as_mut_slice().copy_from_slice(results);

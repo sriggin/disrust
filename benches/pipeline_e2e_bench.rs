@@ -26,13 +26,16 @@ fn main() {
     let mut request_producer = builder.build();
 
     let request_pool = BufferPool::leak_new(RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM);
+    let mut request_allocator = request_pool.allocator();
     let efd = common::create_eventfd();
     assert!(efd >= 0);
     let (resp_producer, mut response_poller) =
         disrust::response_queue::build_response_channel(RESPONSE_QUEUE_SIZE, efd);
     let result_pool = BufferPool::leak_new(RESULT_POOL_CAPACITY);
+    let result_allocator = result_pool.allocator();
 
-    let mut batch = BatchProcessor::new(request_poller, vec![resp_producer], vec![result_pool]);
+    let mut batch =
+        BatchProcessor::new(request_poller, vec![resp_producer], vec![result_allocator]);
 
     let buf = common::one_request_bytes(REQUESTS_PER_BATCH as u32);
     let mut full_buf = buf.clone();
@@ -48,7 +51,7 @@ fn main() {
         let _ = request_flow::process_requests_from_buffer(
             &full_buf,
             &mut request_producer,
-            request_pool,
+            &mut request_allocator,
             conn_id,
             0,
             thread_id,
@@ -69,7 +72,7 @@ fn main() {
         let _ = request_flow::process_requests_from_buffer(
             black_box(&full_buf),
             &mut request_producer,
-            request_pool,
+            &mut request_allocator,
             conn_id,
             0,
             thread_id,

@@ -7,9 +7,11 @@ const DEFAULT_POOL_CAPACITY: usize = 65536 * 64 * FEATURE_DIM; // Same as real c
 const ITERATIONS: usize = 50_000_000;
 
 fn bench_size(pool: &'static BufferPool, size: usize, label: &str) {
+    let mut alloc = pool.allocator();
+
     // Warm up
     for _ in 0..10000 {
-        let mut slice = pool.alloc(size).unwrap();
+        let mut slice = alloc.alloc(size).unwrap();
         slice.as_mut_slice()[0] = 1.0;
         black_box(&slice);
         drop(slice.freeze());
@@ -23,12 +25,12 @@ fn bench_size(pool: &'static BufferPool, size: usize, label: &str) {
     let max_possible = pool_capacity / size; // Max allocations that fit in pool
     let ring_size = (max_possible / 2).clamp(1, 1024);
     let mut ring: Vec<_> = (0..ring_size)
-        .map(|_| pool.alloc(size).unwrap().freeze())
+        .map(|_| alloc.alloc(size).unwrap().freeze())
         .collect();
 
     for i in 0..ITERATIONS {
         // Allocate new slice
-        let mut new_slice = pool.alloc(size).unwrap();
+        let mut new_slice = alloc.alloc(size).unwrap();
         new_slice.as_mut_slice()[0] = i as f32;
         black_box(&new_slice);
         let frozen = new_slice.freeze();

@@ -68,8 +68,8 @@ pub fn try_parse_request(buf: &[u8]) -> ParseResult {
 }
 
 /// Encode a response into `dst`. Caller must ensure `dst.len() == response_size(results.len())`.
-pub fn encode_response(num_vectors: u8, results: &[f32], dst: &mut [u8]) {
-    dst[0] = num_vectors;
+pub fn encode_response(results: &[f32], dst: &mut [u8]) {
+    dst[0] = results.len() as u8;
     dst[1..].copy_from_slice(bytemuck::cast_slice(results));
 }
 

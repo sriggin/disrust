@@ -9,7 +9,7 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 use spsc_bip_buffer::bip_buffer_with_len;
 
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::PoolAllocator;
 use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY, WRITE_BIP_CAPACITY};
 use crate::metrics;
 use crate::protocol;
@@ -181,7 +181,7 @@ pub struct IoThread {
     producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     response_poller: RespPoller,
     eventfd: RawFd,
-    buffer_pool: &'static BufferPool,
+    allocator: PoolAllocator,
 }
 
 impl IoThread {
@@ -191,7 +191,7 @@ impl IoThread {
         producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
         response_poller: RespPoller,
         eventfd: RawFd,
-        buffer_pool: &'static BufferPool,
+        allocator: PoolAllocator,
     ) -> Self {
         Self {
             thread_id,
@@ -199,7 +199,7 @@ impl IoThread {
             producer,
             response_poller,
             eventfd,
-            buffer_pool,
+            allocator,
         }
     }
 
@@ -210,7 +210,7 @@ impl IoThread {
             eventfd_buf: 0,
             listen_fd: self.listen_fd,
             producer: self.producer,
-            buffer_pool: self.buffer_pool,
+            allocator: self.allocator,
             thread_id: self.thread_id,
             eventfd: self.eventfd,
             write_keys: Vec::new(),
@@ -238,7 +238,7 @@ struct RunState {
     eventfd_buf: u64,
     listen_fd: RawFd,
     producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-    buffer_pool: &'static BufferPool,
+    allocator: PoolAllocator,
     thread_id: u8,
     eventfd: RawFd,
     /// Reusable buffer: connection keys that need a write submitted after an OP_EVENTFD batch.
@@ -262,7 +262,6 @@ impl RunState {
                             self.write_keys.clear();
                             for resp in &mut guard {
                                 let conn_id = resp.conn_id;
-                                let num_vectors = resp.num_vectors;
                                 let results = resp.results_slice();
                                 let len = protocol::response_size(results.len());
                                 metrics::dec_resp_occ();
@@ -278,7 +277,7 @@ impl RunState {
                                             break;
                                         };
                                         if let Some(mut r) = conn.write_bip_writer.reserve(len) {
-                                            protocol::encode_response(num_vectors, results, &mut r);
+                                            protocol::encode_response(results, &mut r);
                                             r.send();
                                             if conn.write_bip.in_flight_count()
                                                 < MAX_WRITES_IN_FLIGHT_PER_CONN
@@ -402,7 +401,7 @@ impl RunState {
         match request_flow::process_requests_from_buffer(
             buf,
             &mut self.producer,
-            self.buffer_pool,
+            &mut self.allocator,
             key,
             fd,
             self.thread_id,

@@ -4,7 +4,7 @@
 
 use disruptor::{Producer, RingBufferFull, SingleConsumerBarrier, SingleProducer};
 
-use crate::buffer_pool::{AllocError, BufferPool};
+use crate::buffer_pool::{AllocError, PoolAllocator};
 use crate::constants::FEATURE_DIM;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
@@ -30,7 +30,7 @@ pub enum ProcessRequestError {
 pub fn process_requests_from_buffer(
     buf: &[u8],
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-    pool: &'static BufferPool,
+    allocator: &mut PoolAllocator,
     conn_id: u16,
     fd: i32,
     thread_id: u8,
@@ -55,7 +55,7 @@ pub fn process_requests_from_buffer(
                     // so RingBufferFull never leaves a live PoolSlice outside the ring.
                     // Spin on Exhausted — the batch processor releases on the other thread.
                     let mut pool_slice = loop {
-                        match pool.alloc(feature_count) {
+                        match allocator.alloc(feature_count) {
                             Ok(s) => break s,
                             Err(AllocError::Exhausted { .. }) => std::hint::spin_loop(),
                             Err(AllocError::TooLarge { .. }) => unreachable!(

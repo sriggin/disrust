@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -158,6 +158,22 @@ pub struct BufferPool {
 unsafe impl Send for BufferPool {}
 unsafe impl Sync for BufferPool {}
 
+/// Exclusive allocation capability for a `BufferPool`.
+///
+/// This type is intentionally non-`Sync` and non-`Clone` so allocation cannot
+/// be shared concurrently across threads.
+pub struct PoolAllocator {
+    pool: &'static BufferPool,
+    _not_sync: std::marker::PhantomData<Cell<()>>,
+}
+
+impl PoolAllocator {
+    /// Allocate space for `len` f32 values from the underlying pool.
+    pub fn alloc(&mut self, len: usize) -> Result<PoolSliceMut, AllocError> {
+        self.pool.alloc_inner(len)
+    }
+}
+
 impl BufferPool {
     /// Create a new buffer pool with capacity for `capacity` f32 values.
     /// Pre-touches all pages to fault them in upfront, avoiding page fault latency
@@ -208,13 +224,21 @@ impl BufferPool {
         Box::leak(Self::new_boxed(capacity))
     }
 
+    /// Create an exclusive allocator capability for this pool.
+    pub fn allocator(&'static self) -> PoolAllocator {
+        PoolAllocator {
+            pool: self,
+            _not_sync: std::marker::PhantomData,
+        }
+    }
+
     /// Allocate space for `len` f32 values, returning a mutable slice.
     /// Wraps to offset 0 if allocation would straddle the end.
     ///
     /// # Errors
     /// - `AllocError::TooLarge` if `len` exceeds pool capacity
     /// - `AllocError::Exhausted` if pool is full (producer outpacing consumer)
-    pub fn alloc(&'static self, len: usize) -> Result<PoolSliceMut, AllocError> {
+    fn alloc_inner(&'static self, len: usize) -> Result<PoolSliceMut, AllocError> {
         if len > self.capacity {
             metrics::inc_pool_too_large();
             return Err(AllocError::TooLarge {
@@ -307,7 +331,7 @@ mod tests {
 
     fn with_pool<F>(capacity: usize, f: F)
     where
-        F: FnOnce(&'static BufferPool),
+        F: FnOnce(&'static BufferPool, &mut PoolAllocator),
     {
         let boxed = BufferPool::new_boxed(capacity);
         let ptr = Box::into_raw(boxed);
@@ -323,17 +347,18 @@ mod tests {
         }
         let _guard = PoolGuard { ptr };
         let pool = unsafe { &*ptr };
-        f(pool);
+        let mut alloc = pool.allocator();
+        f(pool, &mut alloc);
     }
 
     #[test]
     fn basic_alloc() {
-        with_pool(1000, |pool| {
-            let mut m1 = pool.alloc(10).expect("alloc failed");
+        with_pool(1000, |_pool, alloc| {
+            let mut m1 = alloc.alloc(10).expect("alloc failed");
             m1.as_mut_slice().fill(1.0);
             let s1 = m1.freeze();
 
-            let mut m2 = pool.alloc(20).expect("alloc failed");
+            let mut m2 = alloc.alloc(20).expect("alloc failed");
             m2.as_mut_slice().fill(2.0);
             let s2 = m2.freeze();
 
@@ -350,12 +375,12 @@ mod tests {
 
     #[test]
     fn wraparound() {
-        with_pool(100, |pool| {
-            let s1 = pool.alloc(95).expect("alloc failed").freeze();
+        with_pool(100, |_pool, alloc| {
+            let s1 = alloc.alloc(95).expect("alloc failed").freeze();
             drop(s1); // Free to make space
 
             // Next allocation would straddle, should wrap to 0
-            let mut m2 = pool.alloc(10).expect("alloc failed");
+            let mut m2 = alloc.alloc(10).expect("alloc failed");
             m2.as_mut_slice().fill(42.0);
             let s2 = m2.freeze();
 
@@ -366,19 +391,19 @@ mod tests {
 
     #[test]
     fn wraparound_overwrites_in_use_region() {
-        with_pool(100, |pool| {
+        with_pool(100, |_pool, alloc| {
             // Free 9 bytes at the start so read = 9.
-            let s_head = pool.alloc(9).expect("alloc failed").freeze();
+            let s_head = alloc.alloc(9).expect("alloc failed").freeze();
             drop(s_head);
 
             // Allocate 82 bytes at physical [9, 91). Hold this slice.
-            let mut m_mid = pool.alloc(82).expect("alloc failed");
+            let mut m_mid = alloc.alloc(82).expect("alloc failed");
             m_mid.as_mut_slice().fill(42.0);
             let slice_mid = m_mid.freeze();
             // write = 91, read = 9. Next alloc(10) would wrap to [0, 10) but that would
             // overwrite physical 9 (first element of slice_mid). Fix: return Exhausted.
 
-            let result = pool.alloc(10);
+            let result = alloc.alloc(10);
             assert!(
                 matches!(result, Err(AllocError::Exhausted { .. })),
                 "alloc(10) must return Exhausted when wrap would overwrite in-use [0, len)"
@@ -399,28 +424,28 @@ mod tests {
         // Exercises the fix to the straddle check: uses read % capacity, not raw read.
         // After many laps, raw `read` is large; the old `read < len` check would always
         // pass, allowing an overwrite. The correct check is `read % capacity < len`.
-        with_pool(100, |pool| {
+        with_pool(100, |_pool, alloc| {
             // Drive the cursors up by doing many full-capacity alloc+free cycles.
             // Each cycle advances write and read by 100 (one full lap).
             for _ in 0..1000 {
-                let s = pool.alloc(100).expect("alloc failed").freeze();
+                let s = alloc.alloc(100).expect("alloc failed").freeze();
                 drop(s);
             }
             // read = write = 100_000. physical offset = 0.
 
             // Now partially free the start: free 9, leaving read at 100_009, physical read = 9.
-            let s_head = pool.alloc(9).expect("alloc failed").freeze();
+            let s_head = alloc.alloc(9).expect("alloc failed").freeze();
             drop(s_head);
 
             // Allocate 82 bytes at physical [9, 91). Hold this slice.
-            let mut m_mid = pool.alloc(82).expect("alloc failed");
+            let mut m_mid = alloc.alloc(82).expect("alloc failed");
             m_mid.as_mut_slice().fill(99.0);
             let slice_mid = m_mid.freeze();
 
             // write % 100 = 91, read % 100 = 9.
             // alloc(10) would straddle: offset 91 + 10 > 100, so it tries to wrap to 0.
             // Physical read offset is 9, which is < 10, so it must return Exhausted.
-            let result = pool.alloc(10);
+            let result = alloc.alloc(10);
             assert!(
                 matches!(result, Err(AllocError::Exhausted { .. })),
                 "multi-lap: alloc(10) must return Exhausted when physical read offset < len"
@@ -432,8 +457,8 @@ mod tests {
 
     #[test]
     fn read_write() {
-        with_pool(100, |pool| {
-            let mut mutable = pool.alloc(5).expect("alloc failed");
+        with_pool(100, |_pool, alloc| {
+            let mut mutable = alloc.alloc(5).expect("alloc failed");
             mutable
                 .as_mut_slice()
                 .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0]);
@@ -445,27 +470,27 @@ mod tests {
 
     #[test]
     fn alloc_too_large() {
-        with_pool(100, |pool| {
-            let result = pool.alloc(200);
+        with_pool(100, |_pool, alloc| {
+            let result = alloc.alloc(200);
             assert!(matches!(result, Err(AllocError::TooLarge { .. })));
         });
     }
 
     #[test]
     fn exhaustion() {
-        with_pool(100, |pool| {
-            let _s1 = pool.alloc(90).expect("alloc failed");
+        with_pool(100, |_pool, alloc| {
+            let _s1 = alloc.alloc(90).expect("alloc failed");
             // Pool exhausted - can't allocate 20 more
-            let result = pool.alloc(20);
+            let result = alloc.alloc(20);
             assert!(matches!(result, Err(AllocError::Exhausted { .. })));
         });
     }
 
     #[test]
     fn alloc_zero_len_is_ok_and_noop() {
-        with_pool(10, |pool| {
+        with_pool(10, |pool, alloc| {
             let before = pool.utilization();
-            let mut m = pool.alloc(0).expect("alloc failed");
+            let mut m = alloc.alloc(0).expect("alloc failed");
             assert_eq!(m.as_mut_slice().len(), 0);
             drop(m.freeze());
             let after = pool.utilization();
@@ -475,28 +500,28 @@ mod tests {
 
     #[test]
     fn alloc_exact_capacity_then_free_allows_reuse() {
-        with_pool(8, |pool| {
-            let s = pool.alloc(8).expect("alloc failed").freeze();
-            assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
+        with_pool(8, |_pool, alloc| {
+            let s = alloc.alloc(8).expect("alloc failed").freeze();
+            assert!(matches!(alloc.alloc(1), Err(AllocError::Exhausted { .. })));
             drop(s);
-            assert!(pool.alloc(1).is_ok());
+            assert!(alloc.alloc(1).is_ok());
         });
     }
 
     #[test]
     fn exhaustion_then_reuse_after_drop() {
-        with_pool(100, |pool| {
-            let s1 = pool.alloc(95).expect("alloc failed").freeze();
-            assert!(matches!(pool.alloc(10), Err(AllocError::Exhausted { .. })));
+        with_pool(100, |_pool, alloc| {
+            let s1 = alloc.alloc(95).expect("alloc failed").freeze();
+            assert!(matches!(alloc.alloc(10), Err(AllocError::Exhausted { .. })));
             drop(s1);
-            assert!(pool.alloc(10).is_ok());
+            assert!(alloc.alloc(10).is_ok());
         });
     }
 
     #[test]
     fn utilization_tracks_simple_alloc_and_drop() {
-        with_pool(50, |pool| {
-            let s1 = pool.alloc(12).expect("alloc failed").freeze();
+        with_pool(50, |pool, alloc| {
+            let s1 = alloc.alloc(12).expect("alloc failed").freeze();
             assert_eq!(pool.utilization(), (12, 50));
             drop(s1);
             assert_eq!(pool.utilization(), (0, 50));
@@ -505,8 +530,8 @@ mod tests {
 
     #[test]
     fn release_frees_once() {
-        with_pool(10, |pool| {
-            let s = pool.alloc(10).expect("alloc failed").freeze();
+        with_pool(10, |pool, alloc| {
+            let s = alloc.alloc(10).expect("alloc failed").freeze();
             assert_eq!(pool.utilization(), (10, 10));
             s.release();
             assert_eq!(pool.utilization(), (0, 10));
@@ -517,8 +542,8 @@ mod tests {
 
     #[test]
     fn vector_access_returns_expected_slice() {
-        with_pool(32, |pool| {
-            let mut m = pool.alloc(8).expect("alloc failed");
+        with_pool(32, |_pool, alloc| {
+            let mut m = alloc.alloc(8).expect("alloc failed");
             m.as_mut_slice()
                 .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
             let s = m.freeze();
@@ -531,8 +556,8 @@ mod tests {
     #[test]
     #[should_panic]
     fn vector_access_out_of_bounds_panics() {
-        with_pool(8, |pool| {
-            let s = pool.alloc(4).expect("alloc failed").freeze();
+        with_pool(8, |_pool, alloc| {
+            let s = alloc.alloc(4).expect("alloc failed").freeze();
             let _ = s.vector(1, 4);
         });
     }
@@ -546,18 +571,18 @@ mod tests {
 
     #[test]
     fn wrap_like_behavior_still_allows_allocation() {
-        with_pool(10, |pool| {
-            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+        with_pool(10, |_pool, alloc| {
+            let s1 = alloc.alloc(7).expect("alloc failed").freeze();
             drop(s1);
             // This may require wrap internally, but from the API view it should succeed.
-            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            let s2 = alloc.alloc(7).expect("alloc failed").freeze();
             assert_eq!(s2.as_slice().len(), 7);
         });
     }
 
     #[test]
     fn alloc_too_large_error_includes_requested_and_capacity() {
-        with_pool(5, |pool| match pool.alloc(6) {
+        with_pool(5, |_pool, alloc| match alloc.alloc(6) {
             Err(AllocError::TooLarge {
                 requested,
                 capacity,
@@ -572,10 +597,10 @@ mod tests {
 
     #[test]
     fn exhausted_error_includes_in_use_and_capacity() {
-        with_pool(10, |pool| {
-            let _s1 = pool.alloc(7).expect("alloc failed");
-            let _s2 = pool.alloc(3).expect("alloc failed");
-            match pool.alloc(1) {
+        with_pool(10, |_pool, alloc| {
+            let _s1 = alloc.alloc(7).expect("alloc failed");
+            let _s2 = alloc.alloc(3).expect("alloc failed");
+            match alloc.alloc(1) {
                 Err(AllocError::Exhausted { in_use, capacity }) => {
                     assert_eq!(capacity, 10);
                     assert_eq!(in_use, 10);
@@ -588,34 +613,34 @@ mod tests {
 
     #[test]
     fn multiple_allocations_fill_capacity_then_fail() {
-        with_pool(12, |pool| {
-            let _a = pool.alloc(5).expect("alloc failed");
-            let _b = pool.alloc(4).expect("alloc failed");
-            let _c = pool.alloc(3).expect("alloc failed");
-            assert!(matches!(pool.alloc(1), Err(AllocError::Exhausted { .. })));
+        with_pool(12, |_pool, alloc| {
+            let _a = alloc.alloc(5).expect("alloc failed");
+            let _b = alloc.alloc(4).expect("alloc failed");
+            let _c = alloc.alloc(3).expect("alloc failed");
+            assert!(matches!(alloc.alloc(1), Err(AllocError::Exhausted { .. })));
         });
     }
 
     #[test]
     fn reuse_after_partial_drop_allows_additional_allocations() {
-        with_pool(20, |pool| {
-            let s1 = pool.alloc(8).expect("alloc failed").freeze();
-            let s2 = pool.alloc(8).expect("alloc failed").freeze();
-            assert!(matches!(pool.alloc(5), Err(AllocError::Exhausted { .. })));
+        with_pool(20, |_pool, alloc| {
+            let s1 = alloc.alloc(8).expect("alloc failed").freeze();
+            let s2 = alloc.alloc(8).expect("alloc failed").freeze();
+            assert!(matches!(alloc.alloc(5), Err(AllocError::Exhausted { .. })));
             drop(s1);
-            assert!(pool.alloc(5).is_ok());
+            assert!(alloc.alloc(5).is_ok());
             drop(s2);
         });
     }
 
     #[test]
     fn freeze_preserves_written_data_across_multiple_allocations() {
-        with_pool(16, |pool| {
-            let mut a = pool.alloc(4).expect("alloc failed");
+        with_pool(16, |_pool, alloc| {
+            let mut a = alloc.alloc(4).expect("alloc failed");
             a.as_mut_slice().copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
             let sa = a.freeze();
 
-            let mut b = pool.alloc(4).expect("alloc failed");
+            let mut b = alloc.alloc(4).expect("alloc failed");
             b.as_mut_slice().copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
             let sb = b.freeze();
 
@@ -626,12 +651,12 @@ mod tests {
 
     #[test]
     fn wrap_padding_is_reclaimed_after_drop() {
-        with_pool(10, |pool| {
-            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+        with_pool(10, |pool, alloc| {
+            let s1 = alloc.alloc(7).expect("alloc failed").freeze();
             drop(s1);
 
             // Forces wrap: offset=7, len=7 => padding=3.
-            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            let s2 = alloc.alloc(7).expect("alloc failed").freeze();
             drop(s2);
 
             // After all drops, utilization should return to zero.
@@ -641,15 +666,15 @@ mod tests {
 
     #[test]
     fn full_capacity_reusable_after_wrap_cycle() {
-        with_pool(10, |pool| {
-            let s1 = pool.alloc(7).expect("alloc failed").freeze();
+        with_pool(10, |_pool, alloc| {
+            let s1 = alloc.alloc(7).expect("alloc failed").freeze();
             drop(s1);
 
-            let s2 = pool.alloc(7).expect("alloc failed").freeze();
+            let s2 = alloc.alloc(7).expect("alloc failed").freeze();
             drop(s2);
 
             // Full capacity should be available again if wrap padding was reclaimed.
-            assert!(pool.alloc(10).is_ok());
+            assert!(alloc.alloc(10).is_ok());
         });
     }
 }

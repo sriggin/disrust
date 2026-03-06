@@ -1,6 +1,6 @@
 use disruptor::{EventPoller, Polling, SingleProducerBarrier};
 
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::PoolAllocator;
 use crate::config::MAX_IO_THREADS;
 use crate::constants::MAX_VECTORS_PER_REQUEST;
 use crate::response_queue::ResponseProducer;
@@ -17,7 +17,7 @@ pub type PollCycleResult = Result<(), Polling>;
 pub struct BatchProcessor {
     poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
     response_producers: Vec<ResponseProducer>,
-    result_pools: Vec<&'static BufferPool>,
+    result_allocators: Vec<PoolAllocator>,
     /// Reusable per-thread signal flags — avoids a heap allocation per poll cycle.
     signaled: Vec<bool>,
 }
@@ -26,7 +26,7 @@ impl BatchProcessor {
     pub fn new(
         poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
         response_producers: Vec<ResponseProducer>,
-        result_pools: Vec<&'static BufferPool>,
+        result_allocators: Vec<PoolAllocator>,
     ) -> Self {
         let num_threads = response_producers.len();
         assert!(
@@ -34,10 +34,15 @@ impl BatchProcessor {
             "io_thread_id is u8; max {} IO threads",
             MAX_IO_THREADS
         );
+        assert_eq!(
+            result_allocators.len(),
+            num_threads,
+            "result allocator count must match response producer count"
+        );
         Self {
             poller,
             response_producers,
-            result_pools,
+            result_allocators,
             signaled: vec![false; num_threads],
         }
     }
@@ -67,19 +72,18 @@ impl BatchProcessor {
                         self.response_producers.len()
                     );
 
-                    let pool_ref = if num_vecs > INLINE_RESULT_CAPACITY {
-                        Some(self.result_pools[thread_id])
-                    } else {
-                        None
-                    };
-
                     // Spin on recoverable failures (result pool exhausted until IO thread frees).
                     let response = loop {
+                        let allocator_ref = if num_vecs > INLINE_RESULT_CAPACITY {
+                            Some(&mut self.result_allocators[thread_id])
+                        } else {
+                            None
+                        };
                         match InferenceResponse::with_results(
                             event.conn_id,
                             event.request_seq,
                             &temp_results[..num_vecs],
-                            pool_ref,
+                            allocator_ref,
                         ) {
                             Ok(r) => break r,
                             Err(_) => std::hint::spin_loop(),

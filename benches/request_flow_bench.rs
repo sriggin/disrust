@@ -23,6 +23,7 @@ fn main() {
 
     let pool_capacity = RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
+    let mut allocator = pool.allocator();
 
     let buf = common::one_request_bytes(REQUESTS_PER_BATCH as u32);
     let mut full_buf = buf.clone();
@@ -39,7 +40,7 @@ fn main() {
         let _ = request_flow::process_requests_from_buffer(
             &full_buf,
             &mut producer,
-            pool,
+            &mut allocator,
             conn_id,
             0,
             thread_id,
@@ -59,7 +60,7 @@ fn main() {
         let result = request_flow::process_requests_from_buffer(
             black_box(&full_buf),
             &mut producer,
-            pool,
+            &mut allocator,
             conn_id,
             0,
             thread_id,

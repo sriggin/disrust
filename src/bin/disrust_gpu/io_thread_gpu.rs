@@ -12,7 +12,7 @@ use disruptor::{SingleConsumerBarrier, SingleProducer};
 use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
-use disrust::buffer_pool::BufferPool;
+use disrust::buffer_pool::PoolAllocator;
 use disrust::config::{READ_BUF_SIZE, SLAB_CAPACITY};
 use disrust::metrics;
 use disrust::request_flow;
@@ -106,7 +106,7 @@ pub struct IoThreadGpu {
     thread_id: u8,
     listen_fd: RawFd,
     producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-    buffer_pool: &'static BufferPool,
+    allocator: PoolAllocator,
 }
 
 impl IoThreadGpu {
@@ -114,13 +114,13 @@ impl IoThreadGpu {
         thread_id: u8,
         listen_fd: RawFd,
         producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-        buffer_pool: &'static BufferPool,
+        allocator: PoolAllocator,
     ) -> Self {
         Self {
             thread_id,
             listen_fd,
             producer,
-            buffer_pool,
+            allocator,
         }
     }
 
@@ -165,7 +165,7 @@ impl IoThreadGpu {
                             &mut ring,
                             &mut conns,
                             &mut self.producer,
-                            self.buffer_pool,
+                            &mut self.allocator,
                             self.thread_id,
                             key,
                         );
@@ -191,7 +191,7 @@ impl IoThreadGpu {
                     &mut ring,
                     &mut conns,
                     &mut self.producer,
-                    self.buffer_pool,
+                    &mut self.allocator,
                     self.thread_id,
                     key,
                 );
@@ -204,7 +204,7 @@ fn parse_and_maybe_read(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
-    buffer_pool: &'static BufferPool,
+    allocator: &mut PoolAllocator,
     thread_id: u8,
     key: u16,
 ) {
@@ -217,7 +217,7 @@ fn parse_and_maybe_read(
     match request_flow::process_requests_from_buffer(
         buf,
         producer,
-        buffer_pool,
+        allocator,
         key,
         fd,
         thread_id,
