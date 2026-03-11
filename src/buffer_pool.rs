@@ -60,6 +60,7 @@ impl PoolSlice {
         unsafe { std::slice::from_raw_parts(self.data.add(start), feature_dim) }
     }
 
+    #[allow(dead_code)]
     /// Returns true if `next` starts exactly where `self` ends.
     /// Used by the Submission Consumer to detect pool ring wrap-around between
     /// consecutive batch slots.
@@ -200,6 +201,7 @@ impl BufferPool {
         })
     }
 
+    #[allow(dead_code)]
     /// Create a pool over externally-allocated memory.
     ///
     /// The caller is responsible for page-touching and for ensuring `ptr` remains

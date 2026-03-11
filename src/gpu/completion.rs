@@ -1,11 +1,8 @@
-//! CompletionConsumer: awaits GPU handles, encodes responses, writes directly
+//! CompletionConsumer: waits for async GPU batch completion, encodes responses, writes directly
 //! to client fds via its own io_uring ring.
 
 use std::io;
-use std::os::unix::io::RawFd;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleConsumerBarrier};
 use io_uring::{opcode, squeue::Entry, types::Fd};
@@ -13,46 +10,6 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 use crate::batch_queue::BatchQueue;
 use crate::config::{MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, WRITE_BUF_SIZE, WRITE_BUF_SLOTS};
 use crate::ring_types::InferenceEvent;
-
-// -----------------------------------------------------------------------
-// Waker / blocking helpers
-// -----------------------------------------------------------------------
-
-const NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |ptr| RawWaker::new(ptr, &NOOP_VTABLE), // clone
-    |_| {},                                 // wake
-    |_| {},                                 // wake_by_ref
-    |_| {},                                 // drop
-);
-
-fn noop_waker() -> Waker {
-    // SAFETY: vtable is valid; data pointer is unused.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &NOOP_VTABLE)) }
-}
-
-/// Spin-poll a GPU run handle until completion.  Aborts on error.
-fn block_on_handle(handle: ort::session::run::OrtRunHandle) {
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut handle = handle;
-    loop {
-        let pinned = unsafe { Pin::new_unchecked(&mut handle) };
-        match pinned.poll(&mut cx) {
-            Poll::Ready(result) => {
-                result.unwrap_or_else(|e| {
-                    eprintln!("OrtRunHandle error: {e}");
-                    std::process::abort();
-                });
-                return;
-            }
-            Poll::Pending => std::hint::spin_loop(),
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// io_uring wrapper
-// -----------------------------------------------------------------------
 
 struct IoUring {
     inner: io_uring::IoUring,
@@ -87,50 +44,76 @@ impl IoUring {
     }
 
     /// Drain CQEs until `outstanding[set]` reaches 0.
-    fn drain_until_zero(&mut self, outstanding: &mut [usize; 2], set: usize) {
+    fn drain_until_zero(
+        &mut self,
+        outstanding: &mut [usize; 2],
+        write_meta: &[WriteMeta; WRITE_BUF_SLOTS],
+        set: usize,
+    ) {
         while outstanding[set] > 0 {
             self.inner
                 .submit_and_wait(1)
                 .expect("submit_and_wait failed");
             for cqe in self.inner.completion() {
-                let buf_set = cqe.user_data() as usize & 1;
-                outstanding[buf_set] = outstanding[buf_set].saturating_sub(1);
+                handle_write_cqe(cqe.user_data(), cqe.result(), outstanding, write_meta);
             }
         }
     }
 }
 
-// -----------------------------------------------------------------------
-// Output tensor handles (one per session slot)
-// -----------------------------------------------------------------------
-
-/// Raw pointer to a session's pinned output tensor, plus element count.
-///
-/// SAFETY: valid only while the owning GpuSession is alive and after the
-/// corresponding OrtRunHandle has been awaited.
-pub struct SessionOutputPtr {
-    pub ptr: *const f32,
-    pub len: usize,
+#[derive(Clone, Copy, Default)]
+struct WriteMeta {
+    fd: i32,
+    expected_len: u32,
 }
 
-// SAFETY: the ptr points to pinned host memory; CompletionConsumer accesses it
-// only after GPU completion (handle awaited), so there is no concurrent write.
-unsafe impl Send for SessionOutputPtr {}
+fn handle_write_cqe(
+    user_data: u64,
+    result: i32,
+    outstanding: &mut [usize; 2],
+    write_meta: &[WriteMeta; WRITE_BUF_SLOTS],
+) {
+    let buf_idx = user_data as usize;
+    let buf_set = buf_idx / MAX_SESSION_BATCH_SIZE;
+    outstanding[buf_set] = outstanding[buf_set].saturating_sub(1);
 
-// -----------------------------------------------------------------------
-// CompletionConsumer
-// -----------------------------------------------------------------------
+    let meta = write_meta[buf_idx];
+    if meta.expected_len == 0 {
+        return;
+    }
+
+    if result == meta.expected_len as i32 {
+        return;
+    }
+
+    if result < 0 {
+        match -result {
+            libc::EPIPE | libc::EBADF | libc::ECONNRESET => {}
+            libc::EAGAIN => unsafe {
+                libc::shutdown(meta.fd, libc::SHUT_WR);
+            },
+            _ => {}
+        }
+        return;
+    }
+
+    // Partial writes leave a corrupt frame on the stream. Shut down the write side so the
+    // reader observes EOF and normal cleanup runs on the IO thread.
+    unsafe {
+        libc::shutdown(meta.fd, libc::SHUT_WR);
+    }
+}
 
 pub struct CompletionConsumer {
     poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
     batch_queue: Arc<BatchQueue>,
-    /// Per-session output tensor pointers.  Index = session_idx from BatchEntry.
-    output_ptrs: Vec<SessionOutputPtr>,
     ring: IoUring,
     /// Double-buffered write buffers: [WRITE_BUF_SLOTS][WRITE_BUF_SIZE].
     write_bufs: Box<[[u8; WRITE_BUF_SIZE]; WRITE_BUF_SLOTS]>,
     /// Outstanding OP_WRITE counts per buffer set (A=0, B=1).
     outstanding: [usize; 2],
+    /// Per-buffer metadata for CQE result handling.
+    write_meta: [WriteMeta; WRITE_BUF_SLOTS],
     /// Currently active write buffer set.
     active_set: usize,
     /// Absolute ring sequence of the last slot fully processed.
@@ -144,17 +127,16 @@ impl CompletionConsumer {
     pub fn new(
         poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
         batch_queue: Arc<BatchQueue>,
-        output_ptrs: Vec<SessionOutputPtr>,
     ) -> io::Result<Self> {
         let sq_depth = (SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE) as u32;
         let ring = IoUring::new(sq_depth)?;
         Ok(Self {
             poller,
             batch_queue,
-            output_ptrs,
             ring,
             write_bufs: Box::new([[0u8; WRITE_BUF_SIZE]; WRITE_BUF_SLOTS]),
             outstanding: [0, 0],
+            write_meta: [WriteMeta::default(); WRITE_BUF_SLOTS],
             active_set: 0,
             local_cursor: -1,
         })
@@ -164,14 +146,15 @@ impl CompletionConsumer {
         loop {
             // Phase A: ensure the previous buffer set is fully retired.
             let prev_set = 1 - self.active_set;
-            self.ring.drain_until_zero(&mut self.outstanding, prev_set);
+            self.ring
+                .drain_until_zero(&mut self.outstanding, &self.write_meta, prev_set);
 
             // Drain any stray CQEs for the current set.
             {
                 let outstanding = &mut self.outstanding;
-                self.ring.drain_cqes(|user_data, _result| {
-                    let buf_set = user_data as usize & 1;
-                    outstanding[buf_set] = outstanding[buf_set].saturating_sub(1);
+                let write_meta = &self.write_meta;
+                self.ring.drain_cqes(|user_data, result| {
+                    handle_write_cqe(user_data, result, outstanding, write_meta);
                 });
             }
 
@@ -181,10 +164,10 @@ impl CompletionConsumer {
                     process_guard(
                         &mut guard,
                         &self.batch_queue,
-                        &self.output_ptrs,
                         &mut self.ring,
                         &mut self.write_bufs,
                         &mut self.outstanding,
+                        &mut self.write_meta,
                         self.active_set,
                         &mut self.local_cursor,
                     );
@@ -203,14 +186,14 @@ impl CompletionConsumer {
 fn process_guard(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
     batch_queue: &Arc<BatchQueue>,
-    output_ptrs: &[SessionOutputPtr],
     ring: &mut IoUring,
     write_bufs: &mut Box<[[u8; WRITE_BUF_SIZE]; WRITE_BUF_SLOTS]>,
     outstanding: &mut [usize; 2],
+    write_meta: &mut [WriteMeta; WRITE_BUF_SLOTS],
     active_set: usize,
     local_cursor: &mut i64,
 ) {
-    let guard_ref = &mut *guard;
+    let mut guard_ref = &mut *guard;
     let buf_base = active_set * MAX_SESSION_BATCH_SIZE;
     let mut slot_in_set: usize = 0;
 
@@ -230,12 +213,9 @@ fn process_guard(
             *local_cursor
         );
 
-        // Await GPU completion (guard held — ring slots cannot be recycled).
-        block_on_handle(entry.handle);
-
-        // SAFETY: GPU run complete; output tensor is fully written.
-        let out_ptr = &output_ptrs[entry.session_idx];
-        let output = unsafe { std::slice::from_raw_parts(out_ptr.ptr, out_ptr.len) };
+        entry.batch.completion.wait();
+        let output =
+            unsafe { std::slice::from_raw_parts(entry.batch.output_ptr, entry.batch.output_len) };
         let mut output_offset: usize = 0;
 
         let slots_in_batch = entry.end_sequence as i64 - *local_cursor;
@@ -259,9 +239,13 @@ fn process_guard(
             let wire_len = (1 + num_vecs * 4) as u32;
 
             // Submit OP_WRITE (user_data encodes the active set for CQE accounting).
+            write_meta[buf_idx] = WriteMeta {
+                fd,
+                expected_len: wire_len,
+            };
             let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), wire_len)
                 .build()
-                .user_data(active_set as u64);
+                .user_data(buf_idx as u64);
             ring.push(&sqe);
             outstanding[active_set] += 1;
 
@@ -273,6 +257,9 @@ fn process_guard(
         }
 
         *local_cursor = entry.end_sequence as i64;
+        let session_available = Arc::clone(&entry.batch.session_available);
+        drop(entry);
+        session_available.store(true, std::sync::atomic::Ordering::Release);
 
         // Exit when the guard is fully consumed.
         if guard_ref.len() == 0 {

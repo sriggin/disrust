@@ -132,8 +132,7 @@ impl IoThreadGpu {
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
 
-            for i in 0..cqe_buf.len() {
-                let (user_data, result) = cqe_buf[i];
+            for &(user_data, result) in &cqe_buf {
                 let (op, key) = decode_user_data(user_data);
                 match op {
                     OP_ACCEPT => handle_accept(&mut ring, &mut conns, result, self.listen_fd),

@@ -58,7 +58,7 @@ bytemuck = { version = "1", features = ["min_const_generics"] }
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
 # Specify the matching CUDA version feature, e.g. features = ["cuda-12040"] or ["cuda-11080"].
 # See https://docs.rs/cudarc for available version features.
-cudarc = { version = "0.12", optional = true }
+cudarc = { version = "0.19.3", features = ["cuda-12060"], optional = true }
 
 [features]
 metrics = []

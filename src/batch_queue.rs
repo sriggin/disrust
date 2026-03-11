@@ -1,6 +1,7 @@
 //! SPSC batch queue between SubmissionConsumer and CompletionConsumer.
 //!
-//! `OrtRunHandle` is non-trivial and cannot sit in a pre-allocated ring slot,
+//! `BatchEntry` contains completion state and ORT value wrappers that cannot sit in a
+//! pre-allocated ring slot,
 //! which is why this queue exists at all.  Hand-rolled to avoid the `spsc-bip-buffer`
 //! crate (which requires trivial element types).
 
@@ -8,15 +9,17 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::gpu::session::InFlightBatch;
+
 /// One entry in the batch queue.
 pub struct BatchEntry {
     /// Last ring slot (inclusive) covered by this GPU batch.
     pub end_sequence: u64,
     /// Which session pool slot was used for this batch.
     pub session_idx: usize,
-    /// Async GPU handle.  Awaiting resolves after GPU kernel completion and
-    /// the pinned output tensor is fully written.
-    pub handle: ort::session::run::OrtRunHandle,
+    /// In-flight GPU batch state. Submission enqueues this immediately after
+    /// `RunAsync` returns; completion waits for the callback to mark it ready.
+    pub batch: InFlightBatch,
 }
 
 /// Fixed-capacity SPSC ring for `BatchEntry` values.

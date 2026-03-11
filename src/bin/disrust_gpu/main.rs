@@ -3,7 +3,7 @@
 
 mod io_thread_gpu;
 
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 use std::thread;
 
@@ -17,7 +17,7 @@ use disrust::config::{
     BATCH_QUEUE_CAPACITY, GPU_BUFFER_POOL_BYTES, GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE,
     SESSION_POOL_SIZE,
 };
-use disrust::gpu::completion::{CompletionConsumer, SessionOutputPtr};
+use disrust::gpu::completion::CompletionConsumer;
 use disrust::gpu::session::GpuSession;
 use disrust::gpu::submission::SubmissionConsumer;
 use disrust::ring_types::InferenceEvent;
@@ -59,9 +59,9 @@ fn main() {
     set_factory_pool(BufferPool::new_boxed(1));
 
     // 2. Allocate pinned host memory for the buffer pool.
-    let (host_ptr, device_base) = unsafe {
+    let host_ptr = unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let status = cudarc::driver::sys::lib().cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
+        let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
         if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             eprintln!("cuMemAllocHost failed: {:?}", status);
             std::process::exit(1);
@@ -69,18 +69,7 @@ fn main() {
         // Touch all pages to avoid page-fault latency during operation.
         std::ptr::write_bytes(ptr as *mut u8, 0u8, GPU_BUFFER_POOL_BYTES);
 
-        let mut dev_ptr: u64 = 0;
-        let status = cudarc::driver::sys::lib().cuMemHostGetDevicePointer_v2(
-            &mut dev_ptr as *mut u64 as *mut _,
-            ptr,
-            0,
-        );
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!("cuMemHostGetDevicePointer failed: {:?}", status);
-            std::process::exit(1);
-        }
-
-        (ptr as *mut f32, dev_ptr)
+        ptr as *mut f32
     };
 
     // 3. Construct the BufferPool over the pinned memory (capacity in f32 units).
@@ -89,9 +78,8 @@ fn main() {
     let allocator = pool.allocator();
 
     eprintln!(
-        "disrust-gpu: pinned pool {} MB, device_base=0x{:x}",
+        "disrust-gpu: pinned pool {} MB",
         GPU_BUFFER_POOL_BYTES / 1_000_000,
-        device_base
     );
 
     // 4. Load ONNX model.
@@ -111,16 +99,8 @@ fn main() {
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
 
-    // 6. Construct session pool and extract output pointers for CompletionConsumer.
-    //
-    //    Ownership split:
-    //    - SubmissionConsumer takes Vec<GpuSession> (calls run_async → &mut self)
-    //    - CompletionConsumer takes Vec<SessionOutputPtr> (reads after GPU completion)
-    //
-    //    Safety: CompletionConsumer reads output_ptr only after awaiting OrtRunHandle,
-    //    which guarantees GPU writes are complete and SubmissionConsumer has not yet
-    //    started the next batch on the same session (ORT serializes same-session runs).
-    let mut sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
+    // 6. Construct session pool.
+    let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
         .map(|i| {
             eprintln!(
                 "disrust-gpu: loading session {}/{}",
@@ -131,34 +111,20 @@ fn main() {
         })
         .collect();
 
-    let output_ptrs: Vec<SessionOutputPtr> = sessions
-        .iter()
-        .map(|s: &GpuSession| {
-            let (ptr, len) = unsafe { s.output_raw_ptr() };
-            SessionOutputPtr { ptr, len }
-        })
-        .collect();
-
     // 7. Shared batch queue.
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
 
     // 8. Spawn SubmissionConsumer (owns sessions).
-    let sub_consumer = SubmissionConsumer::new(
-        submission_poller,
-        sessions,
-        Arc::clone(&batch_queue),
-        host_ptr as *const u8,
-        device_base,
-    );
+    let sub_consumer =
+        SubmissionConsumer::new(submission_poller, sessions, Arc::clone(&batch_queue));
     let sub_handle = thread::Builder::new()
         .name("gpu-submission".into())
         .spawn(move || sub_consumer.run())
         .expect("failed to spawn SubmissionConsumer");
 
     // 9. Spawn CompletionConsumer (has output pointers only).
-    let comp_consumer =
-        CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue), output_ptrs)
-            .expect("failed to create CompletionConsumer io_uring");
+    let comp_consumer = CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue))
+        .expect("failed to create CompletionConsumer io_uring");
     let comp_handle = thread::Builder::new()
         .name("gpu-completion".into())
         .spawn(move || comp_consumer.run())
