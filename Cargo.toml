@@ -19,6 +19,12 @@ path = "src/bin/client.rs"
 [[bin]]
 name = "disrust-gpu"
 path = "src/bin/disrust_gpu/main.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "ort-verify"
+path = "src/bin/ort_verify.rs"
+required-features = ["cuda"]
 
 [[bench]]
 name = "buffer_pool_bench"
@@ -49,9 +55,14 @@ slab = "0.4"
 libc = "0.2"
 spsc-bip-buffer = "0.2"
 bytemuck = { version = "1", features = ["min_const_generics"] }
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
+# Specify the matching CUDA version feature, e.g. features = ["cuda-12040"] or ["cuda-11080"].
+# See https://docs.rs/cudarc for available version features.
+cudarc = { version = "0.12", optional = true }
 
 [features]
 metrics = []
+cuda = ["dep:ort", "ort/cuda", "dep:cudarc"]
 
 [profile.release]
 opt-level = 3

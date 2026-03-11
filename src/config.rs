@@ -4,6 +4,7 @@
 //! Protocol constants (e.g. `FEATURE_DIM`, `MAX_VECTORS_PER_REQUEST`) live in `constants`.
 
 use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
+use std::mem::size_of;
 
 /// io_thread_id is u8 in InferenceEvent; do not spawn more than this many IO threads.
 pub const MAX_IO_THREADS: usize = 256;
@@ -36,6 +37,53 @@ pub const BUFFER_POOL_CAPACITY: usize = DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST
 /// divided by 4 as a conservative default (most responses are inline,
 /// so the pool rarely needs to hold more than a fraction of queue capacity).
 pub const RESULT_POOL_CAPACITY: usize = RESPONSE_QUEUE_SIZE * MAX_VECTORS_PER_REQUEST / 4;
+
+// ---------------------------------------------------------------------------
+// GPU pipeline (used by disrust-gpu binary; gated to suppress dead_code warnings)
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Number of ORT sessions in the session pool (N=1 = one batch in-flight at a time).
+pub const SESSION_POOL_SIZE: usize = 1;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Maximum disruptor ring slots accumulated into a single GPU batch.
+pub const MAX_SESSION_BATCH_SIZE: usize = 32;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Request ring buffer size for the GPU pipeline. Sized with 4× headroom over the
+/// maximum in-flight slots so the IO thread can run ahead while the GPU executes.
+pub const GPU_DISRUPTOR_SIZE: usize = SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE * 4;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Pinned host buffer pool capacity in f32 units (pass to `BufferPool::from_raw_ptr`).
+/// Byte count for `cuMemAllocHost` = `GPU_BUFFER_POOL_CAPACITY * size_of::<f32>()`.
+pub const GPU_BUFFER_POOL_CAPACITY: usize =
+    GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Byte size of the pinned host buffer pool allocation.
+pub const GPU_BUFFER_POOL_BYTES: usize = GPU_BUFFER_POOL_CAPACITY * size_of::<f32>();
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Batch queue capacity: +1 absorbs one wrap-induced extra batch per cycle (prevents deadlock).
+pub const BATCH_QUEUE_CAPACITY: usize = SESSION_POOL_SIZE + 1;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Total write buffer slots (double-buffered: 2 × MAX_SESSION_BATCH_SIZE).
+pub const WRITE_BUF_SLOTS: usize = MAX_SESSION_BATCH_SIZE * 2;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Per-slot write buffer byte size: 1 byte num_vectors + up to MAX_VECTORS_PER_REQUEST f32 results.
+pub const WRITE_BUF_SIZE: usize = 1 + MAX_VECTORS_PER_REQUEST * size_of::<f32>();
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+/// Maximum vectors in a single GPU batch (slots × max vectors per slot).
+pub const MAX_BATCH_VECTORS: usize = MAX_SESSION_BATCH_SIZE * MAX_VECTORS_PER_REQUEST;
+
+// ---------------------------------------------------------------------------
+// Compile-time sanity checks
+// ---------------------------------------------------------------------------
 
 // Compile-time sanity checks
 const _: () = assert!(

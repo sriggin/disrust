@@ -1,8 +1,8 @@
-//! Read-only IO thread for the GPU inference pipeline.
+//! Ingress-only IO thread for the GPU pipeline.
 //!
-//! Handles OP_ACCEPT and OP_READ only. The Completion Consumer writes
-//! responses directly to client fds via its own io_uring ring, so this
-//! thread has no write path, no response queue, no eventfd.
+//! Responsibilities: accept, read, parse, publish to request ring.
+//! No response poller, no eventfd, no write path — the CompletionConsumer
+//! owns all response writes via its own io_uring ring.
 
 use std::io;
 use std::os::unix::io::RawFd;
@@ -14,7 +14,6 @@ use slab::Slab;
 
 use disrust::buffer_pool::PoolAllocator;
 use disrust::config::{READ_BUF_SIZE, SLAB_CAPACITY};
-use disrust::metrics;
 use disrust::request_flow;
 use disrust::ring_types::InferenceEvent;
 
@@ -29,7 +28,6 @@ fn decode_user_data(user_data: u64) -> (u64, u16) {
     (user_data >> 32, user_data as u16)
 }
 
-/// Thin wrapper around IoUring that centralises submission helpers.
 struct IoUring {
     inner: io_uring::IoUring,
 }
@@ -46,7 +44,7 @@ impl IoUring {
             match unsafe { self.inner.submission().push(sqe) } {
                 Ok(()) => return,
                 Err(_) => {
-                    self.inner.submit().expect("submit failed during SQ flush");
+                    self.inner.submit().expect("SQ flush failed");
                 }
             }
         }
@@ -59,11 +57,7 @@ impl IoUring {
     }
 
     fn drain_cqes_into(&mut self, buf: &mut Vec<(u64, i32)>) {
-        buf.extend(
-            self.inner
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result())),
-        );
+        buf.extend(self.inner.completion().map(|c| (c.user_data(), c.result())));
     }
 }
 
@@ -125,10 +119,11 @@ impl IoThreadGpu {
     }
 
     pub fn run(mut self) {
-        let mut ring = IoUring::new(4096).expect("failed to create io_uring");
+        let mut ring = IoUring::new(4096).expect("io_uring creation failed");
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
-        let mut stall_keys: Vec<u16> = Vec::new();
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
+        // Reusable buffer for retry scan keys.
+        let mut retry_keys: Vec<u16> = Vec::new();
 
         submit_accept(&mut ring, self.listen_fd);
 
@@ -137,56 +132,34 @@ impl IoThreadGpu {
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
 
-            for &(user_data, result) in &cqe_buf {
+            for i in 0..cqe_buf.len() {
+                let (user_data, result) = cqe_buf[i];
                 let (op, key) = decode_user_data(user_data);
                 match op {
-                    OP_ACCEPT => {
-                        if result >= 0 {
-                            let client_fd = result as RawFd;
-                            let entry = conns.vacant_entry();
-                            let k = entry.key() as u16;
-                            entry.insert(Connection::new(client_fd));
-                            submit_read(&mut ring, &mut conns, k);
-                        }
-                        submit_accept(&mut ring, self.listen_fd);
-                    }
-                    OP_READ => {
-                        let key_usize = key as usize;
-                        if result <= 0 {
-                            conns.try_remove(key_usize);
-                            continue;
-                        }
-                        let bytes_read = result as usize;
-                        if let Some(conn) = conns.get_mut(key_usize) {
-                            conn.read_inflight = false;
-                            conn.read_len += bytes_read;
-                        }
-                        parse_and_maybe_read(
-                            &mut ring,
-                            &mut conns,
-                            &mut self.producer,
-                            &mut self.allocator,
-                            self.thread_id,
-                            key,
-                        );
-                    }
+                    OP_ACCEPT => handle_accept(&mut ring, &mut conns, result, self.listen_fd),
+                    OP_READ => handle_read(
+                        &mut ring,
+                        &mut conns,
+                        &mut self.producer,
+                        &mut self.allocator,
+                        self.thread_id,
+                        key,
+                        result,
+                    ),
                     _ => {}
                 }
             }
 
-            // Retry connections stalled by RingBufferFull: if the disruptor ring was full
-            // when we tried to publish, process_requests_from_buffer returned with
-            // consumed == 0 and we skipped the OP_READ resubmission (buffer was full).
-            // The Submission Consumer drains the ring on the other thread; on the next
-            // CQE batch (any OP_READ or OP_ACCEPT), we retry these connections.
-            // Linear scan is bounded by SLAB_CAPACITY and is typically a no-op.
-            stall_keys.clear();
+            // Ring-full retry: rescan connections with buffered data but no pending read.
+            // Covers the case where try_publish returned RingBufferFull while the read
+            // buffer was full — no new OP_READ was submitted so no future CQE will wake it.
+            retry_keys.clear();
             for (k, c) in conns.iter() {
                 if !c.read_inflight && c.read_len > 0 {
-                    stall_keys.push(k as u16);
+                    retry_keys.push(k as u16);
                 }
             }
-            for &key in &stall_keys {
+            for &key in &retry_keys {
                 parse_and_maybe_read(
                     &mut ring,
                     &mut conns,
@@ -198,6 +171,41 @@ impl IoThreadGpu {
             }
         }
     }
+}
+
+fn handle_accept(ring: &mut IoUring, conns: &mut Slab<Connection>, result: i32, listen_fd: RawFd) {
+    if result >= 0 {
+        let client_fd = result as RawFd;
+        let entry = conns.vacant_entry();
+        let key = entry.key();
+        entry.insert(Connection::new(client_fd));
+        submit_read(ring, conns, key as u16);
+    }
+    submit_accept(ring, listen_fd);
+}
+
+fn handle_read(
+    ring: &mut IoUring,
+    conns: &mut Slab<Connection>,
+    producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    allocator: &mut PoolAllocator,
+    thread_id: u8,
+    key: u16,
+    result: i32,
+) {
+    let key_usize = key as usize;
+    if result <= 0 {
+        conns.try_remove(key_usize);
+        return;
+    }
+    let bytes_read = result as usize;
+    let Some(conn) = conns.get_mut(key_usize) else {
+        return;
+    };
+    conn.read_inflight = false;
+    conn.read_len += bytes_read;
+
+    parse_and_maybe_read(ring, conns, producer, allocator, thread_id, key);
 }
 
 fn parse_and_maybe_read(
@@ -214,6 +222,7 @@ fn parse_and_maybe_read(
     };
     let buf = &conn.read_buf[..conn.read_len];
     let fd = conn.fd;
+
     match request_flow::process_requests_from_buffer(
         buf,
         producer,
@@ -223,11 +232,7 @@ fn parse_and_maybe_read(
         thread_id,
         &mut conn.next_request_seq,
     ) {
-        Ok((consumed, num_published)) => {
-            for _ in 0..num_published {
-                metrics::inc_req_occ();
-                metrics::inc_requests_published();
-            }
+        Ok((consumed, _)) => {
             if consumed > 0 {
                 conn.read_buf.copy_within(consumed..conn.read_len, 0);
                 conn.read_len -= consumed;
@@ -235,7 +240,7 @@ fn parse_and_maybe_read(
         }
         Err(e) => {
             eprintln!(
-                "io-gpu-{}: request flow error ({:?}), closing conn {}",
+                "io-gpu-{}: request parse error ({:?}), closing conn {}",
                 thread_id, e, key
             );
             conns.remove(key_usize);

@@ -1,6 +1,6 @@
 # GPU Inference Pipeline
 
-This document describes the GPU inference pipeline, which runs as a **separate binary** (`disrust-gpu`) alongside the existing CPU baseline (`disrust`). The existing binary and all its supporting code are unchanged. See `GPU_INFERENCE.md` for research background and decision rationale.
+This document describes the GPU inference pipeline, which runs as a **separate binary** (`disrust-gpu`) alongside the existing CPU baseline (`disrust`). The CPU baseline's runtime behavior and external interface are unchanged; shared internals may receive non-disruptive refactors to support the GPU path. See `GPU_INFERENCE.md` for research background and decision rationale.
 
 ---
 
@@ -11,7 +11,7 @@ disrust        (existing, unchanged)   CPU pipeline, batch_processor POC
 disrust-gpu    (new, additive)         GPU pipeline, ORT/CUDA, this document
 ```
 
-Shared types receive additive-only changes: a new field on `InferenceEvent`, new constructors on `BufferPool`/`PoolSlice`, and a new parameter on `request_flow`. No existing behaviour is altered.
+Shared code changes are constrained to preserve CPU baseline behavior and API compatibility. Most GPU-related integration should remain additive/new-code-path oriented.
 
 ---
 
@@ -91,7 +91,11 @@ Allocations within a batch are contiguous in the pool ring by construction — t
 
 **Wrap-around:** when the pool ring wraps mid-batch, the wrapping slot's data starts at a lower address than the previous slot's end. The Submission Consumer detects this via `PoolSlice::is_contiguous` on consecutive slots. A non-contiguous slot is a forced batch boundary: submit the pre-wrap batch to GPU, push `BatchEntry`, then submit the post-wrap events as a second batch immediately and push a second `BatchEntry` — all within the same guard drop. The post-wrap batch cannot be deferred to a later poll cycle: the alignment guarantee requires all `BatchEntry`s for a guard's events to be pushed before the guard is dropped. Deferral would mean dropping the guard without a `BatchEntry` for the post-wrap slots, which the CompletionConsumer would see as unaccounted events. With `SESSION_POOL_SIZE = 1` this produces two sequential submissions to the same session; ORT serializes concurrent `Run()` calls on a single session internally, so this is safe.
 
-**PoolSlice lifetime:** because the GPU reads directly from pinned host memory throughout kernel execution (zero-copy), `PoolSlice`s cannot be released at submission time. Releasing early would allow the IO thread to reallocate the same physical pool region while the GPU kernel is still issuing DMA reads. However, no explicit transfer is needed: `PoolSlice`s stay in `InferenceEvent.features` in the ring slots. The Completion Consumer's disruptor barrier prevents the IO thread from overwriting any slot in the batch until the Completion Consumer advances its sequence — which only happens after GPU completion and response writes. When the IO thread publishes to a recycled slot, the old `PoolSlice` is dropped by assignment, advancing the read cursor at the correct time.
+**PoolSlice lifetime:** because the GPU reads directly from pinned host memory throughout kernel execution (zero-copy), `PoolSlice`s cannot be released at submission time. Releasing early would allow the IO thread to reallocate the same physical pool region while the GPU kernel is still issuing DMA reads.
+
+`PoolSlice` ownership stays on the ring slot (`InferenceEvent.features`) throughout submission and GPU execution; no transfer into `BatchEntry` is required. The Completion Consumer holds the poll guard while awaiting GPU handles for the covered ranges, so those slots cannot be recycled by the producer during that window.
+
+After a batch handle resolves, while iterating that batch's slot range, CompletionConsumer submits the write and then calls `slot.features.release()` eagerly for each slot. This is the intended reclamation point (to avoid pool saturation from dead data). Later producer overwrite still drops the old `PoolSlice`, but `release()` is idempotent, so that drop is a no-op for already-released slices.
 
 ### Output path: pre-allocated per-session pinned output tensor
 
@@ -107,19 +111,52 @@ After the Completion Consumer awaits GPU completion, it walks ring slots in orde
 
 ### Completion Consumer loop
 
+Core invariants:
+- **Invariant 1 (PoolSlice reclaim):** `PoolSlice` is released eagerly by CompletionConsumer per slot, after that slot's batch GPU completion, not at submission time.
+- **Invariant 2 (Batch boundary):** GPU batch boundaries are defined by SubmissionConsumer via ordered `BatchEntry` boundaries (`end_sequence`), not by poll-guard boundaries.
+
 The Completion Consumer's sequence cursor (not an active guard) is what gates the producer from reusing ring slots. The cursor only advances when a poll guard is dropped. Therefore: as long as the guard is held, those slots cannot be recycled regardless of GPU execution state — but the guard must also be held until all GPU handles in its range complete, because dropping the guard advances the cursor past all covered slots simultaneously. If the guard covered two batches and was dropped after only the first GPU await, the cursor advances past the second batch's slots, eventually allowing the producer to overwrite them via ring wraparound before GPU 2 completes.
 
 Core loop structure:
 
-1. Drain write CQEs from the previous guard's OP_WRITEs — confirms the previous buffer set is free before reusing it
+1. Drain write CQEs and retire outstanding writes from the previous buffer set.
 2. `poll()` on the EventPoller → blocks until the SubmissionConsumer has published at least one event; returns a guard over all events in range `[cursor+1, submission_published]`
-3. For each `BatchEntry` within this guard's range (there may be more than one if the SubmissionConsumer ran multiple cycles while this consumer was awaiting GPU):
+3. For each `BatchEntry` within this guard's range:
    - Pop `(end_sequence, session_idx, OrtRunHandle)` from the batch queue
+   - Assert `end_sequence > local_cursor` and `end_sequence <= submission_published`
    - Await the handle (guard is held throughout — cursor has not advanced)
    - Reset `output_offset = 0`
-   - Walk `entry.end_sequence - local_cursor` events from the guard; for each event: read `fd`, `num_vectors`; encode wire format from `output_buf[output_offset..output_offset+num_vectors]` into the slot's write buffer; submit OP_WRITE; advance `output_offset` by `num_vectors`; advance `local_cursor` to `entry.end_sequence`
+   - Walk `end_sequence - local_cursor` slots from the guard; for each slot: read `fd`, `num_vectors`; encode wire format from `output_buf[output_offset..output_offset+num_vectors]` into the slot's write buffer; submit OP_WRITE; eagerly call `slot.features.release()`; advance `output_offset` by `num_vectors`
+   - Set `local_cursor = end_sequence`
 4. Flush the io_uring SQ
 5. Drop guard → Completion Consumer sequence advances to `submission_published`
+
+**Write completion accounting (required):**
+- CQEs can arrive out of order across connections and SQEs; FIFO CQE arrival must not be assumed.
+- The consumer must track an exact outstanding write count per buffer set (A/B), incrementing on each submitted OP_WRITE and decrementing on each corresponding write CQE.
+- A buffer set is reusable only when its outstanding count reaches zero.
+- "Drain CQEs once" is not sufficient proof of safety; reuse is gated by the counter, not by a single drain call.
+
+This gives the intended phase ordering per cycle:
+- **Phase A:** retire CQEs until the previous set's outstanding count is zero (safe to reuse).
+- **Phase B:** process one poll guard end-to-end (await GPU handles, encode full guard range, submit all writes for the current set), then swap sets.
+
+**Guard vs GPU batch (`BatchEntry`) delineation:**
+- A poll guard is a retention/liveness boundary; it is not the semantic GPU batch boundary.
+- Ordered `BatchEntry` boundaries define true batch boundaries.
+- One guard may contain multiple `BatchEntry` ranges.
+- Within one guard, process `BatchEntry`s in order:
+  1. await that batch's `OrtRunHandle`
+  2. encode and submit OP_WRITEs for that batch's covered slots
+  3. release those slots' `PoolSlice`s eagerly
+- Do **not** require "await all write CQEs for batch N before starting batch N+1" as the default flow.
+  Write completions are retired by the per-buffer-set outstanding counter, and reuse is gated by counter==0.
+  This preserves overlap and avoids unnecessary serialization.
+
+**Performance assumption:**
+- Do not assume socket write completions are always faster than GPU inference.
+- On healthy clients they are often fast, but slow receivers/backpressure can make write completion the long pole.
+- Correctness must depend on explicit completion accounting, not timing assumptions.
 
 **io_uring CQ sizing:** the kernel silently drops CQEs when the Completion Queue ring is full (sets `IORING_SQ_CQ_OVERFLOW`; entries are lost with no error returned). The CQ must never overflow between the CQE drain at step 1 and the next cycle's drain. The maximum pending CQEs equals the maximum OP_WRITEs from one guard: up to `SESSION_POOL_SIZE × MAX_SESSION_BATCH_SIZE` entries. Set the SQ to that value; the CQ is automatically 2× — sufficient.
 
@@ -136,11 +173,15 @@ struct BatchEntry {
 
 `BatchEntry` carries only batch-level metadata. Per-slot metadata (`fd`, `conn_id`, `num_vectors`) is read directly from the disruptor ring slots by the CompletionConsumer — those slots remain live because the CompletionConsumer's own barrier prevents the producer from overwriting them until the CompletionConsumer advances its sequence.
 
-`PoolSlice`s likewise stay in `InferenceEvent.features` in the ring slots; the same barrier holds them alive. When the IO thread eventually publishes to a recycled slot, assigning the new `PoolSlice` to `slot.features` drops the old one (advancing the read cursor). GPU has already completed before the CompletionConsumer advances its sequence, so the timing is always: GPU done → CompletionConsumer advances → IO thread overwrites slot → `PoolSlice::drop` → read cursor advances. No explicit transfer into `BatchEntry` is needed.
+`PoolSlice`s stay in `InferenceEvent.features` in the ring slots; CompletionConsumer explicitly releases them while processing each batch range after GPU completion. No explicit ownership transfer into `BatchEntry` is needed.
 
 `OrtRunHandle` is non-trivial and cannot sit in a pre-allocated ring slot, which is why `BatchEntry` exists at all. `spsc-bip-buffer` remains unsuitable; a hand-rolled SPSC ring of `BatchEntry` is required.
 
-**Alignment guarantee:** when CompletionConsumer's `poll()` returns a guard, all `BatchEntry`s covering those events are already in the queue. This holds because the SubmissionConsumer drops its cursor (making those events visible to CompletionConsumer) only after pushing all `BatchEntry`s for its entire guard. The CompletionConsumer iterates the guard's events, consuming one `BatchEntry` per batch (advancing to the next when `local_cursor == entry.end_sequence`); the iterator exhausts at the same point as the last `BatchEntry`'s range.
+**Submission visibility invariant:** the SubmissionConsumer must not publish any slot sequence to CompletionConsumer unless the corresponding `BatchEntry` boundary has already been enqueued in the batch queue. Given current poll-guard semantics (cursor advances on guard drop), this means all `BatchEntry`s covering that guard's published slots are enqueued before dropping the guard.
+
+**Completion boundary invariant:** within a guard, popped `BatchEntry.end_sequence` values must be strictly increasing and the final one must equal `submission_published`.
+
+Debug assertions should enforce this in development builds.
 
 **Batch queue capacity:** must be `SESSION_POOL_SIZE + 1`, not `SESSION_POOL_SIZE`. A pool ring wrap mid-cycle forces two batches from one SubmissionConsumer guard. With capacity = `SESSION_POOL_SIZE`, the SubmissionConsumer blocks trying to push the second `BatchEntry` while its guard is still held. The CompletionConsumer, gated on SubmissionConsumer's cursor (which hasn't advanced because the guard is held), sees no events and spins. Deadlock. The `+1` absorbs exactly one wrap-induced extra batch per cycle, which is the maximum possible (pool ring can wrap at most once per SubmissionConsumer poll cycle given the pool and ring sizing constraints).
 
@@ -165,12 +206,19 @@ Additive changes to shared types:
 | `PoolSlice::is_contiguous` | `buffer_pool.rs` | Pointer comparison; detects pool ring wrap-around |
 | `fd` parameter in `request_flow` | `request_flow.rs` | Propagates fd into every published slot |
 
-New files:
+No GPU-specific runtime files are intentionally kept in-tree at this stage. The plan remains the source of truth.
 
-| Item | Location | Notes |
-|---|---|---|
-| `IoThreadGpu` | `src/bin/io_thread_gpu.rs` | OP_ACCEPT + OP_READ only; no write path |
-| GPU binary entry point | `src/bin/disrust_gpu.rs` | Stub; consumers and ring not yet wired |
+### Captured Implementation Notes (from removed scaffolding)
+
+The following non-obvious behaviors were validated in a now-removed `disrust-gpu` ingress scaffold and should be preserved when implementation resumes:
+
+- **Ingress thread responsibilities:** accept/read/parse/publish only; no response poller, no eventfd, no write path. Completion consumer owns all response writes.
+- **Ring-full retry behavior:** after each CQE batch, linearly rescan connections with `!read_inflight && read_len > 0` and re-run parse/publish. This prevents a connection from stalling when `RingBufferFull` occurred while its read buffer was full.
+- **Read resubmission rule:** after parse/publish, submit a new OP_READ only when `read_len < READ_BUF_SIZE`.
+- **Socket setup:** listener uses `SO_REUSEADDR`, `SO_REUSEPORT`, `NONBLOCK`, and `TCP_NODELAY`.
+- **Factory pool prerequisite:** `set_factory_pool(BufferPool::new_boxed(1))` must run before disruptor factory pre-allocation (`InferenceEvent::factory` uses `PoolSlice::empty()`).
+- **Provisional ring depth:** io_uring depth `4096` was sufficient for ingress-only accept/read scaffolding.
+- **Allocator capability use:** ingress path should allocate via `PoolAllocator` (single-allocator invariant), not direct `BufferPool::alloc`.
 
 ---
 
@@ -179,7 +227,7 @@ New files:
 1. **Config** — add GPU-path constants to `config.rs` (separate from CPU constants):
    - `SESSION_POOL_SIZE` (default 1)
    - `MAX_SESSION_BATCH_SIZE` (max disruptor slots per GPU batch)
-   - `SUBMISSION_TIMEOUT_NS` — maximum nanoseconds the SubmissionConsumer spends in the idle spin loop between `poll()` calls before calling `std::hint::spin_loop()` or yielding. This is not a "flush partial batch" timer: with the poll-guard model there is no partial batch held across cycles — each guard is fully committed. The constant governs only how aggressively the SubmissionConsumer busy-spins when the ring is empty, preventing a dedicated core burning CPU with no GPU work. Implementation: record `start = Instant::now()` before entering the spin; on each `Err(Polling::NoEvents)` check `start.elapsed() >= Duration::from_nanos(SUBMISSION_TIMEOUT_NS)` and call `std::hint::spin_loop()` (or `thread::yield_now()`) if exceeded. Default: ~100_000 ns.
+   - `SUBMISSION_TIMEOUT_NS` — deferred for now; idle behavior is explicit spin (`std::hint::spin_loop()`) on `Err(Polling::NoEvents)`. This is not a "flush partial batch" timer: with the poll-guard model there is no partial batch held across cycles — each guard is fully committed. Revisit if idle CPU burn becomes an issue in profiling.
    - `GPU_DISRUPTOR_SIZE` — do not reuse `DISRUPTOR_SIZE` (65536 slots × max request size = 268MB pinned memory; far too large). Size to `SESSION_POOL_SIZE × MAX_SESSION_BATCH_SIZE × 4` as headroom.
    - `GPU_BUFFER_POOL_CAPACITY` = `GPU_DISRUPTOR_SIZE × MAX_VECTORS_PER_REQUEST × FEATURE_DIM`. With `GPU_DISRUPTOR_SIZE` in the low hundreds, this is low tens of MB of pinned memory — affordable.
 
@@ -193,7 +241,7 @@ New files:
 
 3. **Batch queue** — `BatchEntry` type (`end_sequence`, `session_idx`, `handle`), fixed-capacity SPSC ring with capacity `SESSION_POOL_SIZE + 1` (the `+1` prevents deadlock when a pool ring wrap forces two batches from one SubmissionConsumer guard cycle)
 
-4. **`SubmissionConsumer`** — disruptor polling, batch accumulation with `is_contiguous` wrap detection, ORT submission via `TensorRefMut::from_raw`, batch queue push, idle timeout via `SUBMISSION_TIMEOUT_NS`.
+4. **`SubmissionConsumer`** — disruptor polling, batch accumulation with `is_contiguous` wrap detection, ORT submission via `TensorRefMut::from_raw`, batch queue push, idle spin on `Err(Polling::NoEvents)` (timeout-based policy deferred; see Config item 1).
 
    The disruptor poll guard covers all events delivered in one `poll()` call. The guard must be held across all ORT submissions from that cycle (there may be multiple due to wrap-around or max-size splits); the guard drop advances the SubmissionConsumer's sequence. If a batch queue push blocks (queue full — all sessions in flight), this also stalls the guard drop, which stalls the IO thread's ring slot reuse. This is correct backpressure. The SubmissionConsumer does not accumulate events across poll cycles; batching occurs naturally from events that arrive between consecutive polls.
 
@@ -201,14 +249,14 @@ New files:
 
 5. **`CompletionConsumer`** — batch queue pop, GPU await, output tensor read, direct OP_WRITE via own io_uring ring. No `InferenceResponse`, no pool. Wire format is encoded from the output tensor directly into pre-allocated per-slot write buffers (`257` bytes each, `2 × MAX_SESSION_BATCH_SIZE` total for double-buffering). See Completion Consumer loop and Response write path sections above.
 
-6. **Wire `disrust_gpu.rs`** — `cudaMallocHost` pool allocation, `cuMemHostGetDevicePointer` for device base, session pool construction, consumer thread spawning. The correct two-consumer builder chain is:
+6. **Wire `disrust-gpu` binary** — add entrypoint + modules (`src/bin/disrust_gpu/main.rs`, `src/bin/disrust_gpu/io_thread_gpu.rs`) with `cudaMallocHost` pool allocation, `cuMemHostGetDevicePointer` for device base, session pool construction, and consumer thread spawning. The correct two-consumer builder chain is:
    ```rust
    let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
    let (submission_poller, builder) = builder.event_poller();
    let (completion_poller, builder) = builder.and_then().event_poller();
    let producer = builder.build();
    ```
-   `event_poller()` alone is non-gating; `.and_then()` installs the dependency barrier. `completion_poller` has type `EventPoller<InferenceEvent, SingleConsumerBarrier>` and is gated on `submission_poller`'s cursor. The producer is gated on `completion_poller`'s cursor (the slowest consumer). **Note:** the CompletionConsumer must hold its poll guard across all GPU awaits for all `BatchEntry`s within that guard's range — guard drop advances the cursor and frees slots for the producer. Multiple `BatchEntry`s may fall within one guard (if the SubmissionConsumer ran multiple cycles); the number of slots per entry is `entry.end_sequence - cursor`.
+   `event_poller()` alone is non-gating; `.and_then()` installs the dependency barrier. `completion_poller` has type `EventPoller<InferenceEvent, SingleConsumerBarrier>` and is gated on `submission_poller`'s cursor. The producer is gated on `completion_poller`'s cursor (the slowest consumer). **Note:** the CompletionConsumer must hold its poll guard across all GPU awaits for all `BatchEntry`s within that guard's range — guard drop advances the cursor and frees slots for the producer. Multiple `BatchEntry`s may fall within one guard; slots covered by one entry are computed from the running cursor (`entry.end_sequence - local_cursor`).
 
 ---
 
