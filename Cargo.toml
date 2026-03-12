@@ -10,14 +10,6 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "disrust"
-path = "src/main.rs"
-
-[[bin]]
-name = "client"
-path = "src/bin/client.rs"
-
-[[bin]]
-name = "disrust-gpu"
 path = "src/bin/disrust_gpu/main.rs"
 required-features = ["cuda"]
 
@@ -42,14 +34,13 @@ path = "benches/request_flow_bench.rs"
 harness = false
 
 [[bench]]
-name = "pipeline_e2e_bench"
-path = "benches/pipeline_e2e_bench.rs"
-harness = false
-
-[[bench]]
 name = "gpu_inference_bench"
 path = "benches/gpu_inference_bench.rs"
 harness = false
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -66,6 +57,7 @@ ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
 cudarc = { version = "0.19.3", features = ["cuda-12060"], optional = true }
 
 [features]
+default = ["cuda"]
 metrics = []
 cuda = ["dep:ort", "ort/cuda", "dep:cudarc"]
 

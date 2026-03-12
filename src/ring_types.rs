@@ -1,28 +1,13 @@
-use crate::buffer_pool::{PoolAllocator, PoolSlice};
+use crate::buffer_pool::PoolSlice;
 use crate::constants::FEATURE_DIM;
 use std::mem::size_of;
 
-// Calculate inline capacity using const math to fit exactly in 64-byte cache line
-pub const INLINE_RESULT_CAPACITY: usize = {
-    const METADATA_SIZE: usize = size_of::<u64>() +   // request_seq
-        size_of::<u16>() +   // conn_id
-        size_of::<u8>(); // num_vectors (1..=MAX_VECTORS_PER_REQUEST)
-
-    const TARGET_STRUCT_SIZE: usize = 64;
-    const ENUM_BUDGET: usize = TARGET_STRUCT_SIZE - METADATA_SIZE; // 53 bytes
-
-    // Enum is max(Inline size, Pooled size) + discriminant
-    // Conservatively reserve 8 bytes for discriminant/padding
-    const INLINE_BYTES: usize = ENUM_BUDGET - 8; // 45 bytes
-
-    INLINE_BYTES / size_of::<f32>()
-};
-
 /// Entry in the disruptor ring buffer. Pre-allocated per slot via factory.
-/// IO threads fill these in the publish closure; batch processor reads them.
+/// IO threads fill these in the publish closure; the ONNX submission/completion
+/// consumers read them.
 ///
 /// Invariants:
-/// - `io_thread_id`: index into batch processor's response_producers/result_allocators (u8 → max 256 IO threads).
+/// - `io_thread_id`: ingress thread id (u8 → max 256 IO threads).
 /// - `conn_id`: slab key from the IO thread's Slab<Connection> (u16 → slab capacity must be ≤ 65535).
 /// - `num_vectors`: 1..=MAX_VECTORS_PER_REQUEST (u8).
 #[repr(C, align(64))]
@@ -54,113 +39,7 @@ impl InferenceEvent {
     }
 }
 
-/// Storage for inference results - either inline or pooled depending on size.
-pub enum ResultStorage {
-    /// Small results (≤INLINE_RESULT_CAPACITY) stored inline in cache line.
-    Inline([f32; INLINE_RESULT_CAPACITY]),
-
-    /// Large results (>INLINE_RESULT_CAPACITY) stored in buffer pool.
-    Pooled(PoolSlice),
-}
-
-/// Response sent back from batch processor to IO threads.
-/// Sized to fit EXACTLY in a 64-byte cache line (no padding needed).
-/// Optimized to inline small results (≤INLINE_RESULT_CAPACITY vectors).
-#[repr(C, align(64))]
-pub struct InferenceResponse {
-    pub request_seq: u64,
-    pub conn_id: u16,
-    pub num_vectors: u8,
-    pub results: ResultStorage,
-}
-
-// Static assertions - fail at compile time if size is wrong
-const _: () = assert!(
-    size_of::<InferenceResponse>() == 64,
-    "InferenceResponse must be exactly 64 bytes"
-);
-
 const _: () = assert!(
     size_of::<InferenceEvent>() == 64,
     "InferenceEvent must be exactly 64 bytes"
 );
-
-const _: () = assert!(
-    INLINE_RESULT_CAPACITY >= 8,
-    "Inline capacity should handle typical workloads (1-8 vectors)"
-);
-
-impl Default for InferenceResponse {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InferenceResponse {
-    /// Create a new response. Automatically chooses inline vs pooled storage.
-    ///
-    /// - Small results (≤INLINE_RESULT_CAPACITY): Uses inline storage (zero allocations)
-    /// - Large results (>INLINE_RESULT_CAPACITY): Allocates from pool
-    pub fn with_results(
-        conn_id: u16,
-        request_seq: u64,
-        results: &[f32],
-        allocator: Option<&mut PoolAllocator>,
-    ) -> Result<Self, &'static str> {
-        let num_vectors = results.len();
-        assert!(
-            num_vectors <= crate::constants::MAX_VECTORS_PER_REQUEST,
-            "results.len() must be <= MAX_VECTORS_PER_REQUEST"
-        );
-        let num_vectors = num_vectors as u8;
-
-        if results.len() <= INLINE_RESULT_CAPACITY {
-            // Fast path: inline storage, no pool needed
-            let mut inline_array = [0.0f32; INLINE_RESULT_CAPACITY];
-            inline_array[..results.len()].copy_from_slice(results);
-
-            Ok(Self {
-                conn_id,
-                request_seq,
-                num_vectors,
-                results: ResultStorage::Inline(inline_array),
-            })
-        } else {
-            // Large results: allocate from pool
-            let allocator = allocator.ok_or("allocator required for large results")?;
-
-            let mut pool_slice = allocator
-                .alloc(results.len())
-                .map_err(|_| "pool allocation failed")?;
-            pool_slice.as_mut_slice().copy_from_slice(results);
-
-            Ok(Self {
-                conn_id,
-                request_seq,
-                num_vectors,
-                results: ResultStorage::Pooled(pool_slice.freeze()),
-            })
-        }
-    }
-
-    /// Get result slice for reading (works for both inline and pooled).
-    /// For `Inline`, the array is `INLINE_RESULT_CAPACITY` elements but only the
-    /// first `num_vectors` are valid. For `Pooled`, the `PoolSlice` was allocated
-    /// with exactly `num_vectors` elements, so `as_slice()` is already the right length.
-    pub fn results_slice(&self) -> &[f32] {
-        match &self.results {
-            ResultStorage::Inline(arr) => &arr[..self.num_vectors as usize],
-            ResultStorage::Pooled(slice) => slice.as_slice(),
-        }
-    }
-
-    /// Factory function for disruptor pre-allocation (creates empty inline response).
-    pub fn new() -> Self {
-        Self {
-            conn_id: 0,
-            request_seq: 0,
-            num_vectors: 0,
-            results: ResultStorage::Inline([0.0f32; INLINE_RESULT_CAPACITY]),
-        }
-    }
-}

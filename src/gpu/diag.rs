@@ -45,7 +45,7 @@ impl Reporter {
         }
         self.last = Instant::now();
         eprintln!(
-            "disrust-gpu diag: reads submit={} cqe={} bytes={} neg={} consumed={} buffered={} ring_full={} published={} batches_submitted={} vectors_submitted={} batches_completed={} responses_written={} write_sqes={} write_cqes={} write_neg={}",
+            "disrust diag: reads submit={} cqe={} bytes={} neg={} consumed={} buffered={} ring_full={} published={} batches_submitted={} vectors_submitted={} batches_completed={} responses_written={} write_sqes={} write_cqes={} write_neg={}",
             READ_SUBMITS.load(Ordering::Relaxed),
             READ_CQES.load(Ordering::Relaxed),
             READ_BYTES.load(Ordering::Relaxed),

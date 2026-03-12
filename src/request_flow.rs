@@ -82,10 +82,15 @@ pub fn process_requests_from_buffer(
                     slot.features = pool_slice.freeze();
                 }) {
                     Ok(_) => {}
-                    Err(RingBufferFull) => break,
+                    Err(RingBufferFull) => {
+                        crate::metrics::inc_req_ring_full();
+                        break;
+                    }
                 }
                 *request_seq += 1;
                 num_published += 1;
+                crate::metrics::inc_requests_published();
+                crate::metrics::inc_req_occ();
                 consumed += bytes_consumed;
             }
             protocol::ParseResult::Incomplete(_) => {

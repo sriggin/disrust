@@ -1,5 +1,5 @@
-//! GPU inference server: accepts TCP connections, publishes to request ring,
-//! runs ONNX inference on GPU via ORT CUDA EP, writes responses directly.
+//! Default disrust server: accepts TCP connections, publishes to the request
+//! ring, runs ONNX inference via ORT CUDA EP, and writes responses directly.
 
 mod io_thread_gpu;
 
@@ -9,6 +9,7 @@ use std::thread;
 
 use clap::Parser;
 use disruptor::{BusySpin, build_single_producer};
+use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use disrust::batch_queue::BatchQueue;
@@ -21,12 +22,13 @@ use disrust::gpu::completion::CompletionConsumer;
 use disrust::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
 use disrust::gpu::session::GpuSession;
 use disrust::gpu::submission::SubmissionConsumer;
+use disrust::metrics;
 use disrust::ring_types::InferenceEvent;
 
 use io_thread_gpu::IoThreadGpu;
 
 #[derive(Parser)]
-#[command(about = "High-performance GPU io_uring inference server")]
+#[command(about = "High-performance ONNX/CUDA io_uring inference server")]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value_t = 9900)]
@@ -55,33 +57,42 @@ fn create_listener(port: u16) -> Socket {
 }
 
 fn main() {
+    metrics::spawn_reporter();
     let args = Args::parse();
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
 
     if max_batch_slots == 0 || max_batch_slots > MAX_SESSION_BATCH_SIZE {
         eprintln!(
-            "disrust-gpu: --max-batch-slots must be in 1..={}",
+            "disrust: --max-batch-slots must be in 1..={}",
             MAX_SESSION_BATCH_SIZE
         );
         std::process::exit(1);
     }
 
-    eprintln!("disrust-gpu: starting on port {}", port);
+    eprintln!("disrust: starting on port {}", port);
     eprintln!(
-        "disrust-gpu: max_batch_slots={} (compile-time max={})",
+        "disrust: max_batch_slots={} (compile-time max={})",
         max_batch_slots, MAX_SESSION_BATCH_SIZE
     );
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
-        eprintln!("disrust-gpu preflight failed: {e}");
+        eprintln!("disrust preflight failed: {e}");
         std::process::exit(1);
     });
-    eprintln!("disrust-gpu: using ORT dylib {}", ort_dylib.display());
+    eprintln!("disrust: using ORT dylib {}", ort_dylib.display());
+    eprintln!("disrust: initializing ONNX Runtime");
+    let committed = init_from(&ort_dylib)
+        .unwrap_or_else(|e| {
+            eprintln!("disrust preflight failed: ort::init_from failed: {e}");
+            std::process::exit(1);
+        })
+        .commit();
+    eprintln!("disrust: ONNX Runtime initialized (fresh={committed})");
     verify_cuda_startup().unwrap_or_else(|e| {
-        eprintln!("disrust-gpu preflight failed: {e}");
+        eprintln!("disrust preflight failed: {e}");
         std::process::exit(1);
     });
-    eprintln!("disrust-gpu: CUDA driver preflight ok");
+    eprintln!("disrust: CUDA driver preflight ok");
 
     // 1. Factory pool for empty PoolSlices during disruptor pre-allocation.
     set_factory_pool(BufferPool::new_boxed(1));
@@ -97,7 +108,7 @@ fn main() {
     let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
         .map(|i| {
             eprintln!(
-                "disrust-gpu: loading session {}/{}",
+                "disrust: loading session {}/{}",
                 i + 1,
                 SESSION_POOL_SIZE
             );
@@ -125,7 +136,7 @@ fn main() {
     let allocator = pool.allocator();
 
     eprintln!(
-        "disrust-gpu: pinned pool {} MB",
+        "disrust: pinned pool {} MB",
         GPU_BUFFER_POOL_BYTES / 1_000_000,
     );
 
@@ -168,7 +179,7 @@ fn main() {
     let listen_socket = create_listener(port);
     let io = IoThreadGpu::new(0, listen_socket.into_raw_fd(), producer, allocator);
 
-    eprintln!("disrust-gpu: ready");
+    eprintln!("disrust: ready");
 
     let io_handle = thread::Builder::new()
         .name("io-gpu-0".into())

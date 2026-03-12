@@ -269,6 +269,7 @@ fn process_batch(
         output_offset += num_vecs;
         slot_in_set += 1;
         diag::bump(&RESPONSES_WRITTEN, 1);
+        crate::metrics::dec_req_occ();
     }
 
     rotate_set(ring, outstanding, write_meta, active_set, &mut slot_in_set);

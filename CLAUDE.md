@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`disrust` is a high-performance TCP inference server built with Rust, using io_uring for asynchronous I/O and the LMAX disruptor pattern for lock-free inter-thread communication. The server processes fixed-size feature vectors (16 f32 values per vector; see `constants::FEATURE_DIM`) and returns inference results with minimal latency.
+`disrust` is a high-performance TCP inference server built with Rust, using io_uring for asynchronous I/O and the LMAX disruptor pattern for lock-free inter-thread communication. The server processes fixed-size feature vectors (16 f32 values per vector; see `constants::FEATURE_DIM`) and runs ONNX inference through ONNX Runtime with the CUDA execution provider.
 
 ## Dev Environment
 
@@ -18,7 +18,7 @@ io_uring and SO_REUSEPORT require Linux. On Linux, run `cargo` commands directly
 ./target/release/disrust --port 9900
 
 # Run with metrics (deltas every 10s to stdout)
-cargo build --release --features metrics && ./target/release/disrust
+cargo build --release --features metrics && ./target/release/disrust --model model.onnx
 
 # Client smoke / pipeline / benchmark
 cargo run --bin client
@@ -34,40 +34,37 @@ cargo bench --bench buffer_pool_bench -- --pool-sizes
 
 ### Threading Model
 
-Currently **1 IO thread + 1 batch processor thread**. The disruptor is SPSC (`build_single_producer`). Expanding to N IO threads requires switching to `build_multi_producer`, making `IoThread::producer` a `MultiProducer` (Clone), and `BatchProcessor::poller` to `EventPoller<InferenceEvent, MultiProducerBarrier>`. Each IO thread already gets a dedicated response channel and `BufferPool`.
+Currently **1 ingress IO thread + 2 ONNX consumer threads**. The disruptor is SPSC (`build_single_producer`). Expanding to N IO threads requires switching to `build_multi_producer` and revisiting the single-producer assumptions in the ingress and GPU consumer pipeline.
 
-- **IO Thread**: io_uring event loop — accept, read, write, eventfd. Parses protocol, publishes to request disruptor, writes responses.
-- **Batch Processor**: Busy-spins on request disruptor, runs inference (currently: sum of feature vector — replace in `batch_processor.rs`), publishes responses to per-thread response queues.
+- **Ingress IO Thread**: io_uring event loop for accept/read only. Parses protocol and publishes `InferenceEvent`s.
+- **Submission Consumer**: batches `InferenceEvent`s and submits ONNX Runtime runs.
+- **Completion Consumer**: waits for completion, serializes responses, and writes directly to client sockets via its own io_uring ring.
 
 ### Communication Flow
 
-1. **Request path** (IO thread → batch processor): IO thread calls `request_flow::process_requests_from_buffer()`, which parses bytes, allocates pool space, and publishes `InferenceEvent` to the SPSC disruptor.
-2. **Response path** (batch processor → IO thread): Batch processor publishes `InferenceResponse` to a per-thread SPSC queue, then calls `signal()` which writes to an `eventfd`. This triggers an `OP_EVENTFD` completion in the IO thread's ring, which drains the response queue and submits writev.
+1. **Request path** (ingress IO thread → submission consumer): `request_flow::process_requests_from_buffer()` parses bytes, allocates pool space, and publishes `InferenceEvent`s to the SPSC disruptor.
+2. **Completion path** (completion consumer → socket): the completion consumer reads finished outputs and submits direct socket writes from its own io_uring ring.
 
 ### io_uring Wrapper
 
-`io_thread.rs` defines a local `IoUring` struct (shadows the crate type) that wraps `io_uring::IoUring`. The rest of the file interacts only with the local wrapper:
+`src/bin/disrust_gpu/io_thread_gpu.rs` defines a local `IoUring` struct (shadows the crate type) that wraps `io_uring::IoUring`. The rest of the file interacts only with the local wrapper:
 - `push(&mut self, sqe: &Entry)` — submits an SQE, flushing the SQ to the kernel if full
 - `wait(&mut self, n: usize)` — `submit_and_wait`
 - `drain_cqes(&mut self) -> Vec<(u64, i32)>` — collects eagerly to release the CQ borrow before any SQE submissions in the same iteration
-- `fd(&self) -> RawFd` — for future `MSG_RING` cross-thread posting
-
-Four operations are encoded into the 64-bit `user_data` field (`OP_ACCEPT`, `OP_READ`, `OP_WRITE`, `OP_EVENTFD`) with the connection key in the low 16 bits.
+- The ingress thread encodes `OP_ACCEPT` and `OP_READ` in `user_data`; the completion consumer owns the write side separately.
 
 ### Connection State
 
 Each `Connection` owns:
 - `read_buf` / `read_len` — accumulates partial reads; compacted after each parse pass
-- `write_headers` / `write_payloads` / `write_segments` — filled per-response before building iovecs
-- `pending_iovecs` — scatter-gather list built by `build_iovecs()` for `Writev`
-- `read_inflight` / `write_inflight` — prevent duplicate SQE submissions
+- `read_inflight` — prevents duplicate SQE submissions
 - `next_request_seq` — per-connection sequence counter
 
 `Connection` has a `Drop` impl that closes the fd. Remove from `Slab` is sufficient to close — no manual `libc::close` needed at call sites.
 
 ### Buffer Pool
 
-`BufferPool` is a ring-based arena. Each IO thread holds a `&'static BufferPool` (via `leak_new`). The batch processor holds a separate result pool for large response payloads.
+`BufferPool` is a ring-based arena over pinned host memory. The ingress IO thread holds a `&'static BufferPool` (via `from_raw_ptr`) and the ONNX path reads directly from those allocations.
 
 - `alloc(len) -> Result<PoolSliceMut, AllocError>` — advances write cursor; wraps to 0 if allocation would straddle the end
 - `PoolSliceMut::freeze() -> PoolSlice` — makes immutable; stored in `InferenceEvent`
@@ -77,7 +74,7 @@ Pool size critically affects performance due to cache locality (see PERFORMANCE.
 
 ### lib/binary Split
 
-`lib.rs` exports everything **except** `io_thread` and `config`. This keeps the library testable without io_uring. Integration tests and benchmarks drive `request_flow` and `response_flow` directly. `io_thread` is compiled only by the binary.
+`lib.rs` exports shared request-path and GPU runtime code. The binary-specific io_uring ingress thread lives under `src/bin/disrust_gpu`.
 
 ### Protocol
 
@@ -90,16 +87,15 @@ Wire format is little-endian binary:
 
 ### Critical Constants
 
-- `config.rs`: `DISRUPTOR_SIZE`, `RESPONSE_QUEUE_SIZE`, `BUFFER_POOL_CAPACITY`, `RESULT_POOL_CAPACITY`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`
+- `config.rs`: `GPU_DISRUPTOR_SIZE`, `GPU_BUFFER_POOL_CAPACITY`, `SESSION_POOL_SIZE`, `MAX_SESSION_BATCH_SIZE`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`
 - `constants.rs`: `FEATURE_DIM = 16`, `MAX_VECTORS_PER_REQUEST = 64`
 
 ## Metrics (`--features metrics`)
 
 Background thread prints deltas every 10s:
-- **Throughput**: `published` (to disruptor), `sent` (responses written)
-- **Stalls**: `req_ring_full`, `resp_ring_full`, `pool_exh`, `pool_too_large`
-- **Batch processor**: `poll_events` vs `poll_no_events`, `stall_pct`
-- **Gauges**: `req_occ`, `resp_occ`, `req_max`, `resp_max`, `pool_max_in_use`
+- **Throughput**: `published` (requests published to the disruptor)
+- **Stalls**: `req_ring_full`, `pool_exh`, `pool_too_large`
+- **Gauges**: `req_occ`, `req_max`, `pool_max_in_use`
 
 ## Notes
 

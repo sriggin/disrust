@@ -9,10 +9,6 @@ Despite using atomics, **request pool access is actually single-threaded for cur
 - When disruptor wraps, IO thread publishes to same slot → **drops old PoolSlice on IO thread**
 - `PoolSlice::drop()` advances read_cursor
 
-**Result pools** (for responses >INLINE_RESULT_CAPACITY vectors) are also single-threaded for cursor
-updates: the batch thread allocates and overwrites response slots (which drops old PoolSlice).
-The IO thread only reads the results via `&InferenceResponse`.
-
 **Atomic ordering:** cursors use Acquire/Release to be safe under cross-thread pool usage.
 
 ### Pages Are Pre-Touched on Construction

@@ -1,4 +1,4 @@
-//! Ingress-only IO thread for the GPU pipeline.
+//! Ingress-only IO thread for the ONNX/CUDA server pipeline.
 //!
 //! Responsibilities: accept, read, parse, publish to request ring.
 //! No response poller, no eventfd, no write path — the CompletionConsumer
@@ -227,7 +227,7 @@ fn handle_read(
         if result < 0 {
             diag::bump(&READ_NEGATIVE, 1);
             if diag::enabled() {
-                eprintln!("disrust-gpu diag: read result={} on conn={}", result, key);
+                eprintln!("disrust diag: read result={} on conn={}", result, key);
             }
         }
         conns.try_remove(key_usize);
@@ -285,7 +285,7 @@ fn parse_and_maybe_read(
         }
         Err(e) => {
             eprintln!(
-                "io-gpu-{}: request parse error ({:?}), closing conn {}",
+                "io-{}: request parse error ({:?}), closing conn {}",
                 thread_id, e, key
             );
             conns.remove(key_usize);

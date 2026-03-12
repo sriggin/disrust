@@ -1,17 +1,14 @@
 # GPU Inference Pipeline
 
-This document describes the GPU inference pipeline, which runs as a **separate binary** (`disrust-gpu`) alongside the existing CPU baseline (`disrust`). The CPU baseline's runtime behavior and external interface are unchanged; shared internals may receive non-disruptive refactors to support the GPU path. See `GPU_INFERENCE.md` for research background and decision rationale.
+This document describes the ONNX/CUDA inference pipeline used by `disrust`. See `GPU_INFERENCE.md` for research background and decision rationale.
 
 ---
 
 ## Structure
 
 ```
-disrust        (existing, unchanged)   CPU pipeline, batch_processor POC
-disrust-gpu    (new, additive)         GPU pipeline, ORT/CUDA, this document
+disrust        ONNX/CUDA pipeline, this document
 ```
-
-Shared code changes are constrained to preserve CPU baseline behavior and API compatibility. Most GPU-related integration should remain additive/new-code-path oriented.
 
 ---
 
@@ -208,9 +205,9 @@ Additive changes to shared types:
 
 No GPU-specific runtime files are intentionally kept in-tree at this stage. The plan remains the source of truth.
 
-### Captured Implementation Notes (from removed scaffolding)
+### Captured Implementation Notes
 
-The following non-obvious behaviors were validated in a now-removed `disrust-gpu` ingress scaffold and should be preserved when implementation resumes:
+The following non-obvious behaviors were validated during the ONNX/CUDA server bring-up and should be preserved:
 
 - **Ingress thread responsibilities:** accept/read/parse/publish only; no response poller, no eventfd, no write path. Completion consumer owns all response writes.
 - **Ring-full retry behavior:** after each CQE batch, linearly rescan connections with `!read_inflight && read_len > 0` and re-run parse/publish. This prevents a connection from stalling when `RingBufferFull` occurred while its read buffer was full.
@@ -222,41 +219,9 @@ The following non-obvious behaviors were validated in a now-removed `disrust-gpu
 
 ---
 
-## Remaining Work
+## Status
 
-1. **Config** — add GPU-path constants to `config.rs` (separate from CPU constants):
-   - `SESSION_POOL_SIZE` (default 1)
-   - `MAX_SESSION_BATCH_SIZE` (max disruptor slots per GPU batch)
-   - `SUBMISSION_TIMEOUT_NS` — deferred for now; idle behavior is explicit spin (`std::hint::spin_loop()`) on `Err(Polling::NoEvents)`. This is not a "flush partial batch" timer: with the poll-guard model there is no partial batch held across cycles — each guard is fully committed. Revisit if idle CPU burn becomes an issue in profiling.
-   - `GPU_DISRUPTOR_SIZE` — do not reuse `DISRUPTOR_SIZE` (65536 slots × max request size = 268MB pinned memory; far too large). Size to `SESSION_POOL_SIZE × MAX_SESSION_BATCH_SIZE × 4` as headroom.
-   - `GPU_BUFFER_POOL_CAPACITY` = `GPU_DISRUPTOR_SIZE × MAX_VECTORS_PER_REQUEST × FEATURE_DIM`. With `GPU_DISRUPTOR_SIZE` in the low hundreds, this is low tens of MB of pinned memory — affordable.
-
-   **Ring/pool sizing constraint:** `GPU_DISRUPTOR_SIZE` must be ≥ `SESSION_POOL_SIZE × MAX_SESSION_BATCH_SIZE`. The IO thread (producer) is gated on the CompletionConsumer's sequence. If the ring is smaller than the maximum number of in-flight slots across all in-flight GPU batches, the IO thread stalls even when the GPU is still executing. With `SESSION_POOL_SIZE = 1`, the ring needs only to be ≥ `MAX_SESSION_BATCH_SIZE`; the 4× headroom above gives the IO thread room to run ahead while the GPU executes.
-
-2. **ORT session wrapper** — session construction with CUDA EP, IoBinding setup, pre-allocated pinned output tensor per session; **run ORT verification steps (§ ORT Upfront Verification) before proceeding**
-
-   **Model loading is out of scope for this plan** — how the ONNX model file path is specified (CLI arg, config constant, environment variable), when it's loaded relative to CUDA initialization, and error handling on load failure are a separate TBD concern. This plan assumes a valid loaded `Session` is available at consumer startup.
-
-
-
-3. **Batch queue** — `BatchEntry` type (`end_sequence`, `session_idx`, `handle`), fixed-capacity SPSC ring with capacity `SESSION_POOL_SIZE + 1` (the `+1` prevents deadlock when a pool ring wrap forces two batches from one SubmissionConsumer guard cycle)
-
-4. **`SubmissionConsumer`** — disruptor polling, batch accumulation with `is_contiguous` wrap detection, ORT submission via `TensorRefMut::from_raw`, batch queue push, idle spin on `Err(Polling::NoEvents)` (timeout-based policy deferred; see Config item 1).
-
-   The disruptor poll guard covers all events delivered in one `poll()` call. The guard must be held across all ORT submissions from that cycle (there may be multiple due to wrap-around or max-size splits); the guard drop advances the SubmissionConsumer's sequence. If a batch queue push blocks (queue full — all sessions in flight), this also stalls the guard drop, which stalls the IO thread's ring slot reuse. This is correct backpressure. The SubmissionConsumer does not accumulate events across poll cycles; batching occurs naturally from events that arrive between consecutive polls.
-
-   **Wrap handling within a cycle:** the post-wrap batch must be submitted within the same guard as the pre-wrap batch. Deferral is not possible: the alignment guarantee requires all `BatchEntry`s for a guard's events to be pushed before the guard drops. Holding the guard open and calling `poll()` again on the same poller is not supported and wouldn't help (cursor hasn't advanced). Two `BatchEntry`s per wrap cycle are the expected outcome. See wrap-around paragraph in the Input path section above.
-
-5. **`CompletionConsumer`** — batch queue pop, GPU await, output tensor read, direct OP_WRITE via own io_uring ring. No `InferenceResponse`, no pool. Wire format is encoded from the output tensor directly into pre-allocated per-slot write buffers (`257` bytes each, `2 × MAX_SESSION_BATCH_SIZE` total for double-buffering). See Completion Consumer loop and Response write path sections above.
-
-6. **Wire `disrust-gpu` binary** — add entrypoint + modules (`src/bin/disrust_gpu/main.rs`, `src/bin/disrust_gpu/io_thread_gpu.rs`) with `cudaMallocHost` pool allocation, `cuMemHostGetDevicePointer` for device base, session pool construction, and consumer thread spawning. The correct two-consumer builder chain is:
-   ```rust
-   let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
-   let (submission_poller, builder) = builder.event_poller();
-   let (completion_poller, builder) = builder.and_then().event_poller();
-   let producer = builder.build();
-   ```
-   `event_poller()` alone is non-gating; `.and_then()` installs the dependency barrier. `completion_poller` has type `EventPoller<InferenceEvent, SingleConsumerBarrier>` and is gated on `submission_poller`'s cursor. The producer is gated on `completion_poller`'s cursor (the slowest consumer). **Note:** the CompletionConsumer must hold its poll guard across all GPU awaits for all `BatchEntry`s within that guard's range — guard drop advances the cursor and frees slots for the producer. Multiple `BatchEntry`s may fall within one guard; slots covered by one entry are computed from the running cursor (`entry.end_sequence - local_cursor`).
+The plan above is now implemented in the codebase as the default `disrust` server. The remaining value in this document is the design rationale, invariants, and operational notes for the ONNX/CUDA pipeline.
 
 ---
 

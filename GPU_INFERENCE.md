@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the placeholder inference in `batch_processor.rs` (currently: sum of feature vector) with real batched ML inference on a GPU, while preserving the low-latency properties of the existing pipeline.
+This document describes the ONNX/CUDA inference pipeline used by `disrust`.
 
 ## Target Architecture
 
@@ -26,18 +26,18 @@ IO Thread(s) → [request ring] → Submission Consumer → [batch queue] → Re
 - Gated on Submission Consumer's sequence (cannot read slot N until Submission has passed it)
 - Pops the next `(end_sequence, GpuHandle)` from the batch queue
 - Awaits GPU completion for that handle
-- Walks slots up to `end_sequence`, reading `conn_id`, `thread_id`, `request_seq`, `num_vectors` to build `InferenceResponse`s and route them to the correct IO thread response queue
-- Signals affected IO threads via eventfd (same as today)
+- Walks slots up to `end_sequence`, reading `fd`, `conn_id`, `request_seq`, and `num_vectors`
+- Encodes the wire response directly and submits socket writes from its own io_uring ring
 
 **Batch queue**
-- SPSC between Submission and Result Consumer — same pattern as the existing per-IO-thread response queue
+- SPSC between Submission and Result Consumer
 - Carries only `(end_sequence: u64, GpuHandle)` per batch, not per-slot data
 - Provides the boundary information the Result Consumer needs to match GPU output indices back to ring slots
 
 ## What Stays the Same
 
-- `InferenceEvent` and `InferenceResponse` structures
-- IO thread, protocol, buffer pool, response queue, eventfd signaling
+- `InferenceEvent`, protocol parsing, and buffer pool semantics
+- Ingress IO thread, request parsing, and ring backpressure
 - Ring backpressure: if the Result Consumer stalls (GPU slow), sequence barrier backs up through the ring to the IO threads automatically
 
 ## Key Design Decisions To Resolve
