@@ -12,6 +12,6 @@ pub mod protocol;
 pub mod request_flow;
 pub mod ring_types;
 #[cfg(feature = "cuda")]
-pub mod batch_queue;
-#[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cuda")]
+pub mod server;

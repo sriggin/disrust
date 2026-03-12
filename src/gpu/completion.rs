@@ -7,8 +7,8 @@ use std::sync::Arc;
 use disruptor::{EventGuard, EventPoller, Polling, SingleConsumerBarrier};
 use io_uring::{opcode, squeue::Entry, types::Fd};
 
-use crate::batch_queue::BatchQueue;
 use crate::config::{MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, WRITE_BUF_SIZE, WRITE_BUF_SLOTS};
+use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
 use crate::gpu::diag::{
     self, BATCHES_COMPLETED, RESPONSES_WRITTEN, WRITE_CQES, WRITE_NEGATIVE, WRITE_SQES,
 };
@@ -202,7 +202,7 @@ impl CompletionConsumer {
 #[allow(clippy::too_many_arguments)]
 fn process_batch(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
-    entry: crate::batch_queue::BatchEntry,
+    entry: BatchEntry,
     ring: &mut IoUring,
     write_bufs: &mut Box<[[u8; WRITE_BUF_SIZE]; WRITE_BUF_SLOTS]>,
     outstanding: &mut [usize; 2],

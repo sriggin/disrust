@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "disrust"
-path = "src/bin/disrust_gpu/main.rs"
+path = "src/main.rs"
 required-features = ["cuda"]
 
 [[bin]]

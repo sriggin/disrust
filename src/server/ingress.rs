@@ -1,8 +1,4 @@
 //! Ingress-only IO thread for the ONNX/CUDA server pipeline.
-//!
-//! Responsibilities: accept, read, parse, publish to request ring.
-//! No response poller, no eventfd, no write path — the CompletionConsumer
-//! owns all response writes via its own io_uring ring.
 
 use std::io;
 use std::os::unix::io::RawFd;
@@ -12,14 +8,14 @@ use disruptor::{SingleConsumerBarrier, SingleProducer};
 use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
-use disrust::buffer_pool::PoolAllocator;
-use disrust::config::{READ_BUF_SIZE, SLAB_CAPACITY};
-use disrust::gpu::diag::{
+use crate::buffer_pool::PoolAllocator;
+use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY};
+use crate::gpu::diag::{
     self, BUFFERED_BYTES, BYTES_CONSUMED, READ_BYTES, READ_CQES, READ_NEGATIVE, READ_SUBMITS,
     REQUESTS_PUBLISHED, Reporter,
 };
-use disrust::request_flow;
-use disrust::ring_types::InferenceEvent;
+use crate::request_flow;
+use crate::ring_types::InferenceEvent;
 
 const OP_ACCEPT: u64 = 0;
 const OP_READ: u64 = 1;
@@ -100,14 +96,14 @@ impl Drop for Connection {
     }
 }
 
-pub struct IoThreadGpu {
+pub struct IngressThread {
     thread_id: u8,
     listen_fd: RawFd,
     producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     allocator: PoolAllocator,
 }
 
-impl IoThreadGpu {
+impl IngressThread {
     pub fn new(
         thread_id: u8,
         listen_fd: RawFd,
@@ -126,7 +122,6 @@ impl IoThreadGpu {
         let mut ring = IoUring::new(4096).expect("io_uring creation failed");
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
-        // Reusable buffer for retry scan keys.
         let mut retry_keys: Vec<u16> = Vec::new();
         let mut reporter = Reporter::new();
 
@@ -134,9 +129,6 @@ impl IoThreadGpu {
 
         loop {
             reporter.maybe_report();
-            // Retry buffered connections before blocking. Otherwise a full per-connection
-            // read buffer plus RingBufferFull can leave no read in flight and no future
-            // CQE to wake this thread, even after completion frees disruptor slots.
             retry_keys.clear();
             for (k, c) in conns.iter() {
                 if !c.read_inflight && c.read_len > 0 {
@@ -178,9 +170,6 @@ impl IoThreadGpu {
                 }
             }
 
-            // Ring-full retry: rescan connections with buffered data but no pending read.
-            // Covers the case where try_publish returned RingBufferFull while the read
-            // buffer was full — no new OP_READ was submitted so no future CQE will wake it.
             retry_keys.clear();
             for (k, c) in conns.iter() {
                 if !c.read_inflight && c.read_len > 0 {

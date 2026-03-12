@@ -47,7 +47,7 @@ Currently **1 ingress IO thread + 2 ONNX consumer threads**. The disruptor is SP
 
 ### io_uring Wrapper
 
-`src/bin/disrust_gpu/io_thread_gpu.rs` defines a local `IoUring` struct (shadows the crate type) that wraps `io_uring::IoUring`. The rest of the file interacts only with the local wrapper:
+`src/server/ingress.rs` defines a local `IoUring` struct (shadows the crate type) that wraps `io_uring::IoUring`. The rest of the file interacts only with the local wrapper:
 - `push(&mut self, sqe: &Entry)` — submits an SQE, flushing the SQ to the kernel if full
 - `wait(&mut self, n: usize)` — `submit_and_wait`
 - `drain_cqes(&mut self) -> Vec<(u64, i32)>` — collects eagerly to release the CQ borrow before any SQE submissions in the same iteration
@@ -74,7 +74,7 @@ Pool size critically affects performance due to cache locality (see PERFORMANCE.
 
 ### lib/binary Split
 
-`lib.rs` exports shared request-path and GPU runtime code. The binary-specific io_uring ingress thread lives under `src/bin/disrust_gpu`.
+`lib.rs` exports shared request-path, server wiring, and GPU runtime code. The binary-specific entrypoint is `src/main.rs`, and the io_uring ingress thread lives under `src/server`.
 
 ### Protocol
 

@@ -1,8 +1,3 @@
-//! Default disrust server: accepts TCP connections, publishes to the request
-//! ring, runs ONNX inference via ORT CUDA EP, and writes responses directly.
-
-mod io_thread_gpu;
-
 use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 use std::thread;
@@ -12,20 +7,22 @@ use disruptor::{BusySpin, build_single_producer};
 use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use disrust::batch_queue::BatchQueue;
-use disrust::buffer_pool::{BufferPool, set_factory_pool};
-use disrust::config::{
+use crate::buffer_pool::{BufferPool, set_factory_pool};
+use crate::config::{
     BATCH_QUEUE_CAPACITY, GPU_BUFFER_POOL_BYTES, GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE,
     MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
 };
-use disrust::gpu::completion::CompletionConsumer;
-use disrust::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
-use disrust::gpu::session::GpuSession;
-use disrust::gpu::submission::SubmissionConsumer;
-use disrust::metrics;
-use disrust::ring_types::InferenceEvent;
+use crate::gpu::batch_queue::BatchQueue;
+use crate::gpu::completion::CompletionConsumer;
+use crate::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
+use crate::gpu::session::GpuSession;
+use crate::gpu::submission::SubmissionConsumer;
+use crate::metrics;
+use crate::ring_types::InferenceEvent;
 
-use io_thread_gpu::IoThreadGpu;
+mod ingress;
+
+use ingress::IngressThread;
 
 #[derive(Parser)]
 #[command(about = "High-performance ONNX/CUDA io_uring inference server")]
@@ -56,7 +53,7 @@ fn create_listener(port: u16) -> Socket {
     socket
 }
 
-fn main() {
+pub fn run() {
     metrics::spawn_reporter();
     let args = Args::parse();
     let port = args.port;
@@ -94,17 +91,13 @@ fn main() {
     });
     eprintln!("disrust: CUDA driver preflight ok");
 
-    // 1. Factory pool for empty PoolSlices during disruptor pre-allocation.
     set_factory_pool(BufferPool::new_boxed(1));
 
-    // 2. Load ONNX model.
     let model_bytes = std::fs::read(&args.model).unwrap_or_else(|e| {
         eprintln!("Failed to read model '{}': {}", args.model, e);
         std::process::exit(1);
     });
 
-    // 3. Construct session pool first so ORT/CUDA creates a context before we allocate
-    // pinned host memory for the request BufferPool.
     let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
         .map(|i| {
             eprintln!(
@@ -116,7 +109,6 @@ fn main() {
         })
         .collect();
 
-    // 4. Allocate pinned host memory for the buffer pool.
     let host_ptr = unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
@@ -124,13 +116,10 @@ fn main() {
             eprintln!("cuMemAllocHost failed: {:?}", status);
             std::process::exit(1);
         }
-        // Touch all pages to avoid page-fault latency during operation.
         std::ptr::write_bytes(ptr as *mut u8, 0u8, GPU_BUFFER_POOL_BYTES);
-
         ptr as *mut f32
     };
 
-    // 5. Construct the BufferPool over the pinned memory (capacity in f32 units).
     let pool: &'static BufferPool =
         Box::leak(unsafe { BufferPool::from_raw_ptr(host_ptr, GPU_BUFFER_POOL_CAPACITY) });
     let allocator = pool.allocator();
@@ -140,21 +129,13 @@ fn main() {
         GPU_BUFFER_POOL_BYTES / 1_000_000,
     );
 
-    // 6. Build request disruptor: two-consumer chain.
-    //    submission_poller: EventPoller<InferenceEvent, SingleProducerBarrier>
-    //    completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>
-    //      (gated on submission_poller's cursor via .and_then())
-    //    producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>
-    //      (gated on completion_poller — slowest consumer drives backpressure)
     let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
     let (submission_poller, builder) = builder.event_poller();
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
 
-    // 7. Shared batch queue.
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
 
-    // 8. Spawn SubmissionConsumer (owns sessions).
     let sub_consumer = SubmissionConsumer::new(
         submission_poller,
         sessions,
@@ -166,7 +147,6 @@ fn main() {
         .spawn(move || sub_consumer.run())
         .expect("failed to spawn SubmissionConsumer");
 
-    // 9. Spawn CompletionConsumer (has output pointers only).
     let comp_consumer =
         CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue), max_batch_slots)
             .expect("failed to create CompletionConsumer io_uring");
@@ -175,15 +155,14 @@ fn main() {
         .spawn(move || comp_consumer.run())
         .expect("failed to spawn CompletionConsumer");
 
-    // 10. Spawn IO ingress thread.
     let listen_socket = create_listener(port);
-    let io = IoThreadGpu::new(0, listen_socket.into_raw_fd(), producer, allocator);
+    let ingress = IngressThread::new(0, listen_socket.into_raw_fd(), producer, allocator);
 
     eprintln!("disrust: ready");
 
     let io_handle = thread::Builder::new()
         .name("io-gpu-0".into())
-        .spawn(move || io.run())
+        .spawn(move || ingress.run())
         .expect("failed to spawn IO thread");
 
     let _ = io_handle.join();

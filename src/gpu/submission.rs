@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
 
-use crate::batch_queue::{BatchEntry, BatchQueue};
 use crate::buffer_pool::PoolSlice;
 use crate::config::MAX_SESSION_BATCH_SIZE;
+use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
 use crate::gpu::diag::{self, BATCHES_SUBMITTED, VECTORS_SUBMITTED};
 use crate::ring_types::InferenceEvent;
 
