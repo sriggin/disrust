@@ -14,6 +14,10 @@ use slab::Slab;
 
 use disrust::buffer_pool::PoolAllocator;
 use disrust::config::{READ_BUF_SIZE, SLAB_CAPACITY};
+use disrust::gpu::diag::{
+    self, BUFFERED_BYTES, BYTES_CONSUMED, READ_BYTES, READ_CQES, READ_NEGATIVE, READ_SUBMITS,
+    REQUESTS_PUBLISHED, Reporter,
+};
 use disrust::request_flow;
 use disrust::ring_types::InferenceEvent;
 
@@ -124,10 +128,35 @@ impl IoThreadGpu {
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
         // Reusable buffer for retry scan keys.
         let mut retry_keys: Vec<u16> = Vec::new();
+        let mut reporter = Reporter::new();
 
         submit_accept(&mut ring, self.listen_fd);
 
         loop {
+            reporter.maybe_report();
+            // Retry buffered connections before blocking. Otherwise a full per-connection
+            // read buffer plus RingBufferFull can leave no read in flight and no future
+            // CQE to wake this thread, even after completion frees disruptor slots.
+            retry_keys.clear();
+            for (k, c) in conns.iter() {
+                if !c.read_inflight && c.read_len > 0 {
+                    retry_keys.push(k as u16);
+                }
+            }
+            if !retry_keys.is_empty() {
+                for &key in &retry_keys {
+                    parse_and_maybe_read(
+                        &mut ring,
+                        &mut conns,
+                        &mut self.producer,
+                        &mut self.allocator,
+                        self.thread_id,
+                        key,
+                    );
+                }
+                continue;
+            }
+
             ring.wait(1);
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
@@ -193,11 +222,19 @@ fn handle_read(
     result: i32,
 ) {
     let key_usize = key as usize;
+    diag::bump(&READ_CQES, 1);
     if result <= 0 {
+        if result < 0 {
+            diag::bump(&READ_NEGATIVE, 1);
+            if diag::enabled() {
+                eprintln!("disrust-gpu diag: read result={} on conn={}", result, key);
+            }
+        }
         conns.try_remove(key_usize);
         return;
     }
     let bytes_read = result as usize;
+    diag::bump(&READ_BYTES, bytes_read as u64);
     let Some(conn) = conns.get_mut(key_usize) else {
         return;
     };
@@ -231,10 +268,19 @@ fn parse_and_maybe_read(
         thread_id,
         &mut conn.next_request_seq,
     ) {
-        Ok((consumed, _)) => {
-            if consumed > 0 {
-                conn.read_buf.copy_within(consumed..conn.read_len, 0);
-                conn.read_len -= consumed;
+        Ok(outcome) => {
+            if outcome.consumed > 0 {
+                conn.read_buf
+                    .copy_within(outcome.consumed..conn.read_len, 0);
+                conn.read_len -= outcome.consumed;
+            }
+            diag::bump(&REQUESTS_PUBLISHED, outcome.num_published as u64);
+            diag::bump(&BYTES_CONSUMED, outcome.consumed as u64);
+            if diag::enabled() {
+                BUFFERED_BYTES.store(conn.read_len as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if outcome.needs_read {
+                submit_read(ring, conns, key);
             }
         }
         Err(e) => {
@@ -248,7 +294,7 @@ fn parse_and_maybe_read(
     }
 
     let c = &conns[key as usize];
-    if c.read_len < READ_BUF_SIZE {
+    if c.read_len == 0 {
         submit_read(ring, conns, key);
     }
 }
@@ -271,4 +317,5 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
         .build()
         .user_data(encode_user_data(OP_READ, key));
     ring.push(&sqe);
+    diag::bump(&READ_SUBMITS, 1);
 }

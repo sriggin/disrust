@@ -13,10 +13,8 @@ use crate::gpu::session::InFlightBatch;
 
 /// One entry in the batch queue.
 pub struct BatchEntry {
-    /// Last ring slot (inclusive) covered by this GPU batch.
-    pub end_sequence: u64,
-    /// Which session pool slot was used for this batch.
-    pub session_idx: usize,
+    /// Number of disruptor slots covered by this GPU batch.
+    pub slot_count: usize,
     /// In-flight GPU batch state. Submission enqueues this immediately after
     /// `RunAsync` returns; completion waits for the callback to mark it ready.
     pub batch: InFlightBatch,

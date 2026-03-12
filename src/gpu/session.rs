@@ -15,6 +15,7 @@ use ort::{
     sys,
 };
 
+use crate::buffer_pool::PoolSlice;
 use crate::config::MAX_BATCH_VECTORS;
 use crate::constants::FEATURE_DIM as FDIM;
 
@@ -145,6 +146,9 @@ pub struct InFlightBatch {
     pub output_ptr: *const f32,
     pub output_len: usize,
     pub session_available: Arc<AtomicBool>,
+    /// Holds the moved request slices alive until completion. Submission drains
+    /// them out of the ring so guard drop no longer determines their lifetime.
+    pub input_slices: Vec<PoolSlice>,
     _resources: BatchResources,
 }
 
@@ -191,6 +195,12 @@ unsafe impl Send for GpuSession {}
 impl GpuSession {
     /// Construct a session for the given ONNX model bytes.
     pub fn new(model_bytes: &[u8]) -> Self {
+        Self::with_output_capacity(model_bytes, MAX_BATCH_VECTORS)
+    }
+
+    /// Construct a session with a caller-chosen maximum output vector capacity.
+    pub fn with_output_capacity(model_bytes: &[u8], output_capacity: usize) -> Self {
+        assert!(output_capacity > 0, "output_capacity must be > 0");
         let session = Session::builder()
             .unwrap_or_else(|e| {
                 eprintln!("Session::builder failed: {e}");
@@ -251,7 +261,6 @@ impl GpuSession {
             std::process::abort()
         });
 
-        let output_capacity = MAX_BATCH_VECTORS;
         let output_ptr = unsafe {
             let mut ptr: *mut c_void = std::ptr::null_mut();
             let status = cudarc::driver::sys::cuMemAllocHost_v2(
@@ -353,6 +362,7 @@ impl GpuSession {
             output_ptr: self.output_ptr,
             output_len: num_vectors,
             session_available: Arc::clone(&self.available),
+            input_slices: Vec::new(),
             _resources: BatchResources {
                 _input_value: input_value,
                 _output_value: output_value,

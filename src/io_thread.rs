@@ -407,14 +407,18 @@ impl RunState {
             self.thread_id,
             &mut conn.next_request_seq,
         ) {
-            Ok((consumed, num_published)) => {
-                for _ in 0..num_published {
+            Ok(outcome) => {
+                for _ in 0..outcome.num_published {
                     metrics::inc_req_occ();
                     metrics::inc_requests_published();
                 }
-                if consumed > 0 {
-                    conn.read_buf.copy_within(consumed..conn.read_len, 0);
-                    conn.read_len -= consumed;
+                if outcome.consumed > 0 {
+                    conn.read_buf
+                        .copy_within(outcome.consumed..conn.read_len, 0);
+                    conn.read_len -= outcome.consumed;
+                }
+                if outcome.needs_read {
+                    submit_read(&mut self.ring, &mut self.conns, key);
                 }
             }
             Err(e) => {
@@ -434,7 +438,7 @@ impl RunState {
         // ring has drained; in the pool-exhaustion case the closure spins until space
         // is available, so this branch is only hit when the buffer is genuinely full.
         let c = &self.conns[key as usize];
-        if c.read_len < READ_BUF_SIZE {
+        if c.read_len == 0 {
             submit_read(&mut self.ring, &mut self.conns, key);
         }
     }

@@ -12,8 +12,8 @@ use std::sync::{
 use clap::Parser;
 use ort::{
     AsPointer, api,
-    init_from,
     execution_providers::CUDAExecutionProvider,
+    init_from,
     memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::Session,
     sys,
@@ -253,10 +253,12 @@ fn main() {
         builder
     };
 
-    let mut session = builder.commit_from_memory(&model_bytes).unwrap_or_else(|e| {
-        eprintln!("commit_from_memory failed: {e}");
-        std::process::exit(1)
-    });
+    let mut session = builder
+        .commit_from_memory(&model_bytes)
+        .unwrap_or_else(|e| {
+            eprintln!("commit_from_memory failed: {e}");
+            std::process::exit(1)
+        });
     eprintln!("ort-verify: session committed");
 
     if !use_cuda {
@@ -271,8 +273,8 @@ fn main() {
         } else {
             vec![1.0f32; args.batch * FDIM]
         };
-        let input =
-            ort::value::Tensor::<f32>::from_array(([args.batch, FDIM], input)).unwrap_or_else(|e| {
+        let input = ort::value::Tensor::<f32>::from_array(([args.batch, FDIM], input))
+            .unwrap_or_else(|e| {
                 eprintln!("Tensor::from_array failed: {e}");
                 std::process::exit(1)
             });

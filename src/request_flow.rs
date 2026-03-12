@@ -15,8 +15,17 @@ pub enum ProcessRequestError {
     Parse(#[allow(dead_code)] &'static str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessRequestOutcome {
+    pub consumed: usize,
+    pub num_published: usize,
+    /// `true` if parsing stopped because more socket bytes are required to finish the
+    /// next request, so the caller should re-arm a read when space is available.
+    pub needs_read: bool,
+}
+
 /// Process all complete requests in `buf`, publishing each to the request ring.
-/// Returns `(bytes_consumed, num_published)` on success.
+/// Returns a [`ProcessRequestOutcome`] on success.
 ///
 /// Pool allocation happens inside the `try_publish` closure, which only runs when
 /// a ring slot is available. This means `RingBufferFull` never leaves a live
@@ -35,9 +44,10 @@ pub fn process_requests_from_buffer(
     fd: i32,
     thread_id: u8,
     request_seq: &mut u64,
-) -> Result<(usize, usize), ProcessRequestError> {
+) -> Result<ProcessRequestOutcome, ProcessRequestError> {
     let mut consumed = 0;
     let mut num_published = 0;
+    let mut needs_read = false;
 
     while consumed < buf.len() {
         let slice = &buf[consumed..];
@@ -78,9 +88,16 @@ pub fn process_requests_from_buffer(
                 num_published += 1;
                 consumed += bytes_consumed;
             }
-            protocol::ParseResult::Incomplete(_) => break,
+            protocol::ParseResult::Incomplete(_) => {
+                needs_read = true;
+                break;
+            }
             protocol::ParseResult::Error(e) => return Err(ProcessRequestError::Parse(e)),
         }
     }
-    Ok((consumed, num_published))
+    Ok(ProcessRequestOutcome {
+        consumed,
+        num_published,
+        needs_read,
+    })
 }

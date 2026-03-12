@@ -48,12 +48,15 @@ pub const SESSION_POOL_SIZE: usize = 1;
 
 #[allow(dead_code)]
 /// Maximum disruptor ring slots accumulated into a single GPU batch.
-pub const MAX_SESSION_BATCH_SIZE: usize = 32;
+pub const MAX_SESSION_BATCH_SIZE: usize = 256;
 
 #[allow(dead_code)]
-/// Request ring buffer size for the GPU pipeline. Sized with 4× headroom over the
-/// maximum in-flight slots so the IO thread can run ahead while the GPU executes.
-pub const GPU_DISRUPTOR_SIZE: usize = SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE * 4;
+/// Request ring buffer size for the GPU pipeline.
+///
+/// With the current disruptor guard semantics, SubmissionConsumer must be able to
+/// submit all slots visible in a single poll without waiting for CompletionConsumer.
+/// That means the ring cannot expose more than one batch per in-flight session at once.
+pub const GPU_DISRUPTOR_SIZE: usize = SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE;
 
 #[allow(dead_code)]
 /// Pinned host buffer pool capacity in f32 units (pass to `BufferPool::from_raw_ptr`).

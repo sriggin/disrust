@@ -15,7 +15,7 @@ use disrust::batch_queue::BatchQueue;
 use disrust::buffer_pool::{BufferPool, set_factory_pool};
 use disrust::config::{
     BATCH_QUEUE_CAPACITY, GPU_BUFFER_POOL_BYTES, GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE,
-    SESSION_POOL_SIZE,
+    MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
 };
 use disrust::gpu::completion::CompletionConsumer;
 use disrust::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
@@ -35,6 +35,10 @@ struct Args {
     /// Path to ONNX model file
     #[arg(short, long, default_value = "model.onnx")]
     model: String,
+
+    /// Runtime cap on ring slots per GPU submission.
+    #[arg(long, default_value_t = MAX_SESSION_BATCH_SIZE)]
+    max_batch_slots: usize,
 }
 
 fn create_listener(port: u16) -> Socket {
@@ -53,8 +57,21 @@ fn create_listener(port: u16) -> Socket {
 fn main() {
     let args = Args::parse();
     let port = args.port;
+    let max_batch_slots = args.max_batch_slots;
+
+    if max_batch_slots == 0 || max_batch_slots > MAX_SESSION_BATCH_SIZE {
+        eprintln!(
+            "disrust-gpu: --max-batch-slots must be in 1..={}",
+            MAX_SESSION_BATCH_SIZE
+        );
+        std::process::exit(1);
+    }
 
     eprintln!("disrust-gpu: starting on port {}", port);
+    eprintln!(
+        "disrust-gpu: max_batch_slots={} (compile-time max={})",
+        max_batch_slots, MAX_SESSION_BATCH_SIZE
+    );
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust-gpu preflight failed: {e}");
         std::process::exit(1);
@@ -127,16 +144,21 @@ fn main() {
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
 
     // 8. Spawn SubmissionConsumer (owns sessions).
-    let sub_consumer =
-        SubmissionConsumer::new(submission_poller, sessions, Arc::clone(&batch_queue));
+    let sub_consumer = SubmissionConsumer::new(
+        submission_poller,
+        sessions,
+        Arc::clone(&batch_queue),
+        max_batch_slots,
+    );
     let sub_handle = thread::Builder::new()
         .name("gpu-submission".into())
         .spawn(move || sub_consumer.run())
         .expect("failed to spawn SubmissionConsumer");
 
     // 9. Spawn CompletionConsumer (has output pointers only).
-    let comp_consumer = CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue))
-        .expect("failed to create CompletionConsumer io_uring");
+    let comp_consumer =
+        CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue), max_batch_slots)
+            .expect("failed to create CompletionConsumer io_uring");
     let comp_handle = thread::Builder::new()
         .name("gpu-completion".into())
         .spawn(move || comp_consumer.run())

@@ -366,6 +366,7 @@ fn sustain_test(
             last_print = Instant::now();
         }
     }
+    let measure_elapsed = measure_start.elapsed();
 
     // Flush partial final interval
     if !interval_samples.is_empty() {
@@ -379,14 +380,13 @@ fn sustain_test(
     }
     all_samples.sort_unstable();
     let n = all_samples.len();
-    let elapsed = measure_start.elapsed();
     eprintln!();
     eprintln!(
         "── summary ({:.1}s, {} requests) ──────────────────────────────────",
-        elapsed.as_secs_f64(),
+        measure_elapsed.as_secs_f64(),
         n
     );
-    eprintln!("  qps     {:.0}", n as f64 / elapsed.as_secs_f64());
+    eprintln!("  qps     {:.0}", n as f64 / measure_elapsed.as_secs_f64());
     eprintln!("  p50     {:.1}µs", percentile(&all_samples, 50.0));
     eprintln!("  p95     {:.1}µs", percentile(&all_samples, 95.0));
     eprintln!("  p99     {:.1}µs", percentile(&all_samples, 99.0));

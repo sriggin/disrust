@@ -44,9 +44,12 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
     );
 
     assert!(result.is_ok());
-    let (consumed, num_published) = result.unwrap();
+    let outcome = result.unwrap();
+    let consumed = outcome.consumed;
+    let num_published = outcome.num_published;
     assert_eq!(consumed, buf.len(), "consumed should match request length");
     assert_eq!(num_published, 1);
+    assert!(!outcome.needs_read);
 
     // Consumer polls and sees one event
     match poller.poll() {
@@ -101,9 +104,12 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     );
 
     assert!(result.is_ok());
-    let (consumed, num_published) = result.unwrap();
+    let outcome = result.unwrap();
+    let consumed = outcome.consumed;
+    let num_published = outcome.num_published;
     assert_eq!(consumed, expected_consumed);
     assert_eq!(num_published, 2);
+    assert!(!outcome.needs_read);
 
     let mut seen = 0u64;
     while let Ok(mut guard) = poller.poll() {
@@ -152,9 +158,12 @@ fn request_flow_incomplete_returns_consumed_only() {
     );
 
     assert!(result.is_ok());
-    let (consumed, num_published) = result.unwrap();
+    let outcome = result.unwrap();
+    let consumed = outcome.consumed;
+    let num_published = outcome.num_published;
     assert_eq!(consumed, 0);
     assert_eq!(num_published, 0);
+    assert!(outcome.needs_read);
 }
 
 #[test]

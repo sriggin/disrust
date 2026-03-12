@@ -9,6 +9,9 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 
 use crate::batch_queue::BatchQueue;
 use crate::config::{MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, WRITE_BUF_SIZE, WRITE_BUF_SLOTS};
+use crate::gpu::diag::{
+    self, BATCHES_COMPLETED, RESPONSES_WRITTEN, WRITE_CQES, WRITE_NEGATIVE, WRITE_SQES,
+};
 use crate::ring_types::InferenceEvent;
 
 struct IoUring {
@@ -76,6 +79,7 @@ fn handle_write_cqe(
     let buf_idx = user_data as usize;
     let buf_set = buf_idx / MAX_SESSION_BATCH_SIZE;
     outstanding[buf_set] = outstanding[buf_set].saturating_sub(1);
+    diag::bump(&WRITE_CQES, 1);
 
     let meta = write_meta[buf_idx];
     if meta.expected_len == 0 {
@@ -87,6 +91,7 @@ fn handle_write_cqe(
     }
 
     if result < 0 {
+        diag::bump(&WRITE_NEGATIVE, 1);
         match -result {
             libc::EPIPE | libc::EBADF | libc::ECONNRESET => {}
             libc::EAGAIN => unsafe {
@@ -116,8 +121,7 @@ pub struct CompletionConsumer {
     write_meta: [WriteMeta; WRITE_BUF_SLOTS],
     /// Currently active write buffer set.
     active_set: usize,
-    /// Absolute ring sequence of the last slot fully processed.
-    local_cursor: i64,
+    max_batch_slots: usize,
 }
 
 // SAFETY: CompletionConsumer runs on a single dedicated thread.
@@ -127,7 +131,13 @@ impl CompletionConsumer {
     pub fn new(
         poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
         batch_queue: Arc<BatchQueue>,
+        max_batch_slots: usize,
     ) -> io::Result<Self> {
+        assert!(max_batch_slots > 0, "max_batch_slots must be > 0");
+        assert!(
+            max_batch_slots <= MAX_SESSION_BATCH_SIZE,
+            "max_batch_slots ({max_batch_slots}) exceeds compile-time limit ({MAX_SESSION_BATCH_SIZE})"
+        );
         let sq_depth = (SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE) as u32;
         let ring = IoUring::new(sq_depth)?;
         Ok(Self {
@@ -138,7 +148,7 @@ impl CompletionConsumer {
             outstanding: [0, 0],
             write_meta: [WriteMeta::default(); WRITE_BUF_SLOTS],
             active_set: 0,
-            local_cursor: -1,
+            max_batch_slots,
         })
     }
 
@@ -158,112 +168,118 @@ impl CompletionConsumer {
                 });
             }
 
-            // Phase B: poll for new events.
-            match self.poller.poll() {
-                Ok(mut guard) => {
-                    process_guard(
-                        &mut guard,
-                        &self.batch_queue,
-                        &mut self.ring,
-                        &mut self.write_bufs,
-                        &mut self.outstanding,
-                        &mut self.write_meta,
-                        self.active_set,
-                        &mut self.local_cursor,
-                    );
-                    self.ring.submit();
-                    // Guard drop advances CompletionConsumer cursor.
-                    self.active_set ^= 1;
+            let entry = loop {
+                if let Some(entry) = self.batch_queue.pop() {
+                    break entry;
                 }
-                Err(Polling::NoEvents) => std::hint::spin_loop(),
-                Err(Polling::Shutdown) => return,
-            }
+                std::hint::spin_loop();
+            };
+
+            entry.batch.completion.wait();
+
+            let mut guard = loop {
+                match self.poller.poll_take(entry.slot_count as u64) {
+                    Ok(guard) => break guard,
+                    Err(Polling::NoEvents) => std::hint::spin_loop(),
+                    Err(Polling::Shutdown) => return,
+                }
+            };
+
+            process_batch(
+                &mut guard,
+                entry,
+                &mut self.ring,
+                &mut self.write_bufs,
+                &mut self.outstanding,
+                &mut self.write_meta,
+                &mut self.active_set,
+                self.max_batch_slots,
+            );
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_guard(
+fn process_batch(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
-    batch_queue: &Arc<BatchQueue>,
+    entry: crate::batch_queue::BatchEntry,
     ring: &mut IoUring,
     write_bufs: &mut Box<[[u8; WRITE_BUF_SIZE]; WRITE_BUF_SLOTS]>,
     outstanding: &mut [usize; 2],
     write_meta: &mut [WriteMeta; WRITE_BUF_SLOTS],
-    active_set: usize,
-    local_cursor: &mut i64,
+    active_set: &mut usize,
+    max_batch_slots: usize,
 ) {
     let mut guard_ref = &mut *guard;
-    let buf_base = active_set * MAX_SESSION_BATCH_SIZE;
     let mut slot_in_set: usize = 0;
 
-    loop {
-        // Pop next BatchEntry — spin until the SubmissionConsumer has pushed it.
-        let entry = loop {
-            if let Some(e) = batch_queue.pop() {
-                break e;
-            }
-            std::hint::spin_loop();
+    let rotate_set = |ring: &mut IoUring,
+                      outstanding: &mut [usize; 2],
+                      write_meta: &[WriteMeta; WRITE_BUF_SLOTS],
+                      active_set: &mut usize,
+                      slot_in_set: &mut usize| {
+        if *slot_in_set == 0 {
+            return;
+        }
+        ring.submit();
+        ring.drain_until_zero(outstanding, write_meta, *active_set);
+        *active_set ^= 1;
+        *slot_in_set = 0;
+    };
+
+    let output =
+        unsafe { std::slice::from_raw_parts(entry.batch.output_ptr, entry.batch.output_len) };
+    let mut output_offset: usize = 0;
+
+    for _ in 0..entry.slot_count {
+        if slot_in_set >= max_batch_slots {
+            rotate_set(ring, outstanding, write_meta, active_set, &mut slot_in_set);
+        }
+
+        let event = guard_ref
+            .next()
+            .expect("guard exhausted before queued batch slot_count");
+        let num_vecs = event.num_vectors as usize;
+        let fd = event.fd;
+
+        // Encode wire format: [u8 num_vectors][f32 × num_vectors LE].
+        let buf_idx = (*active_set * MAX_SESSION_BATCH_SIZE) + slot_in_set;
+        let buf = &mut write_bufs[buf_idx];
+        buf[0] = num_vecs as u8;
+        for (i, &val) in output[output_offset..output_offset + num_vecs]
+            .iter()
+            .enumerate()
+        {
+            buf[1 + i * 4..1 + i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let wire_len = (1 + num_vecs * 4) as u32;
+
+        // Submit OP_WRITE (user_data encodes the active set for CQE accounting).
+        write_meta[buf_idx] = WriteMeta {
+            fd,
+            expected_len: wire_len,
         };
+        let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), wire_len)
+            .build()
+            .user_data(buf_idx as u64);
+        ring.push(&sqe);
+        outstanding[*active_set] += 1;
+        diag::bump(&WRITE_SQES, 1);
 
-        debug_assert!(
-            entry.end_sequence as i64 > *local_cursor,
-            "BatchEntry.end_sequence ({}) must be > local_cursor ({})",
-            entry.end_sequence,
-            *local_cursor
-        );
-
-        entry.batch.completion.wait();
-        let output =
-            unsafe { std::slice::from_raw_parts(entry.batch.output_ptr, entry.batch.output_len) };
-        let mut output_offset: usize = 0;
-
-        let slots_in_batch = entry.end_sequence as i64 - *local_cursor;
-        for _ in 0..slots_in_batch {
-            let event = guard_ref
-                .next()
-                .expect("guard exhausted before BatchEntry.end_sequence");
-            let num_vecs = event.num_vectors as usize;
-            let fd = event.fd;
-
-            // Encode wire format: [u8 num_vectors][f32 × num_vectors LE].
-            let buf_idx = buf_base + slot_in_set;
-            let buf = &mut write_bufs[buf_idx];
-            buf[0] = num_vecs as u8;
-            for (i, &val) in output[output_offset..output_offset + num_vecs]
-                .iter()
-                .enumerate()
-            {
-                buf[1 + i * 4..1 + i * 4 + 4].copy_from_slice(&val.to_le_bytes());
-            }
-            let wire_len = (1 + num_vecs * 4) as u32;
-
-            // Submit OP_WRITE (user_data encodes the active set for CQE accounting).
-            write_meta[buf_idx] = WriteMeta {
-                fd,
-                expected_len: wire_len,
-            };
-            let sqe = opcode::Write::new(Fd(fd), buf.as_ptr(), wire_len)
-                .build()
-                .user_data(buf_idx as u64);
-            ring.push(&sqe);
-            outstanding[active_set] += 1;
-
-            // Eagerly release the PoolSlice — GPU has finished reading this slot's input.
-            event.features.release();
-
-            output_offset += num_vecs;
-            slot_in_set += 1;
-        }
-
-        *local_cursor = entry.end_sequence as i64;
-        let session_available = Arc::clone(&entry.batch.session_available);
-        drop(entry);
-        session_available.store(true, std::sync::atomic::Ordering::Release);
-
-        // Exit when the guard is fully consumed.
-        if guard_ref.len() == 0 {
-            break;
-        }
+        output_offset += num_vecs;
+        slot_in_set += 1;
+        diag::bump(&RESPONSES_WRITTEN, 1);
     }
+
+    rotate_set(ring, outstanding, write_meta, active_set, &mut slot_in_set);
+
+    debug_assert_eq!(
+        output_offset, entry.batch.output_len,
+        "slot_count/num_vectors mismatch between ring events and batch output"
+    );
+
+    let session_available = Arc::clone(&entry.batch.session_available);
+    drop(entry);
+    session_available.store(true, std::sync::atomic::Ordering::Release);
+    diag::bump(&BATCHES_COMPLETED, 1);
 }

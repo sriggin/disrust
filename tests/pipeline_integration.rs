@@ -52,7 +52,9 @@ fn pipeline_request_to_response_end_to_end() {
         &mut request_seq,
     );
     assert!(result.is_ok());
-    let (consumed, num_published) = result.unwrap();
+    let outcome = result.unwrap();
+    let consumed = outcome.consumed;
+    let num_published = outcome.num_published;
     assert_eq!(consumed, buf.len());
     assert_eq!(num_published, 1);
 
@@ -118,7 +120,9 @@ fn pipeline_multiple_requests_same_conn() {
         &mut request_seq,
     );
     assert!(result.is_ok());
-    let (consumed, num_published) = result.unwrap();
+    let outcome = result.unwrap();
+    let consumed = outcome.consumed;
+    let num_published = outcome.num_published;
     assert_eq!(consumed, buf.len());
     assert_eq!(num_published, 2);
 

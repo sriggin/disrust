@@ -1,16 +1,23 @@
-//! SubmissionConsumer: drains the request ring, accumulates GPU batches,
+//! SubmissionConsumer: drains request-ring events into a local backlog, forms GPU batches,
 //! submits to ORT, and pushes BatchEntry values to the batch queue.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
 
 use crate::batch_queue::{BatchEntry, BatchQueue};
+use crate::buffer_pool::PoolSlice;
 use crate::config::MAX_SESSION_BATCH_SIZE;
-use crate::constants::FEATURE_DIM;
+use crate::gpu::diag::{self, BATCHES_SUBMITTED, VECTORS_SUBMITTED};
 use crate::ring_types::InferenceEvent;
 
 use super::session::GpuSession;
+
+struct PendingSlot {
+    features: PoolSlice,
+    num_vectors: usize,
+}
 
 pub struct SubmissionConsumer {
     poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
@@ -18,9 +25,8 @@ pub struct SubmissionConsumer {
     /// Round-robin session index.
     session_cursor: usize,
     batch_queue: Arc<BatchQueue>,
-    /// Tracks the absolute ring sequence of the last event processed.
-    /// Starts at -1 (INITIAL_CURSOR_VALUE); cast to u64 gives BatchEntry.end_sequence.
-    next_seq: i64,
+    backlog: VecDeque<PendingSlot>,
+    max_batch_slots: usize,
 }
 
 // SAFETY: SubmissionConsumer runs on a single dedicated thread.
@@ -31,129 +37,121 @@ impl SubmissionConsumer {
         poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
         sessions: Vec<GpuSession>,
         batch_queue: Arc<BatchQueue>,
+        max_batch_slots: usize,
     ) -> Self {
+        assert!(max_batch_slots > 0, "max_batch_slots must be > 0");
+        assert!(
+            max_batch_slots <= MAX_SESSION_BATCH_SIZE,
+            "max_batch_slots ({max_batch_slots}) exceeds compile-time limit ({MAX_SESSION_BATCH_SIZE})"
+        );
         Self {
             poller,
             sessions,
             session_cursor: 0,
             batch_queue,
-            next_seq: -1,
+            backlog: VecDeque::new(),
+            max_batch_slots,
         }
     }
 
     pub fn run(mut self) {
         loop {
-            match self.poller.poll() {
-                Ok(mut guard) => {
-                    // Extract fields needed inside guard processing to satisfy the borrow checker.
-                    // The guard borrows `self.poller`; the extracted refs borrow disjoint fields.
-                    process_guard(
-                        &mut guard,
-                        &mut self.sessions,
-                        &mut self.session_cursor,
-                        &self.batch_queue,
-                        &mut self.next_seq,
-                    );
-                    // guard drop here advances SubmissionConsumer's cursor.
-                }
-                Err(Polling::NoEvents) => std::hint::spin_loop(),
+            match drain_visible_events(&mut self.poller, &mut self.backlog, self.max_batch_slots) {
+                Ok(()) => {}
                 Err(Polling::Shutdown) => return,
+                Err(Polling::NoEvents) => {
+                    unreachable!("drain_visible_events does not return NoEvents")
+                }
             }
+            if self.backlog.is_empty() {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let idx = reserve_session(&self.sessions, &mut self.session_cursor);
+            let batch_entry = build_batch_entry(
+                &mut self.sessions[idx],
+                &mut self.backlog,
+                self.max_batch_slots,
+            );
+            diag::bump(&BATCHES_SUBMITTED, 1);
+            diag::bump(&VECTORS_SUBMITTED, batch_entry.batch.output_len as u64);
+            self.batch_queue.push(batch_entry);
         }
     }
 }
 
-fn process_guard(
+fn drain_visible_events(
+    poller: &mut EventPoller<InferenceEvent, SingleProducerBarrier>,
+    backlog: &mut VecDeque<PendingSlot>,
+    max_batch_slots: usize,
+) -> Result<(), Polling> {
+    loop {
+        match poller.poll_take(max_batch_slots as u64) {
+            Ok(mut guard) => drain_guard(&mut guard, backlog),
+            Err(Polling::NoEvents) => return Ok(()),
+            Err(Polling::Shutdown) => return Err(Polling::Shutdown),
+        }
+    }
+}
+
+fn drain_guard(
     guard: &mut EventGuard<'_, InferenceEvent, SingleProducerBarrier>,
-    sessions: &mut [GpuSession],
-    session_cursor: &mut usize,
-    batch_queue: &Arc<BatchQueue>,
-    next_seq: &mut i64,
+    backlog: &mut VecDeque<PendingSlot>,
 ) {
-    // Accumulate events into GPU batches, splitting on:
-    //  1. Pool ring wrap-around (non-contiguous PoolSlice addresses).
-    //  2. MAX_SESSION_BATCH_SIZE slots per batch.
-    //
-    // All BatchEntry pushes must happen before the guard is dropped so the
-    // CompletionConsumer's barrier can locate their entries in the queue.
-
-    let mut batch_host_ptr: *const f32 = std::ptr::null();
-    let mut batch_num_vectors: usize = 0;
-    let mut batch_slot_count: usize = 0;
-    // Pointer to the end of the previous slot's feature data (for wrap detection).
-    let mut prev_end: *const f32 = std::ptr::null();
-
     for event in &mut *guard {
-        *next_seq += 1;
-
-        let curr_start = event.features.as_slice().as_ptr();
-        let num_vecs = event.num_vectors as usize;
-
-        if batch_slot_count == 0 {
-            // First slot of a new batch: record the host pointer for this batch.
-            batch_host_ptr = curr_start;
-            batch_num_vectors = num_vecs;
-            batch_slot_count = 1;
-        } else {
-            let contiguous = prev_end == curr_start;
-            let at_size_limit = batch_slot_count >= MAX_SESSION_BATCH_SIZE;
-            if !contiguous || at_size_limit {
-                // Flush the batch that ended at the previous slot.
-                let end_seq = (*next_seq - 1) as u64;
-                flush_batch(
-                    sessions,
-                    session_cursor,
-                    batch_queue,
-                    batch_host_ptr,
-                    batch_num_vectors,
-                    end_seq,
-                );
-                // Start a new batch at the current slot.
-                batch_host_ptr = curr_start;
-                batch_num_vectors = num_vecs;
-                batch_slot_count = 1;
-            } else {
-                batch_num_vectors += num_vecs;
-                batch_slot_count += 1;
-            }
-        }
-
-        prev_end = unsafe { curr_start.add(num_vecs * FEATURE_DIM) };
+        backlog.push_back(PendingSlot {
+            features: take_event_features(event),
+            num_vectors: event.num_vectors as usize,
+        });
     }
-
-    // Flush the final (or only) batch.
-    if batch_slot_count > 0 {
-        let end_seq = *next_seq as u64;
-        flush_batch(
-            sessions,
-            session_cursor,
-            batch_queue,
-            batch_host_ptr,
-            batch_num_vectors,
-            end_seq,
-        );
-    }
-    // Guard drops here, advancing SubmissionConsumer cursor to `end_seq`.
 }
 
-fn flush_batch(
-    sessions: &mut [GpuSession],
-    session_cursor: &mut usize,
-    batch_queue: &Arc<BatchQueue>,
-    host_ptr: *const f32,
-    num_vectors: usize,
-    end_sequence: u64,
-) {
-    let idx = reserve_session(sessions, session_cursor);
+fn take_event_features(event: &InferenceEvent) -> PoolSlice {
+    // SAFETY: while SubmissionConsumer holds the poll guard, no later consumer can
+    // observe these slots yet and the producer cannot reuse them. That makes it
+    // safe to move `features` out into the submission backlog before guard drop.
+    unsafe {
+        let event_ptr = event as *const InferenceEvent as *mut InferenceEvent;
+        std::ptr::replace(
+            std::ptr::addr_of_mut!((*event_ptr).features),
+            PoolSlice::empty(),
+        )
+    }
+}
 
-    let batch = sessions[idx].submit_batch(host_ptr, num_vectors);
+fn build_batch_entry(
+    session: &mut GpuSession,
+    backlog: &mut VecDeque<PendingSlot>,
+    max_batch_slots: usize,
+) -> BatchEntry {
+    let first = backlog
+        .front()
+        .expect("build_batch_entry requires non-empty backlog");
+    let host_ptr = first.features.as_slice().as_ptr();
 
-    // Push to batch queue — spins when full (correct backpressure).
-    batch_queue.push(BatchEntry {
-        end_sequence,
-        session_idx: idx,
-        batch,
-    });
+    let mut slot_count = 0usize;
+    let mut num_vectors = 0usize;
+    let mut input_slices = Vec::new();
+
+    while let Some(next) = backlog.front() {
+        let contiguous = input_slices
+            .last()
+            .is_none_or(|prev: &PoolSlice| prev.is_contiguous(&next.features));
+        if !contiguous || slot_count >= max_batch_slots {
+            break;
+        }
+
+        let next = backlog.pop_front().expect("front just checked");
+        num_vectors += next.num_vectors;
+        slot_count += 1;
+        input_slices.push(next.features);
+    }
+
+    let mut batch = session.submit_batch(host_ptr, num_vectors);
+    batch.input_slices = input_slices;
+
+    BatchEntry { slot_count, batch }
 }
 
 fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize {

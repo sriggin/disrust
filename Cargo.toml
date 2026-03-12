@@ -46,6 +46,11 @@ name = "pipeline_e2e_bench"
 path = "benches/pipeline_e2e_bench.rs"
 harness = false
 
+[[bench]]
+name = "gpu_inference_bench"
+path = "benches/gpu_inference_bench.rs"
+harness = false
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 disruptor = "3.7.1"
