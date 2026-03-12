@@ -18,6 +18,7 @@ use disrust::config::{
     SESSION_POOL_SIZE,
 };
 use disrust::gpu::completion::CompletionConsumer;
+use disrust::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
 use disrust::gpu::session::GpuSession;
 use disrust::gpu::submission::SubmissionConsumer;
 use disrust::ring_types::InferenceEvent;
@@ -54,11 +55,40 @@ fn main() {
     let port = args.port;
 
     eprintln!("disrust-gpu: starting on port {}", port);
+    let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
+        eprintln!("disrust-gpu preflight failed: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("disrust-gpu: using ORT dylib {}", ort_dylib.display());
+    verify_cuda_startup().unwrap_or_else(|e| {
+        eprintln!("disrust-gpu preflight failed: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("disrust-gpu: CUDA driver preflight ok");
 
     // 1. Factory pool for empty PoolSlices during disruptor pre-allocation.
     set_factory_pool(BufferPool::new_boxed(1));
 
-    // 2. Allocate pinned host memory for the buffer pool.
+    // 2. Load ONNX model.
+    let model_bytes = std::fs::read(&args.model).unwrap_or_else(|e| {
+        eprintln!("Failed to read model '{}': {}", args.model, e);
+        std::process::exit(1);
+    });
+
+    // 3. Construct session pool first so ORT/CUDA creates a context before we allocate
+    // pinned host memory for the request BufferPool.
+    let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
+        .map(|i| {
+            eprintln!(
+                "disrust-gpu: loading session {}/{}",
+                i + 1,
+                SESSION_POOL_SIZE
+            );
+            GpuSession::new(&model_bytes)
+        })
+        .collect();
+
+    // 4. Allocate pinned host memory for the buffer pool.
     let host_ptr = unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
@@ -72,7 +102,7 @@ fn main() {
         ptr as *mut f32
     };
 
-    // 3. Construct the BufferPool over the pinned memory (capacity in f32 units).
+    // 5. Construct the BufferPool over the pinned memory (capacity in f32 units).
     let pool: &'static BufferPool =
         Box::leak(unsafe { BufferPool::from_raw_ptr(host_ptr, GPU_BUFFER_POOL_CAPACITY) });
     let allocator = pool.allocator();
@@ -82,13 +112,7 @@ fn main() {
         GPU_BUFFER_POOL_BYTES / 1_000_000,
     );
 
-    // 4. Load ONNX model.
-    let model_bytes = std::fs::read(&args.model).unwrap_or_else(|e| {
-        eprintln!("Failed to read model '{}': {}", args.model, e);
-        std::process::exit(1);
-    });
-
-    // 5. Build request disruptor: two-consumer chain.
+    // 6. Build request disruptor: two-consumer chain.
     //    submission_poller: EventPoller<InferenceEvent, SingleProducerBarrier>
     //    completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>
     //      (gated on submission_poller's cursor via .and_then())
@@ -98,18 +122,6 @@ fn main() {
     let (submission_poller, builder) = builder.event_poller();
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
-
-    // 6. Construct session pool.
-    let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
-        .map(|i| {
-            eprintln!(
-                "disrust-gpu: loading session {}/{}",
-                i + 1,
-                SESSION_POOL_SIZE
-            );
-            GpuSession::new(&model_bytes)
-        })
-        .collect();
 
     // 7. Shared batch queue.
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
