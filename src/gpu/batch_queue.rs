@@ -6,6 +6,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crate::gpu::session::InFlightBatch;
 
@@ -13,6 +14,8 @@ use crate::gpu::session::InFlightBatch;
 pub struct BatchEntry {
     /// Number of disruptor slots covered by this GPU batch.
     pub slot_count: usize,
+    /// Wall-clock timestamp when submission handed this batch to completion.
+    pub submitted_at: Instant,
     /// In-flight GPU batch state. Submission enqueues this immediately after
     /// `RunAsync` returns; completion waits for the callback to mark it ready.
     pub batch: InFlightBatch,

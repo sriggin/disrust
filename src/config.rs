@@ -16,11 +16,11 @@ pub const READ_BUF_SIZE: usize = 65536;
 pub const SLAB_CAPACITY: usize = 4096;
 
 /// Size each buffer pool to handle all in-flight requests at max size.
-/// CRITICAL: Pool must be >= disruptor capacity * max request size to prevent
+/// CRITICAL: Pool must be >= request ring capacity * max request size to prevent
 /// wraparound from overwriting unread data. Worst-case sizing (conservative).
 /// See PERFORMANCE.md for right-sizing opportunities.
 pub const BUFFER_POOL_CAPACITY: usize =
-    GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+    GPU_REQUEST_RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
 
 // ---------------------------------------------------------------------------
 // ONNX/CUDA server pipeline
@@ -32,17 +32,20 @@ pub const SESSION_POOL_SIZE: usize = 1;
 /// Maximum disruptor ring slots accumulated into a single GPU batch.
 pub const MAX_SESSION_BATCH_SIZE: usize = 256;
 
-/// Request ring buffer size for the ONNX pipeline.
+/// Request ring capacity for the ONNX pipeline.
 ///
-/// With the current disruptor guard semantics, SubmissionConsumer must be able to
-/// submit all slots visible in a single poll without waiting for CompletionConsumer.
-/// That means the ring cannot expose more than one batch per in-flight session at once.
-pub const GPU_DISRUPTOR_SIZE: usize = SESSION_POOL_SIZE * MAX_SESSION_BATCH_SIZE;
+/// This is intentionally independent from `MAX_SESSION_BATCH_SIZE`: the disruptor ring controls
+/// how much ingress backlog the pipeline can absorb, while `MAX_SESSION_BATCH_SIZE` controls how
+/// much work a single GPU submission may include.
+pub const GPU_REQUEST_RING_SIZE: usize = 4096;
+
+/// Request ring buffer size for the ONNX pipeline.
+pub const GPU_DISRUPTOR_SIZE: usize = GPU_REQUEST_RING_SIZE;
 
 /// Pinned host buffer pool capacity in f32 units (pass to `BufferPool::from_raw_ptr`).
 /// Byte count for `cuMemAllocHost` = `GPU_BUFFER_POOL_CAPACITY * size_of::<f32>()`.
 pub const GPU_BUFFER_POOL_CAPACITY: usize =
-    GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+    GPU_REQUEST_RING_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
 
 /// Byte size of the pinned host buffer pool allocation.
 pub const GPU_BUFFER_POOL_BYTES: usize = GPU_BUFFER_POOL_CAPACITY * size_of::<f32>();
@@ -69,6 +72,6 @@ const _: () = assert!(
     "SLAB_CAPACITY must fit in u16 (conn_id)"
 );
 const _: () = assert!(
-    BUFFER_POOL_CAPACITY >= GPU_DISRUPTOR_SIZE * FEATURE_DIM,
+    BUFFER_POOL_CAPACITY >= GPU_REQUEST_RING_SIZE * FEATURE_DIM,
     "buffer pool capacity is too small for disruptor size"
 );

@@ -3,13 +3,14 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
 
 use crate::buffer_pool::PoolSlice;
 use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
-use crate::gpu::diag::{self, BATCHES_SUBMITTED, VECTORS_SUBMITTED};
+use crate::metrics;
 use crate::ring_types::InferenceEvent;
 
 use super::session::GpuSession;
@@ -74,8 +75,8 @@ impl SubmissionConsumer {
                 &mut self.backlog,
                 self.max_batch_slots,
             );
-            diag::bump(&BATCHES_SUBMITTED, 1);
-            diag::bump(&VECTORS_SUBMITTED, batch_entry.batch.output_len as u64);
+            metrics::inc_batches_submitted();
+            metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
             self.batch_queue.push(batch_entry);
         }
     }
@@ -151,7 +152,11 @@ fn build_batch_entry(
     let mut batch = session.submit_batch(host_ptr, num_vectors);
     batch.input_slices = input_slices;
 
-    BatchEntry { slot_count, batch }
+    BatchEntry {
+        slot_count,
+        submitted_at: Instant::now(),
+        batch,
+    }
 }
 
 fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize {
@@ -163,6 +168,7 @@ fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize
                 return idx;
             }
         }
+        metrics::inc_session_wait_loops();
         std::hint::spin_loop();
     }
 }

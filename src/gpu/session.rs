@@ -88,6 +88,12 @@ pub struct BatchCompletion {
     error: Mutex<Option<String>>,
 }
 
+pub enum BatchPoll {
+    Pending,
+    Ready,
+    Failed,
+}
+
 impl BatchCompletion {
     fn new() -> Self {
         Self {
@@ -125,6 +131,15 @@ impl BatchCompletion {
                 }
                 _ => unreachable!("invalid batch completion state"),
             }
+        }
+    }
+
+    pub fn poll(&self) -> BatchPoll {
+        match self.state.load(Ordering::Acquire) {
+            BATCH_PENDING => BatchPoll::Pending,
+            BATCH_READY => BatchPoll::Ready,
+            BATCH_FAILED => BatchPoll::Failed,
+            _ => unreachable!("invalid batch completion state"),
         }
     }
 }

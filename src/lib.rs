@@ -7,13 +7,14 @@
 pub mod buffer_pool;
 pub mod config;
 pub mod constants;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod metrics;
 pub mod protocol;
 pub mod request_flow;
 pub mod ring_types;
 #[cfg(feature = "cuda")]
-pub mod gpu;
-#[cfg(feature = "cuda")]
 pub mod server;
+pub mod timer;
 #[cfg(feature = "cuda")]
 pub mod verify;

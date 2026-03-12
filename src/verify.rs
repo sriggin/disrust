@@ -110,8 +110,8 @@ fn run_cpu_verify(model_bytes: &[u8], args: &VerifyArgs) {
     } else {
         vec![1.0f32; args.batch * FDIM]
     };
-    let input = ort::value::Tensor::<f32>::from_array(([args.batch, FDIM], input))
-        .unwrap_or_else(|e| {
+    let input =
+        ort::value::Tensor::<f32>::from_array(([args.batch, FDIM], input)).unwrap_or_else(|e| {
             eprintln!("Tensor::from_array failed: {e}");
             std::process::exit(1)
         });
@@ -147,11 +147,10 @@ fn run_cuda_verify(model_bytes: &[u8], args: &VerifyArgs) {
     let mut gpu_session = GpuSession::with_output_capacity(model_bytes, args.batch);
     let output_name = gpu_session.output_name().to_string();
 
-    let input_ptr = alloc_pinned(input_elems * std::mem::size_of::<f32>())
-        .unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }) as *mut f32;
+    let input_ptr = alloc_pinned(input_elems * std::mem::size_of::<f32>()).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }) as *mut f32;
     unsafe {
         for batch_idx in 0..args.batch {
             for feature_idx in 0..FDIM {

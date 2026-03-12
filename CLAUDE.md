@@ -90,15 +90,17 @@ Wire format is little-endian binary:
 
 ### Critical Constants
 
-- `config.rs`: `GPU_DISRUPTOR_SIZE`, `GPU_BUFFER_POOL_CAPACITY`, `SESSION_POOL_SIZE`, `MAX_SESSION_BATCH_SIZE`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`
+- `config.rs`: `GPU_REQUEST_RING_SIZE`, `GPU_BUFFER_POOL_CAPACITY`, `SESSION_POOL_SIZE`, `MAX_SESSION_BATCH_SIZE`, `MAX_IO_THREADS`, `READ_BUF_SIZE`, `SLAB_CAPACITY`
 - `constants.rs`: `FEATURE_DIM = 16`, `MAX_VECTORS_PER_REQUEST = 64`
 
 ## Metrics (`--features metrics`)
 
 Background thread prints deltas every 10s:
-- **Throughput**: `published` (requests published to the disruptor)
-- **Stalls**: `req_ring_full`, `pool_exh`, `pool_too_large`
-- **Gauges**: `req_occ`, `req_max`, `pool_max_in_use`
+- **Request path**: `req_published`, read submits/CQEs/bytes/negative CQEs, bytes consumed
+- **GPU path**: `batches_submitted`, `batches_completed`, `vectors_submitted`, `responses_written`
+- **Write path**: write SQEs/CQEs/negative CQEs, partial writes, `EAGAIN`, fatal write errors, CQE-drain waits
+- **Stalls**: `req_ring_full`, `pool_exh`, `pool_too_large`, session wait loops, completion queue empty spins, completion poll `NoEvents`
+- **Gauges**: `req_occ`, `req_max`, `buffered_bytes`, `pool_max_in_use`
 
 ## Notes
 

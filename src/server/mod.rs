@@ -37,6 +37,10 @@ pub struct ServeArgs {
     /// Runtime cap on ring slots per GPU submission.
     #[arg(long, default_value_t = MAX_SESSION_BATCH_SIZE)]
     pub max_batch_slots: usize,
+
+    /// Metrics reporting interval in seconds.
+    #[arg(long, default_value_t = 10)]
+    pub metrics_interval_secs: u64,
 }
 
 fn create_listener(port: u16) -> Socket {
@@ -53,7 +57,12 @@ fn create_listener(port: u16) -> Socket {
 }
 
 pub fn run(args: ServeArgs) {
-    metrics::spawn_reporter();
+    if args.metrics_interval_secs == 0 {
+        eprintln!("disrust: --metrics-interval-secs must be > 0");
+        std::process::exit(1);
+    }
+
+    metrics::spawn_reporter(args.metrics_interval_secs);
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
 
@@ -98,11 +107,7 @@ pub fn run(args: ServeArgs) {
 
     let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
         .map(|i| {
-            eprintln!(
-                "disrust: loading session {}/{}",
-                i + 1,
-                SESSION_POOL_SIZE
-            );
+            eprintln!("disrust: loading session {}/{}", i + 1, SESSION_POOL_SIZE);
             GpuSession::new(&model_bytes)
         })
         .collect();

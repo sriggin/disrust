@@ -10,10 +10,7 @@ use slab::Slab;
 
 use crate::buffer_pool::PoolAllocator;
 use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY};
-use crate::gpu::diag::{
-    self, BUFFERED_BYTES, BYTES_CONSUMED, READ_BYTES, READ_CQES, READ_NEGATIVE, READ_SUBMITS,
-    REQUESTS_PUBLISHED, Reporter,
-};
+use crate::metrics;
 use crate::request_flow;
 use crate::ring_types::InferenceEvent;
 
@@ -123,12 +120,9 @@ impl IngressThread {
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
         let mut retry_keys: Vec<u16> = Vec::new();
-        let mut reporter = Reporter::new();
-
         submit_accept(&mut ring, self.listen_fd);
 
         loop {
-            reporter.maybe_report();
             retry_keys.clear();
             for (k, c) in conns.iter() {
                 if !c.read_inflight && c.read_len > 0 {
@@ -211,19 +205,16 @@ fn handle_read(
     result: i32,
 ) {
     let key_usize = key as usize;
-    diag::bump(&READ_CQES, 1);
+    metrics::inc_read_cqes();
     if result <= 0 {
         if result < 0 {
-            diag::bump(&READ_NEGATIVE, 1);
-            if diag::enabled() {
-                eprintln!("disrust diag: read result={} on conn={}", result, key);
-            }
+            metrics::inc_read_negative();
         }
         conns.try_remove(key_usize);
         return;
     }
     let bytes_read = result as usize;
-    diag::bump(&READ_BYTES, bytes_read as u64);
+    metrics::add_read_bytes(bytes_read as u64);
     let Some(conn) = conns.get_mut(key_usize) else {
         return;
     };
@@ -263,11 +254,8 @@ fn parse_and_maybe_read(
                     .copy_within(outcome.consumed..conn.read_len, 0);
                 conn.read_len -= outcome.consumed;
             }
-            diag::bump(&REQUESTS_PUBLISHED, outcome.num_published as u64);
-            diag::bump(&BYTES_CONSUMED, outcome.consumed as u64);
-            if diag::enabled() {
-                BUFFERED_BYTES.store(conn.read_len as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            metrics::add_bytes_consumed(outcome.consumed as u64);
+            metrics::set_buffered_bytes(conn.read_len);
             if outcome.needs_read {
                 submit_read(ring, conns, key);
             }
@@ -306,5 +294,5 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
         .build()
         .user_data(encode_user_data(OP_READ, key));
     ring.push(&sqe);
-    diag::bump(&READ_SUBMITS, 1);
+    metrics::inc_read_submits();
 }
