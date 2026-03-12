@@ -15,3 +15,5 @@ pub mod ring_types;
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod server;
+#[cfg(feature = "cuda")]
+pub mod verify;

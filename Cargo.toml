@@ -13,11 +13,6 @@ name = "disrust"
 path = "src/main.rs"
 required-features = ["cuda"]
 
-[[bin]]
-name = "ort-verify"
-path = "src/bin/ort_verify.rs"
-required-features = ["cuda"]
-
 [[bench]]
 name = "buffer_pool_bench"
 path = "benches/buffer_pool_bench.rs"

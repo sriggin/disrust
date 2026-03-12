@@ -14,11 +14,14 @@ io_uring and SO_REUSEPORT require Linux. On Linux, run `cargo` commands directly
 
 ```bash
 # Start server (default port 9900)
-./target/release/disrust
-./target/release/disrust --port 9900
+./target/release/disrust serve --model model.onnx
+./target/release/disrust serve --model model.onnx --port 9900
 
 # Run with metrics (deltas every 10s to stdout)
-cargo build --release --features metrics && ./target/release/disrust --model model.onnx
+cargo build --release --features metrics && ./target/release/disrust serve --model model.onnx
+
+# Verify ONNX/ORT path
+./target/release/disrust verify --model model.onnx
 
 # Client smoke / pipeline / benchmark
 cargo run --bin client

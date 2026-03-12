@@ -18,6 +18,7 @@ use ort::{
 use crate::buffer_pool::PoolSlice;
 use crate::config::MAX_BATCH_VECTORS;
 use crate::constants::FEATURE_DIM as FDIM;
+use crate::gpu::pinned::{alloc_pinned, free_pinned};
 
 const BATCH_PENDING: u8 = 0;
 const BATCH_READY: u8 = 1;
@@ -175,7 +176,7 @@ pub struct GpuSession {
     input_memory_info: MemoryInfo,
     output_memory_info: MemoryInfo,
     _input_name: CString,
-    _output_name: CString,
+    output_name: CString,
     /// Stable `RunAsync` name arrays. The strings live in `input_name`/`output_name`.
     input_name_ptrs: [*const c_char; 1],
     output_name_ptrs: [*const c_char; 1],
@@ -262,15 +263,11 @@ impl GpuSession {
         });
 
         let output_ptr = unsafe {
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let status = cudarc::driver::sys::cuMemAllocHost_v2(
-                &mut ptr,
-                output_capacity * std::mem::size_of::<f32>(),
-            );
-            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("cuMemAllocHost_v2 for output failed: {:?}", status);
-                std::process::abort();
-            }
+            let ptr =
+                alloc_pinned(output_capacity * std::mem::size_of::<f32>()).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::abort();
+                });
             std::ptr::write_bytes(ptr, 0, output_capacity * std::mem::size_of::<f32>());
             ptr as *mut f32
         };
@@ -283,7 +280,7 @@ impl GpuSession {
             input_memory_info,
             output_memory_info,
             _input_name: input_name,
-            _output_name: output_name,
+            output_name,
             input_name_ptrs,
             output_name_ptrs,
             input_value_ptrs: [std::ptr::null()],
@@ -298,6 +295,12 @@ impl GpuSession {
         self.available
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    pub fn output_name(&self) -> &str {
+        self.output_name
+            .to_str()
+            .expect("ORT output name must be valid UTF-8")
     }
 
     pub fn submit_batch(
@@ -373,11 +376,8 @@ impl GpuSession {
 
 impl Drop for GpuSession {
     fn drop(&mut self) {
-        unsafe {
-            let status = cudarc::driver::sys::cuMemFreeHost(self.output_ptr.cast::<c_void>());
-            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("cuMemFreeHost failed on GpuSession drop: {:?}", status);
-            }
+        if let Err(e) = unsafe { free_pinned(self.output_ptr.cast::<c_void>()) } {
+            eprintln!("GpuSession drop failed to free pinned output buffer: {e}");
         }
     }
 }

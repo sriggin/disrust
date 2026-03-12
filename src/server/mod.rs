@@ -2,7 +2,7 @@ use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 use std::thread;
 
-use clap::Parser;
+use clap::Args;
 use disruptor::{BusySpin, build_single_producer};
 use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -24,20 +24,19 @@ mod ingress;
 
 use ingress::IngressThread;
 
-#[derive(Parser)]
-#[command(about = "High-performance ONNX/CUDA io_uring inference server")]
-struct Args {
+#[derive(Args, Clone)]
+pub struct ServeArgs {
     /// Port to listen on
     #[arg(short, long, default_value_t = 9900)]
-    port: u16,
+    pub port: u16,
 
     /// Path to ONNX model file
-    #[arg(short, long, default_value = "model.onnx")]
-    model: String,
+    #[arg(short, long)]
+    pub model: String,
 
     /// Runtime cap on ring slots per GPU submission.
     #[arg(long, default_value_t = MAX_SESSION_BATCH_SIZE)]
-    max_batch_slots: usize,
+    pub max_batch_slots: usize,
 }
 
 fn create_listener(port: u16) -> Socket {
@@ -53,9 +52,8 @@ fn create_listener(port: u16) -> Socket {
     socket
 }
 
-pub fn run() {
+pub fn run(args: ServeArgs) {
     metrics::spawn_reporter();
-    let args = Args::parse();
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
 
