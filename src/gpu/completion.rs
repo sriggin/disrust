@@ -8,6 +8,7 @@ use std::time::Instant;
 use disruptor::{EventGuard, EventPoller, Polling, SingleConsumerBarrier};
 use io_uring::{opcode, squeue::Entry, types::Fd};
 
+use crate::clock::elapsed_since_ns;
 use crate::config::{MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, WRITE_BUF_SIZE, WRITE_BUF_SLOTS};
 use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
 use crate::gpu::session::BatchPoll;
@@ -276,6 +277,7 @@ fn process_batch(
             .expect("guard exhausted before queued batch slot_count");
         let num_vecs = event.num_vectors as usize;
         let fd = event.fd;
+        metrics::record_publish_to_write_submit(elapsed_since_ns(event.published_at_ns));
 
         // Encode wire format: [u8 num_vectors][f32 × num_vectors LE].
         let buf_idx = (*active_set * MAX_SESSION_BATCH_SIZE) + slot_in_set;

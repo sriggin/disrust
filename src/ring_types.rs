@@ -17,6 +17,7 @@ pub struct InferenceEvent {
     pub fd: i32,
     pub request_seq: u64,
     pub num_vectors: u8,
+    pub published_at_ns: u64,
     pub features: PoolSlice,
 }
 
@@ -29,6 +30,7 @@ impl InferenceEvent {
             fd: 0,
             request_seq: 0,
             num_vectors: 0,
+            published_at_ns: 0,
             features: PoolSlice::empty(),
         }
     }

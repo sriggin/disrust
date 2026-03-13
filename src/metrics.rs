@@ -23,6 +23,11 @@ mod imp {
     static BATCHES_SUBMITTED: AtomicU64 = AtomicU64::new(0);
     static VECTORS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
     static BATCHES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+    static SLOTS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+    static BACKLOG_SLOTS_AT_BUILD: AtomicU64 = AtomicU64::new(0);
+    static BATCH_STOP_CAP: AtomicU64 = AtomicU64::new(0);
+    static BATCH_STOP_BACKLOG_EMPTY: AtomicU64 = AtomicU64::new(0);
+    static BATCH_STOP_NON_CONTIG: AtomicU64 = AtomicU64::new(0);
     static RESPONSES_WRITTEN: AtomicU64 = AtomicU64::new(0);
     static READ_SUBMITS: AtomicU64 = AtomicU64::new(0);
     static READ_CQES: AtomicU64 = AtomicU64::new(0);
@@ -34,10 +39,16 @@ mod imp {
     static WRITE_NEGATIVE: AtomicU64 = AtomicU64::new(0);
     static BATCH_TOTAL_NS: OnceLock<TimerMetric> = OnceLock::new();
     static BATCH_WAIT_NS: OnceLock<TimerMetric> = OnceLock::new();
+    static BACKLOG_AGE_NS: OnceLock<TimerMetric> = OnceLock::new();
+    static PUBLISH_TO_SUBMIT_NS: OnceLock<TimerMetric> = OnceLock::new();
+    static PUBLISH_TO_WRITE_SUBMIT_NS: OnceLock<TimerMetric> = OnceLock::new();
     static WRITE_DRAIN_NS: OnceLock<TimerMetric> = OnceLock::new();
     thread_local! {
         static BATCH_TOTAL_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
         static BATCH_WAIT_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
+        static BACKLOG_AGE_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
+        static PUBLISH_TO_SUBMIT_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
+        static PUBLISH_TO_WRITE_SUBMIT_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
         static WRITE_DRAIN_RECORDER: RefCell<Option<TimerRecorder>> = const { RefCell::new(None) };
     }
     // Gauges
@@ -55,6 +66,11 @@ mod imp {
         pub batches_submitted: u64,
         pub vectors_submitted: u64,
         pub batches_completed: u64,
+        pub slots_submitted: u64,
+        pub backlog_slots_at_build: u64,
+        pub batch_stop_cap: u64,
+        pub batch_stop_backlog_empty: u64,
+        pub batch_stop_non_contig: u64,
         pub responses_written: u64,
         pub read_submits: u64,
         pub read_cqes: u64,
@@ -135,12 +151,7 @@ mod imp {
         let mut prev = REQ_OCC.load(Ordering::Relaxed);
         loop {
             let next = prev.saturating_add(1);
-            match REQ_OCC.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match REQ_OCC.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => {
                     update_max(&REQ_MAX_OCC, next);
                     return;
@@ -154,12 +165,7 @@ mod imp {
         let mut prev = REQ_OCC.load(Ordering::Relaxed);
         loop {
             let next = prev.saturating_sub(1);
-            match REQ_OCC.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match REQ_OCC.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return,
                 Err(actual) => prev = actual,
             }
@@ -180,6 +186,26 @@ mod imp {
 
     pub fn inc_batches_completed() {
         BATCHES_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_slots_submitted(count: u64) {
+        SLOTS_SUBMITTED.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn add_backlog_slots_at_build(count: u64) {
+        BACKLOG_SLOTS_AT_BUILD.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_batch_stop_cap() {
+        BATCH_STOP_CAP.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_batch_stop_backlog_empty() {
+        BATCH_STOP_BACKLOG_EMPTY.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_batch_stop_non_contig() {
+        BATCH_STOP_NON_CONTIG.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_responses_written() {
@@ -226,6 +252,18 @@ mod imp {
         BATCH_WAIT_NS.get_or_init(TimerMetric::new)
     }
 
+    fn backlog_age_timer() -> &'static TimerMetric {
+        BACKLOG_AGE_NS.get_or_init(TimerMetric::new)
+    }
+
+    fn publish_to_submit_timer() -> &'static TimerMetric {
+        PUBLISH_TO_SUBMIT_NS.get_or_init(TimerMetric::new)
+    }
+
+    fn publish_to_write_submit_timer() -> &'static TimerMetric {
+        PUBLISH_TO_WRITE_SUBMIT_NS.get_or_init(TimerMetric::new)
+    }
+
     fn write_drain_timer() -> &'static TimerMetric {
         WRITE_DRAIN_NS.get_or_init(TimerMetric::new)
     }
@@ -242,6 +280,30 @@ mod imp {
         BATCH_WAIT_RECORDER.with(|slot| {
             let mut slot = slot.borrow_mut();
             let recorder = slot.get_or_insert_with(|| batch_wait_timer().recorder());
+            recorder.record_duration(duration);
+        });
+    }
+
+    pub fn record_backlog_age(duration: Duration) {
+        BACKLOG_AGE_RECORDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let recorder = slot.get_or_insert_with(|| backlog_age_timer().recorder());
+            recorder.record_duration(duration);
+        });
+    }
+
+    pub fn record_publish_to_submit(duration: Duration) {
+        PUBLISH_TO_SUBMIT_RECORDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let recorder = slot.get_or_insert_with(|| publish_to_submit_timer().recorder());
+            recorder.record_duration(duration);
+        });
+    }
+
+    pub fn record_publish_to_write_submit(duration: Duration) {
+        PUBLISH_TO_WRITE_SUBMIT_RECORDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let recorder = slot.get_or_insert_with(|| publish_to_write_submit_timer().recorder());
             recorder.record_duration(duration);
         });
     }
@@ -272,6 +334,11 @@ mod imp {
             batches_submitted: BATCHES_SUBMITTED.load(Ordering::Relaxed),
             vectors_submitted: VECTORS_SUBMITTED.load(Ordering::Relaxed),
             batches_completed: BATCHES_COMPLETED.load(Ordering::Relaxed),
+            slots_submitted: SLOTS_SUBMITTED.load(Ordering::Relaxed),
+            backlog_slots_at_build: BACKLOG_SLOTS_AT_BUILD.load(Ordering::Relaxed),
+            batch_stop_cap: BATCH_STOP_CAP.load(Ordering::Relaxed),
+            batch_stop_backlog_empty: BATCH_STOP_BACKLOG_EMPTY.load(Ordering::Relaxed),
+            batch_stop_non_contig: BATCH_STOP_NON_CONTIG.load(Ordering::Relaxed),
             responses_written: RESPONSES_WRITTEN.load(Ordering::Relaxed),
             read_submits: READ_SUBMITS.load(Ordering::Relaxed),
             read_cqes: READ_CQES.load(Ordering::Relaxed),
@@ -317,6 +384,19 @@ mod imp {
                 let batches_completed_d = snap
                     .batches_completed
                     .saturating_sub(last_snap.batches_completed);
+                let slots_submitted_d = snap
+                    .slots_submitted
+                    .saturating_sub(last_snap.slots_submitted);
+                let backlog_slots_at_build_d = snap
+                    .backlog_slots_at_build
+                    .saturating_sub(last_snap.backlog_slots_at_build);
+                let batch_stop_cap_d = snap.batch_stop_cap.saturating_sub(last_snap.batch_stop_cap);
+                let batch_stop_backlog_empty_d = snap
+                    .batch_stop_backlog_empty
+                    .saturating_sub(last_snap.batch_stop_backlog_empty);
+                let batch_stop_non_contig_d = snap
+                    .batch_stop_non_contig
+                    .saturating_sub(last_snap.batch_stop_non_contig);
                 let responses_written_d = snap
                     .responses_written
                     .saturating_sub(last_snap.responses_written);
@@ -345,15 +425,29 @@ mod imp {
                 let write_fatal_d = snap.write_fatal.saturating_sub(last_snap.write_fatal);
                 let batch_total = batch_total_timer().snapshot_and_reset();
                 let batch_wait = batch_wait_timer().snapshot_and_reset();
+                let backlog_age = backlog_age_timer().snapshot_and_reset();
+                let publish_to_submit = publish_to_submit_timer().snapshot_and_reset();
+                let publish_to_write_submit = publish_to_write_submit_timer().snapshot_and_reset();
                 let write_drain = write_drain_timer().snapshot_and_reset();
                 println!(
-                    "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} vectors_submitted={} responses_written={} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} buffered_bytes={} pool_max_in_use={} {} {}",
+                    "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} buffered_bytes={} pool_max_in_use={} {} {}",
                     interval_secs,
                     req_pub_d,
                     batches_submitted_d,
                     batches_completed_d,
+                    slots_submitted_d,
+                    backlog_slots_at_build_d,
                     vectors_submitted_d,
                     responses_written_d,
+                    batch_stop_cap_d,
+                    batch_stop_backlog_empty_d,
+                    batch_stop_non_contig_d,
+                    format_timer("backlog_age_us", backlog_age.as_ref()),
+                    format_timer("publish_to_submit_us", publish_to_submit.as_ref()),
+                    format_timer(
+                        "publish_to_write_submit_us",
+                        publish_to_write_submit.as_ref()
+                    ),
                     read_submits_d,
                     read_cqes_d,
                     read_bytes_d,
@@ -414,6 +508,11 @@ mod imp {
         pub batches_submitted: u64,
         pub vectors_submitted: u64,
         pub batches_completed: u64,
+        pub slots_submitted: u64,
+        pub backlog_slots_at_build: u64,
+        pub batch_stop_cap: u64,
+        pub batch_stop_backlog_empty: u64,
+        pub batch_stop_non_contig: u64,
         pub responses_written: u64,
         pub read_submits: u64,
         pub read_cqes: u64,
@@ -453,6 +552,11 @@ mod imp {
     pub fn inc_batches_submitted() {}
     pub fn add_vectors_submitted(_: u64) {}
     pub fn inc_batches_completed() {}
+    pub fn add_slots_submitted(_: u64) {}
+    pub fn add_backlog_slots_at_build(_: u64) {}
+    pub fn inc_batch_stop_cap() {}
+    pub fn inc_batch_stop_backlog_empty() {}
+    pub fn inc_batch_stop_non_contig() {}
     pub fn inc_responses_written() {}
     pub fn inc_read_submits() {}
     pub fn inc_read_cqes() {}
@@ -464,6 +568,9 @@ mod imp {
     pub fn inc_write_negative() {}
     pub fn record_batch_total(_: std::time::Duration) {}
     pub fn record_batch_wait(_: std::time::Duration) {}
+    pub fn record_backlog_age(_: std::time::Duration) {}
+    pub fn record_publish_to_submit(_: std::time::Duration) {}
+    pub fn record_publish_to_write_submit(_: std::time::Duration) {}
     pub fn record_write_drain(_: std::time::Duration) {}
     pub fn idle_timers() {}
     pub fn set_buffered_bytes(_: usize) {}
@@ -476,6 +583,11 @@ mod imp {
             batches_submitted: 0,
             vectors_submitted: 0,
             batches_completed: 0,
+            slots_submitted: 0,
+            backlog_slots_at_build: 0,
+            batch_stop_cap: 0,
+            batch_stop_backlog_empty: 0,
+            batch_stop_non_contig: 0,
             responses_written: 0,
             read_submits: 0,
             read_cqes: 0,

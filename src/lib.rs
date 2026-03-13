@@ -5,6 +5,7 @@
 //! full network server.
 
 pub mod buffer_pool;
+pub mod clock;
 pub mod config;
 pub mod constants;
 #[cfg(feature = "cuda")]

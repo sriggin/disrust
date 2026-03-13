@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use hdrhistogram::sync::{Recorder, SyncHistogram};
 use hdrhistogram::Histogram;
+use hdrhistogram::sync::{Recorder, SyncHistogram};
 
 const REFRESH_TIMEOUT: Duration = Duration::from_millis(100);
 

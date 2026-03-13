@@ -9,8 +9,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::buffer_pool::{BufferPool, set_factory_pool};
 use crate::config::{
-    BATCH_QUEUE_CAPACITY, GPU_BUFFER_POOL_BYTES, GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE,
-    MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
+    BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES,
+    GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE, MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
 };
 use crate::gpu::batch_queue::BatchQueue;
 use crate::gpu::completion::CompletionConsumer;
@@ -37,6 +37,10 @@ pub struct ServeArgs {
     /// Runtime cap on ring slots per GPU submission.
     #[arg(long, default_value_t = MAX_SESSION_BATCH_SIZE)]
     pub max_batch_slots: usize,
+
+    /// Coalescing window for a partial batch once a session is available, in microseconds.
+    #[arg(long, default_value_t = DEFAULT_BATCH_COALESCE_US)]
+    pub batch_coalesce_us: u64,
 
     /// Metrics reporting interval in seconds.
     #[arg(long, default_value_t = 10)]
@@ -65,6 +69,7 @@ pub fn run(args: ServeArgs) {
     metrics::spawn_reporter(args.metrics_interval_secs);
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
+    let batch_coalesce = std::time::Duration::from_micros(args.batch_coalesce_us);
 
     if max_batch_slots == 0 || max_batch_slots > MAX_SESSION_BATCH_SIZE {
         eprintln!(
@@ -79,6 +84,7 @@ pub fn run(args: ServeArgs) {
         "disrust: max_batch_slots={} (compile-time max={})",
         max_batch_slots, MAX_SESSION_BATCH_SIZE
     );
+    eprintln!("disrust: batch_coalesce_us={}", args.batch_coalesce_us);
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust preflight failed: {e}");
         std::process::exit(1);
@@ -144,6 +150,7 @@ pub fn run(args: ServeArgs) {
         sessions,
         Arc::clone(&batch_queue),
         max_batch_slots,
+        batch_coalesce,
     );
     let sub_handle = thread::Builder::new()
         .name("gpu-submission".into())

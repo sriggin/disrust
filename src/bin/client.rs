@@ -670,14 +670,7 @@ fn handle_read_cqe(
     );
 
     conn.read_len += result as usize;
-    process_read_buffer(
-        conn,
-        scenario,
-        stats,
-        run,
-        now,
-        interval_latency_recorder,
-    );
+    process_read_buffer(conn, scenario, stats, run, now, interval_latency_recorder);
 }
 
 fn run_scenario(addr: &str, scenario: Scenario) {
@@ -690,11 +683,15 @@ fn run_scenario(addr: &str, scenario: Scenario) {
     let mut cqe_buf: Vec<(u64, i32)> = Vec::with_capacity(sq_entries as usize);
     let mut stats = SummaryStats::default();
     let mut run = RunState::new(&scenario.stop_mode);
-    let latency_interval_timer = scenario.collect_latency.then(|| Arc::new(TimerMetric::new()));
+    let latency_interval_timer = scenario
+        .collect_latency
+        .then(|| Arc::new(TimerMetric::new()));
     let reporter = latency_interval_timer
         .as_ref()
         .map(|interval| Reporter::spawn(Arc::clone(interval)));
-    let mut latency_interval_recorder = latency_interval_timer.as_ref().map(|timer| timer.recorder());
+    let mut latency_interval_recorder = latency_interval_timer
+        .as_ref()
+        .map(|timer| timer.recorder());
 
     for _ in 0..scenario.connections {
         let fd = create_connection(addr).expect("failed to connect");

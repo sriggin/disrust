@@ -16,7 +16,7 @@ use ort::{
 };
 
 use crate::buffer_pool::PoolSlice;
-use crate::config::MAX_BATCH_VECTORS;
+use crate::config::{MAX_BATCH_VECTORS, ORT_INTRA_THREADS};
 use crate::constants::FEATURE_DIM as FDIM;
 use crate::gpu::pinned::{alloc_pinned, free_pinned};
 
@@ -222,7 +222,7 @@ impl GpuSession {
                 eprintln!("Session::builder failed: {e}");
                 std::process::abort()
             })
-            .with_intra_threads(2)
+            .with_intra_threads(ORT_INTRA_THREADS)
             .unwrap_or_else(|e| {
                 eprintln!("with_intra_threads failed: {e}");
                 std::process::abort()
@@ -310,6 +310,10 @@ impl GpuSession {
         self.available
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
     }
 
     pub fn output_name(&self) -> &str {

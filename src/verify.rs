@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use clap::Args;
 use ort::{init_from, session::Session};
 
+use crate::config::ORT_INTRA_THREADS;
 use crate::constants::FEATURE_DIM as FDIM;
 use crate::gpu::pinned::{alloc_pinned, free_pinned};
 use crate::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
@@ -90,10 +91,12 @@ fn run_cpu_verify(model_bytes: &[u8], args: &VerifyArgs) {
         eprintln!("Session::builder failed: {e}");
         std::process::exit(1)
     });
-    let mut builder = builder.with_intra_threads(2).unwrap_or_else(|e| {
-        eprintln!("with_intra_threads failed: {e}");
-        std::process::exit(1)
-    });
+    let mut builder = builder
+        .with_intra_threads(ORT_INTRA_THREADS)
+        .unwrap_or_else(|e| {
+            eprintln!("with_intra_threads failed: {e}");
+            std::process::exit(1)
+        });
     let mut session = builder.commit_from_memory(model_bytes).unwrap_or_else(|e| {
         eprintln!("commit_from_memory failed: {e}");
         std::process::exit(1)

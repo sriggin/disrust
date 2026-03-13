@@ -29,8 +29,17 @@ pub const BUFFER_POOL_CAPACITY: usize =
 /// Number of ORT sessions in the session pool (N=1 = one batch in-flight at a time).
 pub const SESSION_POOL_SIZE: usize = 1;
 
+/// ORT intra-op thread count per session. Must be >= 2 for RunAsync: ORT requires at
+/// least one pool thread to dispatch async work (1 = caller only, no pool = RunAsync
+/// aborts). For the CUDA EP the pool thread is otherwise idle since ops run on the GPU;
+/// it is the minimum tax for using the async API.
+pub const ORT_INTRA_THREADS: usize = 2;
+
 /// Maximum disruptor ring slots accumulated into a single GPU batch.
 pub const MAX_SESSION_BATCH_SIZE: usize = 256;
+
+/// Default coalescing window, in microseconds, for a partial batch once a session is available.
+pub const DEFAULT_BATCH_COALESCE_US: u64 = 500;
 
 /// Request ring capacity for the ONNX pipeline.
 ///

@@ -5,6 +5,7 @@
 use disruptor::{Producer, RingBufferFull, SingleConsumerBarrier, SingleProducer};
 
 use crate::buffer_pool::{AllocError, PoolAllocator};
+use crate::clock::monotonic_now_ns;
 use crate::constants::FEATURE_DIM;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
@@ -79,6 +80,7 @@ pub fn process_requests_from_buffer(
                     slot.fd = fd;
                     slot.request_seq = seq;
                     slot.num_vectors = num_vectors;
+                    slot.published_at_ns = monotonic_now_ns();
                     slot.features = pool_slice.freeze();
                 }) {
                     Ok(_) => {}

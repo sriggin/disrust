@@ -3,11 +3,12 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
 
 use crate::buffer_pool::PoolSlice;
+use crate::clock::elapsed_since_ns;
 use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
 use crate::metrics;
@@ -18,6 +19,13 @@ use super::session::GpuSession;
 struct PendingSlot {
     features: PoolSlice,
     num_vectors: usize,
+    published_at_ns: u64,
+}
+
+enum BatchStopReason {
+    Cap,
+    BacklogEmpty,
+    NonContiguous,
 }
 
 pub struct SubmissionConsumer {
@@ -28,6 +36,8 @@ pub struct SubmissionConsumer {
     batch_queue: Arc<BatchQueue>,
     backlog: VecDeque<PendingSlot>,
     max_batch_slots: usize,
+    batch_coalesce_timeout: Duration,
+    backlog_started_at: Option<Instant>,
 }
 
 // SAFETY: SubmissionConsumer runs on a single dedicated thread.
@@ -39,6 +49,7 @@ impl SubmissionConsumer {
         sessions: Vec<GpuSession>,
         batch_queue: Arc<BatchQueue>,
         max_batch_slots: usize,
+        batch_coalesce_timeout: Duration,
     ) -> Self {
         assert!(max_batch_slots > 0, "max_batch_slots must be > 0");
         assert!(
@@ -52,11 +63,14 @@ impl SubmissionConsumer {
             batch_queue,
             backlog: VecDeque::new(),
             max_batch_slots,
+            batch_coalesce_timeout,
+            backlog_started_at: None,
         }
     }
 
     pub fn run(mut self) {
         loop {
+            let backlog_was_empty = self.backlog.is_empty();
             match drain_visible_events(&mut self.poller, &mut self.backlog, self.max_batch_slots) {
                 Ok(()) => {}
                 Err(Polling::Shutdown) => return,
@@ -64,12 +78,37 @@ impl SubmissionConsumer {
                     unreachable!("drain_visible_events does not return NoEvents")
                 }
             }
+            if backlog_was_empty && !self.backlog.is_empty() {
+                self.backlog_started_at = Some(Instant::now());
+            }
             if self.backlog.is_empty() {
+                self.backlog_started_at = None;
                 std::hint::spin_loop();
                 continue;
             }
 
-            let idx = reserve_session(&self.sessions, &mut self.session_cursor);
+            if self.backlog.len() < self.max_batch_slots
+                && (!session_available(&self.sessions)
+                    || self
+                        .backlog_started_at
+                        .is_some_and(|started| started.elapsed() < self.batch_coalesce_timeout))
+            {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let idx = if self.backlog.len() >= self.max_batch_slots {
+                reserve_session(&self.sessions, &mut self.session_cursor)
+            } else if let Some(idx) = try_reserve_session(&self.sessions, &mut self.session_cursor)
+            {
+                idx
+            } else {
+                std::hint::spin_loop();
+                continue;
+            };
+            if let Some(started) = self.backlog_started_at {
+                metrics::record_backlog_age(started.elapsed());
+            }
             let batch_entry = build_batch_entry(
                 &mut self.sessions[idx],
                 &mut self.backlog,
@@ -77,6 +116,9 @@ impl SubmissionConsumer {
             );
             metrics::inc_batches_submitted();
             metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
+            if self.backlog.is_empty() {
+                self.backlog_started_at = None;
+            }
             self.batch_queue.push(batch_entry);
         }
     }
@@ -87,13 +129,15 @@ fn drain_visible_events(
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
 ) -> Result<(), Polling> {
-    loop {
-        match poller.poll_take(max_batch_slots as u64) {
+    while backlog.len() < max_batch_slots {
+        let remaining = (max_batch_slots - backlog.len()) as u64;
+        match poller.poll_take(remaining) {
             Ok(mut guard) => drain_guard(&mut guard, backlog),
             Err(Polling::NoEvents) => return Ok(()),
             Err(Polling::Shutdown) => return Err(Polling::Shutdown),
         }
     }
+    Ok(())
 }
 
 fn drain_guard(
@@ -104,6 +148,7 @@ fn drain_guard(
         backlog.push_back(PendingSlot {
             features: take_event_features(event),
             num_vectors: event.num_vectors as usize,
+            published_at_ns: event.published_at_ns,
         });
     }
 }
@@ -134,19 +179,41 @@ fn build_batch_entry(
     let mut slot_count = 0usize;
     let mut num_vectors = 0usize;
     let mut input_slices = Vec::new();
+    let backlog_slots_at_build = backlog.len() as u64;
+    let mut stop_reason = None;
 
     while let Some(next) = backlog.front() {
         let contiguous = input_slices
             .last()
             .is_none_or(|prev: &PoolSlice| prev.is_contiguous(&next.features));
-        if !contiguous || slot_count >= max_batch_slots {
+        if !contiguous {
+            stop_reason = Some(BatchStopReason::NonContiguous);
+            break;
+        }
+        if slot_count >= max_batch_slots {
+            stop_reason = Some(BatchStopReason::Cap);
             break;
         }
 
         let next = backlog.pop_front().expect("front just checked");
+        metrics::record_publish_to_submit(elapsed_since_ns(next.published_at_ns));
         num_vectors += next.num_vectors;
         slot_count += 1;
         input_slices.push(next.features);
+    }
+
+    let stop_reason = if backlog.front().is_none() {
+        BatchStopReason::BacklogEmpty
+    } else {
+        stop_reason.expect("non-empty backlog must have a stop reason")
+    };
+
+    metrics::add_backlog_slots_at_build(backlog_slots_at_build);
+    metrics::add_slots_submitted(slot_count as u64);
+    match stop_reason {
+        BatchStopReason::Cap => metrics::inc_batch_stop_cap(),
+        BatchStopReason::BacklogEmpty => metrics::inc_batch_stop_backlog_empty(),
+        BatchStopReason::NonContiguous => metrics::inc_batch_stop_non_contig(),
     }
 
     let mut batch = session.submit_batch(host_ptr, num_vectors);
@@ -161,14 +228,25 @@ fn build_batch_entry(
 
 fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize {
     loop {
-        for _ in 0..sessions.len() {
-            let idx = *session_cursor;
-            *session_cursor = (idx + 1) % sessions.len();
-            if sessions[idx].try_acquire() {
-                return idx;
-            }
+        if let Some(idx) = try_reserve_session(sessions, session_cursor) {
+            return idx;
         }
         metrics::inc_session_wait_loops();
         std::hint::spin_loop();
     }
+}
+
+fn try_reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> Option<usize> {
+    for _ in 0..sessions.len() {
+        let idx = *session_cursor;
+        *session_cursor = (idx + 1) % sessions.len();
+        if sessions[idx].try_acquire() {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn session_available(sessions: &[GpuSession]) -> bool {
+    sessions.iter().any(GpuSession::is_available)
 }
