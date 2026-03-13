@@ -5,9 +5,12 @@ use ort::{init_from, session::Session};
 
 use crate::config::ORT_INTRA_THREADS;
 use crate::constants::FEATURE_DIM as FDIM;
-use crate::gpu::pinned::{alloc_pinned, free_pinned};
-use crate::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
-use crate::gpu::session::GpuSession;
+use crate::pipeline::verify_ort_dylib_present;
+
+#[cfg(feature = "cuda")]
+use crate::cuda::memory::{alloc_pinned, free_pinned};
+#[cfg(feature = "cuda")]
+use crate::pipeline::session::InferenceSession;
 
 #[derive(Args, Clone)]
 pub struct VerifyArgs {
@@ -48,6 +51,14 @@ pub fn run(args: VerifyArgs) {
     eprintln!("disrust verify: args parsed");
     let use_cuda = if args.cpu { false } else { args.cuda };
 
+    #[cfg(not(feature = "cuda"))]
+    let use_cuda = {
+        if use_cuda {
+            eprintln!("disrust verify: cuda feature not compiled in, falling back to cpu");
+        }
+        false
+    };
+
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust verify preflight failed: {e}");
         std::process::exit(1);
@@ -62,8 +73,9 @@ pub fn run(args: VerifyArgs) {
         .commit();
     eprintln!("disrust verify: ONNX Runtime initialized (fresh={committed})");
 
+    #[cfg(feature = "cuda")]
     if use_cuda {
-        verify_cuda_startup().unwrap_or_else(|e| {
+        crate::cuda::preflight::verify_cuda_startup().unwrap_or_else(|e| {
             eprintln!("disrust verify preflight failed: {e}");
             std::process::exit(1);
         });
@@ -71,6 +83,9 @@ pub fn run(args: VerifyArgs) {
     } else {
         eprintln!("disrust verify: CPU mode selected");
     }
+
+    #[cfg(not(feature = "cuda"))]
+    eprintln!("disrust verify: CPU mode selected");
 
     let model_bytes = std::fs::read(&args.model).unwrap_or_else(|e| {
         eprintln!("Failed to read model '{}': {e}", args.model);
@@ -83,6 +98,7 @@ pub fn run(args: VerifyArgs) {
         return;
     }
 
+    #[cfg(feature = "cuda")]
     run_cuda_verify(&model_bytes, &args);
 }
 
@@ -145,10 +161,11 @@ fn run_cpu_verify(model_bytes: &[u8], args: &VerifyArgs) {
     validate_generated_model_if_requested(values, args.validate_generated_model);
 }
 
+#[cfg(feature = "cuda")]
 fn run_cuda_verify(model_bytes: &[u8], args: &VerifyArgs) {
     let input_elems = args.batch * FDIM;
-    let mut gpu_session = GpuSession::with_output_capacity(model_bytes, args.batch);
-    let output_name = gpu_session.output_name().to_string();
+    let mut session = InferenceSession::with_output_capacity(model_bytes, args.batch);
+    let output_name = session.output_name().to_string();
 
     let input_ptr = alloc_pinned(input_elems * std::mem::size_of::<f32>()).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -167,12 +184,12 @@ fn run_cuda_verify(model_bytes: &[u8], args: &VerifyArgs) {
         }
     }
 
-    if !gpu_session.try_acquire() {
-        eprintln!("fresh GpuSession was unexpectedly unavailable");
+    if !session.try_acquire() {
+        eprintln!("fresh InferenceSession was unexpectedly unavailable");
         std::process::exit(1);
     }
 
-    let batch = gpu_session.submit_batch(input_ptr, args.batch);
+    let batch = session.submit_batch(input_ptr, args.batch);
     batch.completion.wait();
 
     let output = unsafe { std::slice::from_raw_parts(batch.output_ptr, batch.output_len) };

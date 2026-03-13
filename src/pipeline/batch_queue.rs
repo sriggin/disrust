@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::gpu::session::InFlightBatch;
+use crate::pipeline::session::InFlightBatch;
 
 /// One entry in the batch queue.
 pub struct BatchEntry {
@@ -16,7 +16,7 @@ pub struct BatchEntry {
     pub slot_count: usize,
     /// Wall-clock timestamp when submission handed this batch to completion.
     pub submitted_at: Instant,
-    /// In-flight GPU batch state. Submission enqueues this immediately after
+    /// In-flight batch state. Submission enqueues this immediately after
     /// `RunAsync` returns; completion waits for the callback to mark it ready.
     pub batch: InFlightBatch,
 }

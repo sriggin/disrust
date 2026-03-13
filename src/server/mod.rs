@@ -12,12 +12,12 @@ use crate::config::{
     BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES,
     GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE, MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
 };
-use crate::gpu::batch_queue::BatchQueue;
-use crate::gpu::completion::CompletionConsumer;
-use crate::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
-use crate::gpu::session::GpuSession;
-use crate::gpu::submission::SubmissionConsumer;
 use crate::metrics;
+use crate::pipeline::batch_queue::BatchQueue;
+use crate::pipeline::completion::CompletionConsumer;
+use crate::pipeline::session::InferenceSession;
+use crate::pipeline::submission::SubmissionConsumer;
+use crate::pipeline::verify_ort_dylib_present;
 use crate::ring_types::InferenceEvent;
 
 mod ingress;
@@ -98,11 +98,15 @@ pub fn run(args: ServeArgs) {
         })
         .commit();
     eprintln!("disrust: ONNX Runtime initialized (fresh={committed})");
-    verify_cuda_startup().unwrap_or_else(|e| {
-        eprintln!("disrust preflight failed: {e}");
-        std::process::exit(1);
-    });
-    eprintln!("disrust: CUDA driver preflight ok");
+
+    #[cfg(feature = "cuda")]
+    {
+        crate::cuda::preflight::verify_cuda_startup().unwrap_or_else(|e| {
+            eprintln!("disrust preflight failed: {e}");
+            std::process::exit(1);
+        });
+        eprintln!("disrust: CUDA driver preflight ok");
+    }
 
     set_factory_pool(BufferPool::new_boxed(1));
 
@@ -111,13 +115,14 @@ pub fn run(args: ServeArgs) {
         std::process::exit(1);
     });
 
-    let sessions: Vec<GpuSession> = (0..SESSION_POOL_SIZE)
+    let sessions: Vec<InferenceSession> = (0..SESSION_POOL_SIZE)
         .map(|i| {
             eprintln!("disrust: loading session {}/{}", i + 1, SESSION_POOL_SIZE);
-            GpuSession::new(&model_bytes)
+            InferenceSession::new(&model_bytes)
         })
         .collect();
 
+    #[cfg(feature = "cuda")]
     let host_ptr = unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
@@ -129,12 +134,15 @@ pub fn run(args: ServeArgs) {
         ptr as *mut f32
     };
 
+    #[cfg(not(feature = "cuda"))]
+    let host_ptr = Box::leak(vec![0f32; GPU_BUFFER_POOL_CAPACITY].into_boxed_slice()).as_mut_ptr();
+
     let pool: &'static BufferPool =
         Box::leak(unsafe { BufferPool::from_raw_ptr(host_ptr, GPU_BUFFER_POOL_CAPACITY) });
     let allocator = pool.allocator();
 
     eprintln!(
-        "disrust: pinned pool {} MB",
+        "disrust: buffer pool {} MB",
         GPU_BUFFER_POOL_BYTES / 1_000_000,
     );
 
@@ -153,7 +161,7 @@ pub fn run(args: ServeArgs) {
         batch_coalesce,
     );
     let sub_handle = thread::Builder::new()
-        .name("gpu-submission".into())
+        .name("submission".into())
         .spawn(move || sub_consumer.run())
         .expect("failed to spawn SubmissionConsumer");
 
@@ -161,7 +169,7 @@ pub fn run(args: ServeArgs) {
         CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue), max_batch_slots)
             .expect("failed to create CompletionConsumer io_uring");
     let comp_handle = thread::Builder::new()
-        .name("gpu-completion".into())
+        .name("completion".into())
         .spawn(move || comp_consumer.run())
         .expect("failed to spawn CompletionConsumer");
 
@@ -171,7 +179,7 @@ pub fn run(args: ServeArgs) {
     eprintln!("disrust: ready");
 
     let io_handle = thread::Builder::new()
-        .name("io-gpu-0".into())
+        .name("io-0".into())
         .spawn(move || ingress.run())
         .expect("failed to spawn IO thread");
 

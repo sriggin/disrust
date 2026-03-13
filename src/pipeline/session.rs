@@ -9,16 +9,20 @@ use std::sync::{
 
 use ort::{
     AsPointer, api,
-    execution_providers::CUDAExecutionProvider,
     memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::Session,
     sys,
 };
 
+#[cfg(feature = "cuda")]
+use ort::execution_providers::CUDAExecutionProvider;
+
 use crate::buffer_pool::PoolSlice;
 use crate::config::{MAX_BATCH_VECTORS, ORT_INTRA_THREADS};
 use crate::constants::FEATURE_DIM as FDIM;
-use crate::gpu::pinned::{alloc_pinned, free_pinned};
+
+#[cfg(feature = "cuda")]
+use crate::cuda::memory::{alloc_pinned, free_pinned};
 
 const BATCH_PENDING: u8 = 0;
 const BATCH_READY: u8 = 1;
@@ -154,7 +158,7 @@ struct BatchResources {
 
 unsafe impl Send for BatchResources {}
 
-/// One in-flight GPU batch. Submission owns this until it reaches the batch queue;
+/// One in-flight batch. Submission owns this until it reaches the batch queue;
 /// completion owns it until the response bytes are encoded and the session buffer
 /// can be reused.
 pub struct InFlightBatch {
@@ -186,7 +190,7 @@ unsafe extern "system" fn run_async_callback(
 }
 
 /// Per-session state used by the submission thread.
-pub struct GpuSession {
+pub struct InferenceSession {
     session: Session,
     input_memory_info: MemoryInfo,
     output_memory_info: MemoryInfo,
@@ -205,10 +209,10 @@ pub struct GpuSession {
     available: Arc<AtomicBool>,
 }
 
-// SAFETY: GpuSession is moved to its owning thread and never shared concurrently.
-unsafe impl Send for GpuSession {}
+// SAFETY: InferenceSession is moved to its owning thread and never shared concurrently.
+unsafe impl Send for InferenceSession {}
 
-impl GpuSession {
+impl InferenceSession {
     /// Construct a session for the given ONNX model bytes.
     pub fn new(model_bytes: &[u8]) -> Self {
         Self::with_output_capacity(model_bytes, MAX_BATCH_VECTORS)
@@ -217,7 +221,7 @@ impl GpuSession {
     /// Construct a session with a caller-chosen maximum output vector capacity.
     pub fn with_output_capacity(model_bytes: &[u8], output_capacity: usize) -> Self {
         assert!(output_capacity > 0, "output_capacity must be > 0");
-        let session = Session::builder()
+        let builder = Session::builder()
             .unwrap_or_else(|e| {
                 eprintln!("Session::builder failed: {e}");
                 std::process::abort()
@@ -226,21 +230,24 @@ impl GpuSession {
             .unwrap_or_else(|e| {
                 eprintln!("with_intra_threads failed: {e}");
                 std::process::abort()
-            })
+            });
+
+        #[cfg(feature = "cuda")]
+        let mut builder = builder
             .with_execution_providers([CUDAExecutionProvider::default().build()])
             .unwrap_or_else(|e| {
                 eprintln!("with_execution_providers failed: {e}");
                 std::process::abort()
-            })
-            .commit_from_memory(model_bytes)
-            .unwrap_or_else(|e| {
-                eprintln!("commit_from_memory failed: {e}");
-                std::process::abort()
             });
+
+        let session = builder.commit_from_memory(model_bytes).unwrap_or_else(|e| {
+            eprintln!("commit_from_memory failed: {e}");
+            std::process::abort()
+        });
 
         if session.inputs().len() != 1 || session.outputs().len() != 1 {
             eprintln!(
-                "GPU path currently expects exactly 1 input and 1 output, got {} inputs / {} outputs",
+                "disrust: session expects exactly 1 input and 1 output, got {} inputs / {} outputs",
                 session.inputs().len(),
                 session.outputs().len()
             );
@@ -256,6 +263,7 @@ impl GpuSession {
             std::process::abort()
         });
 
+        #[cfg(feature = "cuda")]
         let input_memory_info = MemoryInfo::new(
             AllocationDevice::CUDA_PINNED,
             0,
@@ -266,6 +274,20 @@ impl GpuSession {
             eprintln!("input MemoryInfo::new failed: {e}");
             std::process::abort()
         });
+
+        #[cfg(not(feature = "cuda"))]
+        let input_memory_info = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Arena,
+            MemoryType::Default,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("input MemoryInfo::new failed: {e}");
+            std::process::abort()
+        });
+
+        #[cfg(feature = "cuda")]
         let output_memory_info = MemoryInfo::new(
             AllocationDevice::CUDA_PINNED,
             0,
@@ -277,6 +299,19 @@ impl GpuSession {
             std::process::abort()
         });
 
+        #[cfg(not(feature = "cuda"))]
+        let output_memory_info = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Arena,
+            MemoryType::Default,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("output MemoryInfo::new failed: {e}");
+            std::process::abort()
+        });
+
+        #[cfg(feature = "cuda")]
         let output_ptr = unsafe {
             let ptr =
                 alloc_pinned(output_capacity * std::mem::size_of::<f32>()).unwrap_or_else(|e| {
@@ -286,6 +321,9 @@ impl GpuSession {
             std::ptr::write_bytes(ptr, 0, output_capacity * std::mem::size_of::<f32>());
             ptr as *mut f32
         };
+
+        #[cfg(not(feature = "cuda"))]
+        let output_ptr = Box::leak(vec![0f32; output_capacity].into_boxed_slice()).as_mut_ptr();
 
         let input_name_ptrs = [input_name.as_ptr() as *const c_char];
         let output_name_ptrs = [output_name.as_ptr() as *const c_char];
@@ -393,10 +431,19 @@ impl GpuSession {
     }
 }
 
-impl Drop for GpuSession {
+impl Drop for InferenceSession {
     fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
         if let Err(e) = unsafe { free_pinned(self.output_ptr.cast::<c_void>()) } {
-            eprintln!("GpuSession drop failed to free pinned output buffer: {e}");
+            eprintln!("InferenceSession drop failed to free pinned output buffer: {e}");
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        unsafe {
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(
+                self.output_ptr,
+                self.output_capacity,
+            )));
         }
     }
 }

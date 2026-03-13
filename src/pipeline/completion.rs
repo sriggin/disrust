@@ -1,4 +1,4 @@
-//! CompletionConsumer: waits for async GPU batch completion, encodes responses, writes directly
+//! CompletionConsumer: waits for async batch completion, encodes responses, writes directly
 //! to client fds via its own io_uring ring.
 
 use std::io;
@@ -10,9 +10,9 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 
 use crate::clock::elapsed_since_ns;
 use crate::config::{MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, WRITE_BUF_SIZE, WRITE_BUF_SLOTS};
-use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
-use crate::gpu::session::BatchPoll;
 use crate::metrics;
+use crate::pipeline::batch_queue::{BatchEntry, BatchQueue};
+use crate::pipeline::session::BatchPoll;
 use crate::ring_types::InferenceEvent;
 
 struct IoUring {

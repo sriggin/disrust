@@ -1,4 +1,4 @@
-//! SubmissionConsumer: drains request-ring events into a local backlog, forms GPU batches,
+//! SubmissionConsumer: drains request-ring events into a local backlog, forms batches,
 //! submits to ORT, and pushes BatchEntry values to the batch queue.
 
 use std::collections::VecDeque;
@@ -10,11 +10,11 @@ use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
 use crate::buffer_pool::PoolSlice;
 use crate::clock::elapsed_since_ns;
 use crate::config::MAX_SESSION_BATCH_SIZE;
-use crate::gpu::batch_queue::{BatchEntry, BatchQueue};
 use crate::metrics;
+use crate::pipeline::batch_queue::{BatchEntry, BatchQueue};
 use crate::ring_types::InferenceEvent;
 
-use super::session::GpuSession;
+use super::session::InferenceSession;
 
 struct PendingSlot {
     features: PoolSlice,
@@ -30,7 +30,7 @@ enum BatchStopReason {
 
 pub struct SubmissionConsumer {
     poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
-    sessions: Vec<GpuSession>,
+    sessions: Vec<InferenceSession>,
     /// Round-robin session index.
     session_cursor: usize,
     batch_queue: Arc<BatchQueue>,
@@ -46,7 +46,7 @@ unsafe impl Send for SubmissionConsumer {}
 impl SubmissionConsumer {
     pub fn new(
         poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
-        sessions: Vec<GpuSession>,
+        sessions: Vec<InferenceSession>,
         batch_queue: Arc<BatchQueue>,
         max_batch_slots: usize,
         batch_coalesce_timeout: Duration,
@@ -167,7 +167,7 @@ fn take_event_features(event: &InferenceEvent) -> PoolSlice {
 }
 
 fn build_batch_entry(
-    session: &mut GpuSession,
+    session: &mut InferenceSession,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
 ) -> BatchEntry {
@@ -226,7 +226,7 @@ fn build_batch_entry(
     }
 }
 
-fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize {
+fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> usize {
     loop {
         if let Some(idx) = try_reserve_session(sessions, session_cursor) {
             return idx;
@@ -236,7 +236,7 @@ fn reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> usize
     }
 }
 
-fn try_reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> Option<usize> {
+fn try_reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> Option<usize> {
     for _ in 0..sessions.len() {
         let idx = *session_cursor;
         *session_cursor = (idx + 1) % sessions.len();
@@ -247,6 +247,6 @@ fn try_reserve_session(sessions: &[GpuSession], session_cursor: &mut usize) -> O
     None
 }
 
-fn session_available(sessions: &[GpuSession]) -> bool {
-    sessions.iter().any(GpuSession::is_available)
+fn session_available(sessions: &[InferenceSession]) -> bool {
+    sessions.iter().any(InferenceSession::is_available)
 }
