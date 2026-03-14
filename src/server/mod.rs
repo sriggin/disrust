@@ -7,17 +7,21 @@ use disruptor::{BusySpin, build_single_producer};
 use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::affinity;
 use crate::buffer_pool::{BufferPool, set_factory_pool};
 use crate::config::{
-    BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES,
-    GPU_BUFFER_POOL_CAPACITY, GPU_DISRUPTOR_SIZE, MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
+    BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES, GPU_DISRUPTOR_SIZE,
+    MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
 };
 use crate::metrics;
 use crate::pipeline::batch_queue::BatchQueue;
 use crate::pipeline::completion::CompletionConsumer;
+use crate::pipeline::connection_registry::ConnectionRegistry;
+use crate::pipeline::ready_queue::ReadyQueue;
 use crate::pipeline::session::InferenceSession;
 use crate::pipeline::submission::SubmissionConsumer;
-use crate::pipeline::verify_ort_dylib_present;
+use crate::pipeline::writer::WriterConsumer;
+use crate::pipeline::{make_pool, verify_ort_dylib_present};
 use crate::ring_types::InferenceEvent;
 
 mod ingress;
@@ -45,6 +49,26 @@ pub struct ServeArgs {
     /// Metrics reporting interval in seconds.
     #[arg(long, default_value_t = 10)]
     pub metrics_interval_secs: u64,
+
+    /// Pin the metrics reporter thread to a specific CPU id.
+    #[arg(long)]
+    pub metrics_cpu: Option<usize>,
+
+    /// Pin the submission thread to a specific CPU id.
+    #[arg(long)]
+    pub submission_cpu: Option<usize>,
+
+    /// Pin the completion thread to a specific CPU id.
+    #[arg(long)]
+    pub completion_cpu: Option<usize>,
+
+    /// Pin the ingress io thread to a specific CPU id.
+    #[arg(long)]
+    pub io_cpu: Option<usize>,
+
+    /// Pin the writer thread to a specific CPU id.
+    #[arg(long)]
+    pub writer_cpu: Option<usize>,
 }
 
 fn create_listener(port: u16) -> Socket {
@@ -66,7 +90,7 @@ pub fn run(args: ServeArgs) {
         std::process::exit(1);
     }
 
-    metrics::spawn_reporter(args.metrics_interval_secs);
+    metrics::spawn_reporter(args.metrics_interval_secs, args.metrics_cpu);
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
     let batch_coalesce = std::time::Duration::from_micros(args.batch_coalesce_us);
@@ -85,6 +109,21 @@ pub fn run(args: ServeArgs) {
         max_batch_slots, MAX_SESSION_BATCH_SIZE
     );
     eprintln!("disrust: batch_coalesce_us={}", args.batch_coalesce_us);
+    if let Some(cpu) = args.metrics_cpu {
+        eprintln!("disrust: metrics_cpu={cpu}");
+    }
+    if let Some(cpu) = args.submission_cpu {
+        eprintln!("disrust: submission_cpu={cpu}");
+    }
+    if let Some(cpu) = args.completion_cpu {
+        eprintln!("disrust: completion_cpu={cpu}");
+    }
+    if let Some(cpu) = args.io_cpu {
+        eprintln!("disrust: io_cpu={cpu}");
+    }
+    if let Some(cpu) = args.writer_cpu {
+        eprintln!("disrust: writer_cpu={cpu}");
+    }
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust preflight failed: {e}");
         std::process::exit(1);
@@ -122,23 +161,7 @@ pub fn run(args: ServeArgs) {
         })
         .collect();
 
-    #[cfg(feature = "cuda")]
-    let host_ptr = unsafe {
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, GPU_BUFFER_POOL_BYTES);
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            eprintln!("cuMemAllocHost failed: {:?}", status);
-            std::process::exit(1);
-        }
-        std::ptr::write_bytes(ptr as *mut u8, 0u8, GPU_BUFFER_POOL_BYTES);
-        ptr as *mut f32
-    };
-
-    #[cfg(not(feature = "cuda"))]
-    let host_ptr = Box::leak(vec![0f32; GPU_BUFFER_POOL_CAPACITY].into_boxed_slice()).as_mut_ptr();
-
-    let pool: &'static BufferPool =
-        Box::leak(unsafe { BufferPool::from_raw_ptr(host_ptr, GPU_BUFFER_POOL_CAPACITY) });
+    let pool = make_pool();
     let allocator = pool.allocator();
 
     eprintln!(
@@ -152,6 +175,8 @@ pub fn run(args: ServeArgs) {
     let producer = builder.build();
 
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
+    let ready_queue = Arc::new(ReadyQueue::new(crate::config::SLAB_CAPACITY * 2));
+    let registry = Arc::new(ConnectionRegistry::default());
 
     let sub_consumer = SubmissionConsumer::new(
         submission_poller,
@@ -160,30 +185,72 @@ pub fn run(args: ServeArgs) {
         max_batch_slots,
         batch_coalesce,
     );
+    let submission_cpu = args.submission_cpu;
     let sub_handle = thread::Builder::new()
         .name("submission".into())
-        .spawn(move || sub_consumer.run())
+        .spawn(move || {
+            if let Some(cpu) = submission_cpu {
+                affinity::pin_current_thread(cpu, "submission").unwrap_or_else(|e| panic!("{e}"));
+            }
+            sub_consumer.run()
+        })
         .expect("failed to spawn SubmissionConsumer");
 
-    let comp_consumer =
-        CompletionConsumer::new(completion_poller, Arc::clone(&batch_queue), max_batch_slots)
-            .expect("failed to create CompletionConsumer io_uring");
+    let comp_consumer = CompletionConsumer::new(
+        completion_poller,
+        Arc::clone(&batch_queue),
+        Arc::clone(&ready_queue),
+        Arc::clone(&registry),
+        max_batch_slots,
+    );
+    let completion_cpu = args.completion_cpu;
     let comp_handle = thread::Builder::new()
         .name("completion".into())
-        .spawn(move || comp_consumer.run())
+        .spawn(move || {
+            if let Some(cpu) = completion_cpu {
+                affinity::pin_current_thread(cpu, "completion").unwrap_or_else(|e| panic!("{e}"));
+            }
+            comp_consumer.run()
+        })
         .expect("failed to spawn CompletionConsumer");
 
+    let writer_consumer = WriterConsumer::new(Arc::clone(&ready_queue), Arc::clone(&registry))
+        .expect("failed to create WriterConsumer io_uring");
+    let writer_cpu = args.writer_cpu;
+    let writer_handle = thread::Builder::new()
+        .name("writer".into())
+        .spawn(move || {
+            if let Some(cpu) = writer_cpu {
+                affinity::pin_current_thread(cpu, "writer").unwrap_or_else(|e| panic!("{e}"));
+            }
+            writer_consumer.run()
+        })
+        .expect("failed to spawn WriterConsumer");
+
     let listen_socket = create_listener(port);
-    let ingress = IngressThread::new(0, listen_socket.into_raw_fd(), producer, allocator);
+    let ingress = IngressThread::new(
+        0,
+        listen_socket.into_raw_fd(),
+        producer,
+        allocator,
+        Arc::clone(&registry),
+    );
 
     eprintln!("disrust: ready");
 
+    let io_cpu = args.io_cpu;
     let io_handle = thread::Builder::new()
         .name("io-0".into())
-        .spawn(move || ingress.run())
+        .spawn(move || {
+            if let Some(cpu) = io_cpu {
+                affinity::pin_current_thread(cpu, "io-0").unwrap_or_else(|e| panic!("{e}"));
+            }
+            ingress.run()
+        })
         .expect("failed to spawn IO thread");
 
     let _ = io_handle.join();
     let _ = sub_handle.join();
     let _ = comp_handle.join();
+    let _ = writer_handle.join();
 }

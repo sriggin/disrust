@@ -1,3 +1,4 @@
+#[cfg(feature = "cuda")]
 use std::sync::atomic::Ordering;
 
 use clap::Args;
@@ -95,11 +96,10 @@ pub fn run(args: VerifyArgs) {
 
     if !use_cuda {
         run_cpu_verify(&model_bytes, &args);
-        return;
+    } else {
+        #[cfg(feature = "cuda")]
+        run_cuda_verify(&model_bytes, &args);
     }
-
-    #[cfg(feature = "cuda")]
-    run_cuda_verify(&model_bytes, &args);
 }
 
 fn run_cpu_verify(model_bytes: &[u8], args: &VerifyArgs) {

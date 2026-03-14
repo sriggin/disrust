@@ -1,12 +1,9 @@
 #[cfg(feature = "cuda")]
-mod common;
-
-#[cfg(feature = "cuda")]
 use std::hint::black_box;
 #[cfg(feature = "cuda")]
-use std::time::{Duration, Instant};
+use std::ptr::NonNull;
 #[cfg(feature = "cuda")]
-use std::{ffi::c_void, ptr::NonNull};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 use clap::{Parser, ValueEnum};
@@ -18,9 +15,13 @@ use disrust::buffer_pool::{BufferPool, PoolSlice, set_factory_pool};
 #[cfg(feature = "cuda")]
 use disrust::constants::FEATURE_DIM;
 #[cfg(feature = "cuda")]
-use disrust::gpu::preflight::{verify_cuda_startup, verify_ort_dylib_present};
+use disrust::cuda::memory::{alloc_pinned, free_pinned};
 #[cfg(feature = "cuda")]
-use disrust::gpu::session::GpuSession;
+use disrust::cuda::preflight::verify_cuda_startup;
+#[cfg(feature = "cuda")]
+use disrust::pipeline::session::InferenceSession;
+#[cfg(feature = "cuda")]
+use disrust::pipeline::{make_pool, verify_ort_dylib_present};
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -38,7 +39,7 @@ struct Args {
     model: String,
 
     /// Benchmark mode:
-    /// direct = raw GpuSession RunAsync throughput by total batch vectors
+    /// direct = raw InferenceSession RunAsync throughput by total batch vectors
     /// subsystem = synthetic pooled request slots + completion-style wait
     #[arg(long, value_enum, default_value_t = Mode::Direct)]
     mode: Mode,
@@ -145,6 +146,7 @@ struct Stats {
     avg_us: f64,
 }
 
+/// Pinned host buffer for benchmark input data. Backed by `cuda::memory`.
 #[cfg(feature = "cuda")]
 struct PinnedHostBuffer {
     ptr: NonNull<f32>,
@@ -154,15 +156,11 @@ struct PinnedHostBuffer {
 #[cfg(feature = "cuda")]
 impl PinnedHostBuffer {
     fn new(len: usize) -> Self {
-        unsafe {
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let status =
-                cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, len * std::mem::size_of::<f32>());
-            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                panic!("cuMemAllocHost_v2 failed for benchmark input: {status:?}");
-            }
-            let ptr = NonNull::new(ptr as *mut f32).expect("cuMemAllocHost_v2 returned null");
-            Self { ptr, len }
+        let raw = alloc_pinned(len * std::mem::size_of::<f32>())
+            .expect("alloc_pinned failed for benchmark input") as *mut f32;
+        Self {
+            ptr: NonNull::new(raw).expect("alloc_pinned returned null"),
+            len,
         }
     }
 
@@ -179,10 +177,7 @@ impl PinnedHostBuffer {
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
         unsafe {
-            let status = cudarc::driver::sys::cuMemFreeHost(self.ptr.as_ptr() as *mut c_void);
-            if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("gpu_inference_bench: cuMemFreeHost failed: {status:?}");
-            }
+            free_pinned(self.ptr.as_ptr().cast()).expect("free_pinned failed");
         }
     }
 }
@@ -194,7 +189,7 @@ fn bench_direct(
     warmup_iters: usize,
     iters: usize,
 ) -> Stats {
-    let mut session = GpuSession::with_output_capacity(model_bytes, num_vectors);
+    let mut session = InferenceSession::with_output_capacity(model_bytes, num_vectors);
     let pinned = allocate_pinned_input(num_vectors);
     let host_ptr = pinned.as_ptr();
 
@@ -219,12 +214,8 @@ fn bench_subsystem(
     iters: usize,
 ) -> Stats {
     let total_vectors = slot_count * vectors_per_slot;
-    let pool_capacity = total_vectors * FEATURE_DIM * 4;
-    let mut session = GpuSession::with_output_capacity(model_bytes, total_vectors);
-    let mut pinned_pool = PinnedHostBuffer::new(pool_capacity);
-    let pool = Box::leak(unsafe {
-        BufferPool::from_raw_ptr(pinned_pool.as_mut_slice().as_mut_ptr(), pool_capacity)
-    });
+    let mut session = InferenceSession::with_output_capacity(model_bytes, total_vectors);
+    let pool = make_pool();
     let mut alloc = pool.allocator();
 
     for _ in 0..warmup_iters {
@@ -240,20 +231,19 @@ fn bench_subsystem(
         run_batch(&mut session, black_box(host_ptr), total_vectors, slices);
     }
     let elapsed = start.elapsed();
-    drop(pinned_pool);
     stats_from_elapsed(elapsed, iters, total_vectors)
 }
 
 #[cfg(feature = "cuda")]
 fn run_batch(
-    session: &mut GpuSession,
+    session: &mut InferenceSession,
     host_ptr: *const f32,
     num_vectors: usize,
     input_slices: Vec<PoolSlice>,
 ) {
     assert!(
         session.try_acquire(),
-        "GpuSession unexpectedly unavailable in benchmark"
+        "InferenceSession unexpectedly unavailable in benchmark"
     );
     let mut batch = session.submit_batch(host_ptr, num_vectors);
     batch.input_slices = input_slices;

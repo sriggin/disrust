@@ -42,7 +42,7 @@ pub fn process_requests_from_buffer(
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     allocator: &mut PoolAllocator,
     conn_id: u16,
-    fd: i32,
+    generation: u32,
     thread_id: u8,
     request_seq: &mut u64,
 ) -> Result<ProcessRequestOutcome, ProcessRequestError> {
@@ -77,7 +77,7 @@ pub fn process_requests_from_buffer(
                     protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
                     slot.io_thread_id = thread_id;
                     slot.conn_id = conn_id;
-                    slot.fd = fd;
+                    slot.generation = generation;
                     slot.request_seq = seq;
                     slot.num_vectors = num_vectors;
                     slot.published_at_ns = monotonic_now_ns();

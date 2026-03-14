@@ -221,7 +221,8 @@ impl InferenceSession {
     /// Construct a session with a caller-chosen maximum output vector capacity.
     pub fn with_output_capacity(model_bytes: &[u8], output_capacity: usize) -> Self {
         assert!(output_capacity > 0, "output_capacity must be > 0");
-        let builder = Session::builder()
+        #[allow(unused_mut)]
+        let mut builder = Session::builder()
             .unwrap_or_else(|e| {
                 eprintln!("Session::builder failed: {e}");
                 std::process::abort()
@@ -440,7 +441,7 @@ impl Drop for InferenceSession {
 
         #[cfg(not(feature = "cuda"))]
         unsafe {
-            drop(Box::from_raw(std::slice::from_raw_parts_mut(
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 self.output_ptr,
                 self.output_capacity,
             )));

@@ -5,6 +5,7 @@ mod imp {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::affinity;
     use crate::timer::{TimerMetric, TimerRecorder, TimerSnapshot};
 
     // Stall / backpressure (cumulative counts)
@@ -362,121 +363,135 @@ mod imp {
         }
     }
 
-    pub fn spawn_reporter(interval_secs: u64) {
+    pub fn spawn_reporter(interval_secs: u64, metrics_cpu: Option<usize>) {
         assert!(interval_secs > 0, "metrics interval must be > 0");
-        std::thread::spawn(move || {
-            let mut last_snap = snapshot();
-            loop {
-                std::thread::sleep(Duration::from_secs(interval_secs));
-                let snap = snapshot();
-                let req_full_d = snap.req_ring_full.saturating_sub(last_snap.req_ring_full);
-                let pool_exh_d = snap.pool_exhausted.saturating_sub(last_snap.pool_exhausted);
-                let pool_tl_d = snap.pool_too_large.saturating_sub(last_snap.pool_too_large);
-                let req_pub_d = snap
-                    .requests_published
-                    .saturating_sub(last_snap.requests_published);
-                let batches_submitted_d = snap
-                    .batches_submitted
-                    .saturating_sub(last_snap.batches_submitted);
-                let vectors_submitted_d = snap
-                    .vectors_submitted
-                    .saturating_sub(last_snap.vectors_submitted);
-                let batches_completed_d = snap
-                    .batches_completed
-                    .saturating_sub(last_snap.batches_completed);
-                let slots_submitted_d = snap
-                    .slots_submitted
-                    .saturating_sub(last_snap.slots_submitted);
-                let backlog_slots_at_build_d = snap
-                    .backlog_slots_at_build
-                    .saturating_sub(last_snap.backlog_slots_at_build);
-                let batch_stop_cap_d = snap.batch_stop_cap.saturating_sub(last_snap.batch_stop_cap);
-                let batch_stop_backlog_empty_d = snap
-                    .batch_stop_backlog_empty
-                    .saturating_sub(last_snap.batch_stop_backlog_empty);
-                let batch_stop_non_contig_d = snap
-                    .batch_stop_non_contig
-                    .saturating_sub(last_snap.batch_stop_non_contig);
-                let responses_written_d = snap
-                    .responses_written
-                    .saturating_sub(last_snap.responses_written);
-                let read_submits_d = snap.read_submits.saturating_sub(last_snap.read_submits);
-                let read_cqes_d = snap.read_cqes.saturating_sub(last_snap.read_cqes);
-                let read_bytes_d = snap.read_bytes.saturating_sub(last_snap.read_bytes);
-                let read_negative_d = snap.read_negative.saturating_sub(last_snap.read_negative);
-                let bytes_consumed_d = snap.bytes_consumed.saturating_sub(last_snap.bytes_consumed);
-                let write_sqes_d = snap.write_sqes.saturating_sub(last_snap.write_sqes);
-                let write_cqes_d = snap.write_cqes.saturating_sub(last_snap.write_cqes);
-                let write_negative_d = snap.write_negative.saturating_sub(last_snap.write_negative);
-                let session_wait_loops_d = snap
-                    .session_wait_loops
-                    .saturating_sub(last_snap.session_wait_loops);
-                let completion_queue_empty_spins_d = snap
-                    .completion_queue_empty_spins
-                    .saturating_sub(last_snap.completion_queue_empty_spins);
-                let completion_poll_no_events_d = snap
-                    .completion_poll_no_events
-                    .saturating_sub(last_snap.completion_poll_no_events);
-                let write_drain_waits_d = snap
-                    .write_drain_waits
-                    .saturating_sub(last_snap.write_drain_waits);
-                let write_partial_d = snap.write_partial.saturating_sub(last_snap.write_partial);
-                let write_eagain_d = snap.write_eagain.saturating_sub(last_snap.write_eagain);
-                let write_fatal_d = snap.write_fatal.saturating_sub(last_snap.write_fatal);
-                let batch_total = batch_total_timer().snapshot_and_reset();
-                let batch_wait = batch_wait_timer().snapshot_and_reset();
-                let backlog_age = backlog_age_timer().snapshot_and_reset();
-                let publish_to_submit = publish_to_submit_timer().snapshot_and_reset();
-                let publish_to_write_submit = publish_to_write_submit_timer().snapshot_and_reset();
-                let write_drain = write_drain_timer().snapshot_and_reset();
-                println!(
-                    "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} buffered_bytes={} pool_max_in_use={} {} {}",
-                    interval_secs,
-                    req_pub_d,
-                    batches_submitted_d,
-                    batches_completed_d,
-                    slots_submitted_d,
-                    backlog_slots_at_build_d,
-                    vectors_submitted_d,
-                    responses_written_d,
-                    batch_stop_cap_d,
-                    batch_stop_backlog_empty_d,
-                    batch_stop_non_contig_d,
-                    format_timer("backlog_age_us", backlog_age.as_ref()),
-                    format_timer("publish_to_submit_us", publish_to_submit.as_ref()),
-                    format_timer(
-                        "publish_to_write_submit_us",
-                        publish_to_write_submit.as_ref()
-                    ),
-                    read_submits_d,
-                    read_cqes_d,
-                    read_bytes_d,
-                    read_negative_d,
-                    bytes_consumed_d,
-                    write_sqes_d,
-                    write_cqes_d,
-                    write_negative_d,
-                    write_partial_d,
-                    write_eagain_d,
-                    write_fatal_d,
-                    write_drain_waits_d,
-                    format_timer("write_drain_us", write_drain.as_ref()),
-                    req_full_d,
-                    pool_exh_d,
-                    pool_tl_d,
-                    session_wait_loops_d,
-                    completion_queue_empty_spins_d,
-                    completion_poll_no_events_d,
-                    snap.req_occ,
-                    snap.req_max_occ,
-                    snap.buffered_bytes,
-                    snap.pool_max_in_use,
-                    format_timer("batch_total_us", batch_total.as_ref()),
-                    format_timer("batch_wait_us", batch_wait.as_ref()),
-                );
-                last_snap = snap;
-            }
-        });
+        std::thread::Builder::new()
+            .name("metrics".into())
+            .spawn(move || {
+                if let Some(cpu) = metrics_cpu {
+                    affinity::pin_current_thread(cpu, "metrics")
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+                let mut last_snap = snapshot();
+                loop {
+                    std::thread::sleep(Duration::from_secs(interval_secs));
+                    let snap = snapshot();
+                    let req_full_d = snap.req_ring_full.saturating_sub(last_snap.req_ring_full);
+                    let pool_exh_d = snap.pool_exhausted.saturating_sub(last_snap.pool_exhausted);
+                    let pool_tl_d = snap.pool_too_large.saturating_sub(last_snap.pool_too_large);
+                    let req_pub_d = snap
+                        .requests_published
+                        .saturating_sub(last_snap.requests_published);
+                    let batches_submitted_d = snap
+                        .batches_submitted
+                        .saturating_sub(last_snap.batches_submitted);
+                    let vectors_submitted_d = snap
+                        .vectors_submitted
+                        .saturating_sub(last_snap.vectors_submitted);
+                    let batches_completed_d = snap
+                        .batches_completed
+                        .saturating_sub(last_snap.batches_completed);
+                    let slots_submitted_d = snap
+                        .slots_submitted
+                        .saturating_sub(last_snap.slots_submitted);
+                    let backlog_slots_at_build_d = snap
+                        .backlog_slots_at_build
+                        .saturating_sub(last_snap.backlog_slots_at_build);
+                    let batch_stop_cap_d =
+                        snap.batch_stop_cap.saturating_sub(last_snap.batch_stop_cap);
+                    let batch_stop_backlog_empty_d = snap
+                        .batch_stop_backlog_empty
+                        .saturating_sub(last_snap.batch_stop_backlog_empty);
+                    let batch_stop_non_contig_d = snap
+                        .batch_stop_non_contig
+                        .saturating_sub(last_snap.batch_stop_non_contig);
+                    let responses_written_d = snap
+                        .responses_written
+                        .saturating_sub(last_snap.responses_written);
+                    let read_submits_d = snap.read_submits.saturating_sub(last_snap.read_submits);
+                    let read_cqes_d = snap.read_cqes.saturating_sub(last_snap.read_cqes);
+                    let read_bytes_d = snap.read_bytes.saturating_sub(last_snap.read_bytes);
+                    let read_negative_d =
+                        snap.read_negative.saturating_sub(last_snap.read_negative);
+                    let bytes_consumed_d =
+                        snap.bytes_consumed.saturating_sub(last_snap.bytes_consumed);
+                    let write_sqes_d = snap.write_sqes.saturating_sub(last_snap.write_sqes);
+                    let write_cqes_d = snap.write_cqes.saturating_sub(last_snap.write_cqes);
+                    let write_negative_d =
+                        snap.write_negative.saturating_sub(last_snap.write_negative);
+                    let session_wait_loops_d = snap
+                        .session_wait_loops
+                        .saturating_sub(last_snap.session_wait_loops);
+                    let completion_queue_empty_spins_d = snap
+                        .completion_queue_empty_spins
+                        .saturating_sub(last_snap.completion_queue_empty_spins);
+                    let completion_poll_no_events_d = snap
+                        .completion_poll_no_events
+                        .saturating_sub(last_snap.completion_poll_no_events);
+                    let write_drain_waits_d = snap
+                        .write_drain_waits
+                        .saturating_sub(last_snap.write_drain_waits);
+                    let write_partial_d =
+                        snap.write_partial.saturating_sub(last_snap.write_partial);
+                    let write_eagain_d =
+                        snap.write_eagain.saturating_sub(last_snap.write_eagain);
+                    let write_fatal_d = snap.write_fatal.saturating_sub(last_snap.write_fatal);
+                    let batch_total = batch_total_timer().snapshot_and_reset();
+                    let batch_wait = batch_wait_timer().snapshot_and_reset();
+                    let backlog_age = backlog_age_timer().snapshot_and_reset();
+                    let publish_to_submit = publish_to_submit_timer().snapshot_and_reset();
+                    let publish_to_write_submit =
+                        publish_to_write_submit_timer().snapshot_and_reset();
+                    let write_drain = write_drain_timer().snapshot_and_reset();
+                    println!(
+                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} buffered_bytes={} pool_max_in_use={} {} {}",
+                        interval_secs,
+                        req_pub_d,
+                        batches_submitted_d,
+                        batches_completed_d,
+                        slots_submitted_d,
+                        backlog_slots_at_build_d,
+                        vectors_submitted_d,
+                        responses_written_d,
+                        batch_stop_cap_d,
+                        batch_stop_backlog_empty_d,
+                        batch_stop_non_contig_d,
+                        format_timer("backlog_age_us", backlog_age.as_ref()),
+                        format_timer("publish_to_submit_us", publish_to_submit.as_ref()),
+                        format_timer(
+                            "publish_to_write_submit_us",
+                            publish_to_write_submit.as_ref()
+                        ),
+                        read_submits_d,
+                        read_cqes_d,
+                        read_bytes_d,
+                        read_negative_d,
+                        bytes_consumed_d,
+                        write_sqes_d,
+                        write_cqes_d,
+                        write_negative_d,
+                        write_partial_d,
+                        write_eagain_d,
+                        write_fatal_d,
+                        write_drain_waits_d,
+                        format_timer("write_drain_us", write_drain.as_ref()),
+                        req_full_d,
+                        pool_exh_d,
+                        pool_tl_d,
+                        session_wait_loops_d,
+                        completion_queue_empty_spins_d,
+                        completion_poll_no_events_d,
+                        snap.req_occ,
+                        snap.req_max_occ,
+                        snap.buffered_bytes,
+                        snap.pool_max_in_use,
+                        format_timer("batch_total_us", batch_total.as_ref()),
+                        format_timer("batch_wait_us", batch_wait.as_ref()),
+                    );
+                    last_snap = snap;
+                }
+            })
+            .expect("failed to spawn metrics reporter");
     }
 
     fn format_timer(label: &str, snapshot: Option<&TimerSnapshot>) -> String {
@@ -610,7 +625,7 @@ mod imp {
             buffered_bytes: 0,
         }
     }
-    pub fn spawn_reporter(_: u64) {}
+    pub fn spawn_reporter(_: u64, _: Option<usize>) {}
 }
 
 pub use imp::*;

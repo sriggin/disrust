@@ -23,6 +23,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
     let mut allocator = pool.allocator();
 
     let conn_id = 1u16;
+    let generation = 7u32;
     let thread_id = 0u8;
     let mut request_seq = 0u64;
 
@@ -38,7 +39,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
         &mut producer,
         &mut allocator,
         conn_id,
-        0,
+        generation,
         thread_id,
         &mut request_seq,
     );
@@ -58,6 +59,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
             assert_eq!(events.len(), 1);
             let ev = &events[0];
             assert_eq!(ev.conn_id, conn_id);
+            assert_eq!(ev.generation, generation);
             assert_eq!(ev.io_thread_id, thread_id);
             assert_eq!(ev.num_vectors, num_vectors as u8);
             assert_eq!(ev.request_seq, 0);
@@ -84,6 +86,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     let mut allocator = pool.allocator();
 
     let conn_id = 2u16;
+    let generation = 9u32;
     let thread_id = 0u8;
     let mut request_seq = 0u64;
 
@@ -98,7 +101,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
         &mut producer,
         &mut allocator,
         conn_id,
-        0,
+        generation,
         thread_id,
         &mut request_seq,
     );
@@ -115,6 +118,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     while let Ok(mut guard) = poller.poll() {
         for ev in &mut guard {
             assert_eq!(ev.conn_id, conn_id);
+            assert_eq!(ev.generation, generation);
             assert_eq!(ev.request_seq, seen);
             assert_eq!(ev.num_vectors, 1);
             let v = ev.vector(0);
@@ -152,7 +156,7 @@ fn request_flow_incomplete_returns_consumed_only() {
         &mut producer,
         &mut allocator,
         0,
-        0,
+        1,
         0,
         &mut request_seq,
     );
@@ -186,7 +190,7 @@ fn request_flow_parse_error_returns_err() {
         &mut producer,
         &mut allocator,
         0,
-        0,
+        1,
         0,
         &mut request_seq,
     );

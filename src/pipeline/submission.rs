@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
@@ -38,6 +39,7 @@ pub struct SubmissionConsumer {
     max_batch_slots: usize,
     batch_coalesce_timeout: Duration,
     backlog_started_at: Option<Instant>,
+    coalesce_check_spins: u32,
 }
 
 // SAFETY: SubmissionConsumer runs on a single dedicated thread.
@@ -65,10 +67,12 @@ impl SubmissionConsumer {
             max_batch_slots,
             batch_coalesce_timeout,
             backlog_started_at: None,
+            coalesce_check_spins: 0,
         }
     }
 
     pub fn run(mut self) {
+        let mut idle_loops = 0u32;
         loop {
             let backlog_was_empty = self.backlog.is_empty();
             match drain_visible_events(&mut self.poller, &mut self.backlog, self.max_batch_slots) {
@@ -80,21 +84,33 @@ impl SubmissionConsumer {
             }
             if backlog_was_empty && !self.backlog.is_empty() {
                 self.backlog_started_at = Some(Instant::now());
+                self.coalesce_check_spins = 0;
             }
             if self.backlog.is_empty() {
                 self.backlog_started_at = None;
-                std::hint::spin_loop();
+                self.coalesce_check_spins = 0;
+                idle_wait(&mut idle_loops);
                 continue;
             }
 
-            if self.backlog.len() < self.max_batch_slots
-                && (!session_available(&self.sessions)
-                    || self
-                        .backlog_started_at
-                        .is_some_and(|started| started.elapsed() < self.batch_coalesce_timeout))
-            {
-                std::hint::spin_loop();
-                continue;
+            if self.backlog.len() < self.max_batch_slots {
+                if !session_available(&self.sessions) {
+                    idle_wait(&mut idle_loops);
+                    continue;
+                }
+                if self.batch_coalesce_timeout > Duration::ZERO && self.coalesce_check_spins < 64 {
+                    self.coalesce_check_spins += 1;
+                    idle_wait(&mut idle_loops);
+                    continue;
+                }
+                self.coalesce_check_spins = 0;
+                if self
+                    .backlog_started_at
+                    .is_some_and(|started| started.elapsed() < self.batch_coalesce_timeout)
+                {
+                    idle_wait(&mut idle_loops);
+                    continue;
+                }
             }
 
             let idx = if self.backlog.len() >= self.max_batch_slots {
@@ -119,8 +135,21 @@ impl SubmissionConsumer {
             if self.backlog.is_empty() {
                 self.backlog_started_at = None;
             }
+            self.coalesce_check_spins = 0;
+            idle_loops = 0;
             self.batch_queue.push(batch_entry);
         }
+    }
+}
+
+fn idle_wait(idle_loops: &mut u32) {
+    *idle_loops = idle_loops.saturating_add(1);
+    if *idle_loops < 64 {
+        std::hint::spin_loop();
+    } else if *idle_loops < 256 {
+        thread::yield_now();
+    } else {
+        thread::sleep(Duration::from_micros(10));
     }
 }
 

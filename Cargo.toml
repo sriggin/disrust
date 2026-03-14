@@ -11,7 +11,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "disrust"
 path = "src/main.rs"
-required-features = ["cuda"]
 
 [[bench]]
 name = "buffer_pool_bench"
@@ -33,6 +32,11 @@ name = "gpu_inference_bench"
 path = "benches/gpu_inference_bench.rs"
 harness = false
 
+[[bench]]
+name = "pipeline_bench"
+path = "benches/pipeline_bench.rs"
+harness = false
+
 [[bin]]
 name = "client"
 path = "src/bin/client.rs"
@@ -47,7 +51,7 @@ libc = "0.2"
 spsc-bip-buffer = "0.2"
 bytemuck = { version = "1", features = ["min_const_generics"] }
 hdrhistogram = { version = "7", default-features = false, features = ["sync"] }
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
 # Specify the matching CUDA version feature, e.g. features = ["cuda-12040"] or ["cuda-11080"].
 # See https://docs.rs/cudarc for available version features.
 cudarc = { version = "0.19.3", features = ["cuda-12060"], optional = true }
@@ -55,7 +59,7 @@ cudarc = { version = "0.19.3", features = ["cuda-12060"], optional = true }
 [features]
 default = ["cuda"]
 metrics = []
-cuda = ["dep:ort", "ort/cuda", "dep:cudarc"]
+cuda = ["ort/cuda", "dep:cudarc"]
 
 [profile.release]
 opt-level = 3

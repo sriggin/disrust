@@ -2,10 +2,43 @@
 
 pub mod batch_queue;
 pub mod completion;
+pub mod connection_registry;
+pub mod ready_queue;
 pub mod session;
 pub mod submission;
+pub mod writer;
 
 use std::path::PathBuf;
+
+use crate::buffer_pool::BufferPool;
+#[cfg(feature = "cuda")]
+use crate::config::GPU_BUFFER_POOL_BYTES;
+use crate::config::GPU_BUFFER_POOL_CAPACITY;
+
+/// Allocate and leak a `BufferPool` of the standard server capacity.
+///
+/// CUDA: backed by pinned host memory (`cuMemAllocHost`), enabling zero-copy DMA.
+/// CPU: backed by heap memory.
+///
+/// The returned reference is `'static` because the pool lives for the process lifetime.
+pub fn make_pool() -> &'static BufferPool {
+    #[cfg(feature = "cuda")]
+    let ptr = unsafe {
+        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        let status = cudarc::driver::sys::cuMemAllocHost_v2(&mut raw, GPU_BUFFER_POOL_BYTES);
+        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            eprintln!("make_pool: cuMemAllocHost_v2 failed: {status:?}");
+            std::process::abort();
+        }
+        std::ptr::write_bytes(raw as *mut u8, 0u8, GPU_BUFFER_POOL_BYTES);
+        raw as *mut f32
+    };
+
+    #[cfg(not(feature = "cuda"))]
+    let ptr = Box::leak(vec![0f32; GPU_BUFFER_POOL_CAPACITY].into_boxed_slice()).as_mut_ptr();
+
+    Box::leak(unsafe { BufferPool::from_raw_ptr(ptr, GPU_BUFFER_POOL_CAPACITY) })
+}
 
 /// Locate the ONNX Runtime shared library to pass to `ort::init_from`.
 pub fn verify_ort_dylib_present() -> Result<PathBuf, String> {

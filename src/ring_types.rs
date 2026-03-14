@@ -14,7 +14,7 @@ use std::mem::size_of;
 pub struct InferenceEvent {
     pub io_thread_id: u8,
     pub conn_id: u16,
-    pub fd: i32,
+    pub generation: u32,
     pub request_seq: u64,
     pub num_vectors: u8,
     pub published_at_ns: u64,
@@ -27,7 +27,7 @@ impl InferenceEvent {
         Self {
             io_thread_id: 0,
             conn_id: 0,
-            fd: 0,
+            generation: 0,
             request_seq: 0,
             num_vectors: 0,
             published_at_ns: 0,

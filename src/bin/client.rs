@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand};
 use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
+use disrust::affinity;
 use disrust::constants::FEATURE_DIM;
 use disrust::protocol::{RESPONSE_HEADER_BYTES, request_size, response_size};
 use disrust::timer::{TimerMetric, TimerRecorder, TimerSnapshot};
@@ -25,6 +26,14 @@ struct Cli {
     /// Server port
     #[arg(short, long, default_value_t = 9900)]
     port: u16,
+
+    /// Pin the client event-loop thread to a specific CPU id.
+    #[arg(long)]
+    event_loop_cpu: Option<usize>,
+
+    /// Pin the client reporter thread to a specific CPU id.
+    #[arg(long)]
+    reporter_cpu: Option<usize>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -367,11 +376,15 @@ struct Reporter {
 }
 
 impl Reporter {
-    fn spawn(interval_timer: Arc<TimerMetric>) -> Self {
+    fn spawn(interval_timer: Arc<TimerMetric>, reporter_cpu: Option<usize>) -> Self {
         let (tx, rx) = mpsc::channel();
         let handle = thread::Builder::new()
             .name("client-reporter".into())
             .spawn(move || {
+                if let Some(cpu) = reporter_cpu {
+                    affinity::pin_current_thread(cpu, "client-reporter")
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
                 let mut measurement_start: Option<Instant> = None;
                 let mut last_interval_start: Option<Instant> = None;
                 let mut interval_completions: u64 = 0;
@@ -673,9 +686,18 @@ fn handle_read_cqe(
     process_read_buffer(conn, scenario, stats, run, now, interval_latency_recorder);
 }
 
-fn run_scenario(addr: &str, scenario: Scenario) {
+fn run_scenario(
+    addr: &str,
+    scenario: Scenario,
+    event_loop_cpu: Option<usize>,
+    reporter_cpu: Option<usize>,
+) {
     assert!(scenario.connections > 0, "connections must be > 0");
     assert!(scenario.window > 0, "window must be > 0");
+
+    if let Some(cpu) = event_loop_cpu {
+        affinity::pin_current_thread(cpu, "client-main").unwrap_or_else(|e| panic!("{e}"));
+    }
 
     let sq_entries = (scenario.connections * scenario.window * 2).clamp(256, 16384) as u32;
     let mut ring = IoUring::new(sq_entries).expect("io_uring creation failed");
@@ -688,7 +710,7 @@ fn run_scenario(addr: &str, scenario: Scenario) {
         .then(|| Arc::new(TimerMetric::new()));
     let reporter = latency_interval_timer
         .as_ref()
-        .map(|interval| Reporter::spawn(Arc::clone(interval)));
+        .map(|interval| Reporter::spawn(Arc::clone(interval), reporter_cpu));
     let mut latency_interval_recorder = latency_interval_timer
         .as_ref()
         .map(|timer| timer.recorder());
@@ -824,6 +846,8 @@ fn smoke_test(addr: &str) {
                 requests_per_connection: 1,
             },
         },
+        None,
+        None,
     );
     eprintln!("  1 vector: OK");
 
@@ -840,6 +864,8 @@ fn smoke_test(addr: &str) {
                 requests_per_connection: 1,
             },
         },
+        None,
+        None,
     );
     eprintln!("  4 vectors: OK");
     eprintln!("smoke test: PASSED");
@@ -851,8 +877,23 @@ fn main() {
 
     match cli.command.unwrap_or(Command::Smoke) {
         Command::Smoke => smoke_test(&addr),
-        Command::Pipeline(args) => run_scenario(&addr, Scenario::pipeline(args)),
-        Command::Bench(args) => run_scenario(&addr, Scenario::bench(args)),
-        Command::Sustain(args) => run_scenario(&addr, Scenario::sustain(args)),
+        Command::Pipeline(args) => run_scenario(
+            &addr,
+            Scenario::pipeline(args),
+            cli.event_loop_cpu,
+            cli.reporter_cpu,
+        ),
+        Command::Bench(args) => run_scenario(
+            &addr,
+            Scenario::bench(args),
+            cli.event_loop_cpu,
+            cli.reporter_cpu,
+        ),
+        Command::Sustain(args) => run_scenario(
+            &addr,
+            Scenario::sustain(args),
+            cli.event_loop_cpu,
+            cli.reporter_cpu,
+        ),
     }
 }

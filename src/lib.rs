@@ -4,6 +4,7 @@
 //! the protocol, request path, and pipeline pieces so they can be tested without starting the
 //! full network server.
 
+pub mod affinity;
 pub mod buffer_pool;
 pub mod clock;
 pub mod config;
