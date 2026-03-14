@@ -4,6 +4,7 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::Arc;
+use std::collections::VecDeque;
 
 use disruptor::{SingleConsumerBarrier, SingleProducer};
 use io_uring::{opcode, squeue::Entry, types::Fd};
@@ -68,6 +69,7 @@ struct Connection {
     next_request_seq: u64,
     read_inflight: bool,
     read_closed: bool,
+    parse_queued: bool,
 }
 
 impl Connection {
@@ -80,6 +82,7 @@ impl Connection {
             next_request_seq: 0,
             read_inflight: false,
             read_closed: false,
+            parse_queued: false,
         }
     }
 
@@ -120,28 +123,24 @@ impl IngressThread {
         let mut ring = IoUring::new(4096).expect("io_uring creation failed");
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
-        let mut retry_keys: Vec<u16> = Vec::new();
+        let mut parse_queue: VecDeque<u16> = VecDeque::new();
         submit_accept(&mut ring, self.listen_fd);
 
         loop {
-            retry_keys.clear();
-            for (k, c) in conns.iter() {
-                if !c.read_closed && !c.read_inflight && c.read_len > 0 {
-                    retry_keys.push(k as u16);
+            if let Some(key) = parse_queue.pop_front() {
+                if let Some(conn) = conns.get_mut(key as usize) {
+                    conn.parse_queued = false;
                 }
-            }
-            if !retry_keys.is_empty() {
-                for &key in &retry_keys {
-                    parse_and_maybe_read(
-                        &mut ring,
-                        &mut conns,
-                        &mut self.producer,
-                        &mut self.allocator,
-                        &self.registry,
-                        self.thread_id,
-                        key,
-                    );
-                }
+                parse_and_maybe_read(
+                    &mut ring,
+                    &mut conns,
+                    &mut parse_queue,
+                    &mut self.producer,
+                    &mut self.allocator,
+                    &self.registry,
+                    self.thread_id,
+                    key,
+                );
                 continue;
             }
 
@@ -162,6 +161,7 @@ impl IngressThread {
                     OP_READ => handle_read(
                         &mut ring,
                         &mut conns,
+                        &mut parse_queue,
                         &mut self.producer,
                         &mut self.allocator,
                         &self.registry,
@@ -171,24 +171,6 @@ impl IngressThread {
                     ),
                     _ => {}
                 }
-            }
-
-            retry_keys.clear();
-            for (k, c) in conns.iter() {
-                if !c.read_closed && !c.read_inflight && c.read_len > 0 {
-                    retry_keys.push(k as u16);
-                }
-            }
-            for &key in &retry_keys {
-                parse_and_maybe_read(
-                    &mut ring,
-                    &mut conns,
-                    &mut self.producer,
-                    &mut self.allocator,
-                    &self.registry,
-                    self.thread_id,
-                    key,
-                );
             }
 
             let retired: Vec<u16> = conns
@@ -231,6 +213,7 @@ fn handle_accept(
 fn handle_read(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
+    parse_queue: &mut VecDeque<u16>,
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     allocator: &mut PoolAllocator,
     registry: &Arc<ConnectionRegistry>,
@@ -258,13 +241,25 @@ fn handle_read(
     };
     conn.read_inflight = false;
     conn.read_len += bytes_read;
+    enqueue_parse(conns, parse_queue, key);
 
-    parse_and_maybe_read(ring, conns, producer, allocator, registry, thread_id, key);
+    parse_and_maybe_read(
+        ring,
+        conns,
+        parse_queue,
+        producer,
+        allocator,
+        registry,
+        thread_id,
+        key,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_and_maybe_read(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
+    parse_queue: &mut VecDeque<u16>,
     producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
     allocator: &mut PoolAllocator,
     registry: &Arc<ConnectionRegistry>,
@@ -313,7 +308,20 @@ fn parse_and_maybe_read(
     let c = &conns[key as usize];
     if !c.read_closed && c.read_len == 0 {
         submit_read(ring, conns, key);
+    } else if !c.read_closed && !c.read_inflight && c.read_len > 0 {
+        enqueue_parse(conns, parse_queue, key);
     }
+}
+
+fn enqueue_parse(conns: &mut Slab<Connection>, parse_queue: &mut VecDeque<u16>, key: u16) {
+    let Some(conn) = conns.get_mut(key as usize) else {
+        return;
+    };
+    if conn.read_closed || conn.read_inflight || conn.read_len == 0 || conn.parse_queued {
+        return;
+    }
+    conn.parse_queued = true;
+    parse_queue.push_back(key);
 }
 
 fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
@@ -330,7 +338,7 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     }
     conn.read_inflight = true;
     let (buf_ptr, buf_len) = conn.read_buf_tail();
-    let sqe = opcode::Read::new(Fd(conn.fd), buf_ptr, buf_len)
+    let sqe = opcode::Recv::new(Fd(conn.fd), buf_ptr, buf_len)
         .build()
         .user_data(encode_user_data(OP_READ, key));
     ring.push(&sqe);
