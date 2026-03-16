@@ -436,49 +436,43 @@ mod imp {
                     let publish_to_write_submit =
                         publish_to_write_submit_timer().snapshot_and_reset();
                     let write_drain = write_drain_timer().snapshot_and_reset();
+                    println!("--- metrics {}s ---", interval_secs);
                     println!(
-                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty_waits={} completion_poll_stalls={} | gauges: req_occ={} req_max={} pool_max_in_use={} {} {}",
-                        interval_secs,
-                        req_pub_d,
-                        batches_submitted_d,
-                        batches_completed_d,
-                        slots_submitted_d,
-                        backlog_slots_at_build_d,
-                        vectors_submitted_d,
-                        responses_written_d,
-                        batch_stop_cap_d,
-                        batch_stop_backlog_empty_d,
-                        batch_stop_non_contig_d,
+                        "  throughput:  req_pub={} batches_sub={} batches_cmp={} slots={} backlog={} vectors={} responses={}",
+                        req_pub_d, batches_submitted_d, batches_completed_d,
+                        slots_submitted_d, backlog_slots_at_build_d,
+                        vectors_submitted_d, responses_written_d,
+                    );
+                    println!(
+                        "  batch_build: stop_cap={} stop_empty={} stop_noncontig={}",
+                        batch_stop_cap_d, batch_stop_backlog_empty_d, batch_stop_non_contig_d,
+                    );
+                    println!(
+                        "  reads:       submits={} cqes={} bytes={} neg={} consumed={}",
+                        read_submits_d, read_cqes_d, read_bytes_d, read_negative_d, bytes_consumed_d,
+                    );
+                    println!(
+                        "  writes:      sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={}",
+                        write_sqes_d, write_cqes_d, write_negative_d,
+                        write_partial_d, write_eagain_d, write_fatal_d, write_drain_waits_d,
+                    );
+                    println!(
+                        "  stalls:      ring_full={} pool_exh={} pool_too_large={} session_waits={} cq_empty_waits={} poll_stalls={}",
+                        req_full_d, pool_exh_d, pool_tl_d,
+                        session_waits_d, completion_queue_empty_waits_d, completion_poll_stalls_d,
+                    );
+                    println!(
+                        "  gauges:      req_occ={} req_max={} pool_max={}",
+                        snap.req_occ, snap.req_max_occ, snap.pool_max_in_use,
+                    );
+                    println!(
+                        "  timers:      {} {} {} {} {} {}",
                         format_timer("backlog_age_us", backlog_age.as_ref()),
                         format_timer("publish_to_submit_us", publish_to_submit.as_ref()),
-                        format_timer(
-                            "publish_to_write_submit_us",
-                            publish_to_write_submit.as_ref()
-                        ),
-                        read_submits_d,
-                        read_cqes_d,
-                        read_bytes_d,
-                        read_negative_d,
-                        bytes_consumed_d,
-                        write_sqes_d,
-                        write_cqes_d,
-                        write_negative_d,
-                        write_partial_d,
-                        write_eagain_d,
-                        write_fatal_d,
-                        write_drain_waits_d,
-                        format_timer("write_drain_us", write_drain.as_ref()),
-                        req_full_d,
-                        pool_exh_d,
-                        pool_tl_d,
-                        session_waits_d,
-                        completion_queue_empty_waits_d,
-                        completion_poll_stalls_d,
-                        snap.req_occ,
-                        snap.req_max_occ,
-                        snap.pool_max_in_use,
+                        format_timer("publish_to_write_submit_us", publish_to_write_submit.as_ref()),
                         format_timer("batch_total_us", batch_total.as_ref()),
                         format_timer("batch_wait_us", batch_wait.as_ref()),
+                        format_timer("write_drain_us", write_drain.as_ref()),
                     );
                     last_snap = snap;
                 }
