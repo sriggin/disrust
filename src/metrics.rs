@@ -56,7 +56,6 @@ mod imp {
     static POOL_MAX_IN_USE: AtomicUsize = AtomicUsize::new(0);
     static REQ_OCC: AtomicUsize = AtomicUsize::new(0);
     static REQ_MAX_OCC: AtomicUsize = AtomicUsize::new(0);
-    static BUFFERED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Copy)]
     pub struct MetricsSnapshot {
@@ -91,7 +90,6 @@ mod imp {
         pub pool_max_in_use: usize,
         pub req_occ: usize,
         pub req_max_occ: usize,
-        pub buffered_bytes: usize,
     }
 
     pub fn inc_req_ring_full() {
@@ -322,10 +320,6 @@ mod imp {
         // on transient idle phases, which was perturbing the completion hot path.
     }
 
-    pub fn set_buffered_bytes(value: usize) {
-        BUFFERED_BYTES.store(value, Ordering::Relaxed);
-    }
-
     pub fn snapshot() -> MetricsSnapshot {
         MetricsSnapshot {
             req_ring_full: REQ_RING_FULL.load(Ordering::Relaxed),
@@ -359,7 +353,6 @@ mod imp {
             pool_max_in_use: POOL_MAX_IN_USE.load(Ordering::Relaxed),
             req_occ: REQ_OCC.load(Ordering::Relaxed),
             req_max_occ: REQ_MAX_OCC.load(Ordering::Relaxed),
-            buffered_bytes: BUFFERED_BYTES.load(Ordering::Relaxed),
         }
     }
 
@@ -444,7 +437,7 @@ mod imp {
                         publish_to_write_submit_timer().snapshot_and_reset();
                     let write_drain = write_drain_timer().snapshot_and_reset();
                     println!(
-                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} buffered_bytes={} pool_max_in_use={} {} {}",
+                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} pool_max_in_use={} {} {}",
                         interval_secs,
                         req_pub_d,
                         batches_submitted_d,
@@ -483,7 +476,6 @@ mod imp {
                         completion_poll_no_events_d,
                         snap.req_occ,
                         snap.req_max_occ,
-                        snap.buffered_bytes,
                         snap.pool_max_in_use,
                         format_timer("batch_total_us", batch_total.as_ref()),
                         format_timer("batch_wait_us", batch_wait.as_ref()),
@@ -547,7 +539,6 @@ mod imp {
         pub pool_max_in_use: usize,
         pub req_occ: usize,
         pub req_max_occ: usize,
-        pub buffered_bytes: usize,
     }
 
     pub fn inc_req_ring_full() {}
@@ -588,7 +579,6 @@ mod imp {
     pub fn record_publish_to_write_submit(_: std::time::Duration) {}
     pub fn record_write_drain(_: std::time::Duration) {}
     pub fn idle_timers() {}
-    pub fn set_buffered_bytes(_: usize) {}
     pub fn snapshot() -> MetricsSnapshot {
         MetricsSnapshot {
             req_ring_full: 0,
@@ -622,7 +612,6 @@ mod imp {
             pool_max_in_use: 0,
             req_occ: 0,
             req_max_occ: 0,
-            buffered_bytes: 0,
         }
     }
     pub fn spawn_reporter(_: u64, _: Option<usize>) {}

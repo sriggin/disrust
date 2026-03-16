@@ -26,7 +26,7 @@ use crate::ring_types::InferenceEvent;
 
 mod ingress;
 
-use ingress::IngressThread;
+pub use ingress::IngressThread;
 
 #[derive(Args, Clone)]
 pub struct ServeArgs {

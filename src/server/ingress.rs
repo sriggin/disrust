@@ -1,10 +1,10 @@
 //! Ingress-only IO thread for the ONNX/CUDA server pipeline.
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::Arc;
-use std::collections::VecDeque;
 
 use disruptor::{SingleConsumerBarrier, SingleProducer};
 use io_uring::{opcode, squeue::Entry, types::Fd};
@@ -288,7 +288,6 @@ fn parse_and_maybe_read(
                 conn.read_len -= outcome.consumed;
             }
             metrics::add_bytes_consumed(outcome.consumed as u64);
-            metrics::set_buffered_bytes(conn.read_len);
             registry.update_published_seq_end(key, conn.generation, conn.next_request_seq);
             if outcome.needs_read {
                 submit_read(ring, conns, key);
