@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use clap::Args;
-use disruptor::{BusySpin, build_single_producer};
+use disruptor::{BusySpin, build_multi_producer};
 use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -11,7 +11,7 @@ use crate::affinity;
 use crate::buffer_pool::{BufferPool, set_factory_pool};
 use crate::config::{
     BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES, GPU_DISRUPTOR_SIZE,
-    MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE,
+    MAX_IO_THREADS, MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, SLAB_CAPACITY,
 };
 use crate::metrics;
 use crate::pipeline::batch_queue::BatchQueue;
@@ -66,6 +66,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub io_cpu: Option<usize>,
 
+    /// Number of ingress IO threads to run via SO_REUSEPORT sharding.
+    #[arg(long, default_value_t = 1)]
+    pub io_threads: u8,
+
     /// Pin the writer thread to a specific CPU id.
     #[arg(long)]
     pub writer_cpu: Option<usize>,
@@ -94,12 +98,17 @@ pub fn run(args: ServeArgs) {
     let port = args.port;
     let max_batch_slots = args.max_batch_slots;
     let batch_coalesce = std::time::Duration::from_micros(args.batch_coalesce_us);
+    let io_threads = args.io_threads as usize;
 
     if max_batch_slots == 0 || max_batch_slots > MAX_SESSION_BATCH_SIZE {
         eprintln!(
             "disrust: --max-batch-slots must be in 1..={}",
             MAX_SESSION_BATCH_SIZE
         );
+        std::process::exit(1);
+    }
+    if io_threads == 0 || io_threads > MAX_IO_THREADS {
+        eprintln!("disrust: --io-threads must be in 1..={MAX_IO_THREADS}");
         std::process::exit(1);
     }
 
@@ -119,8 +128,9 @@ pub fn run(args: ServeArgs) {
         eprintln!("disrust: completion_cpu={cpu}");
     }
     if let Some(cpu) = args.io_cpu {
-        eprintln!("disrust: io_cpu={cpu}");
+        eprintln!("disrust: io_cpu_base={cpu}");
     }
+    eprintln!("disrust: io_threads={io_threads}");
     if let Some(cpu) = args.writer_cpu {
         eprintln!("disrust: writer_cpu={cpu}");
     }
@@ -169,14 +179,15 @@ pub fn run(args: ServeArgs) {
         GPU_BUFFER_POOL_BYTES / 1_000_000,
     );
 
-    let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
+    let builder = build_multi_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
     let (submission_poller, builder) = builder.event_poller();
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
 
     let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
-    let ready_queue = Arc::new(ReadyQueue::new(crate::config::SLAB_CAPACITY * 2));
-    let registry = Arc::new(ConnectionRegistry::default());
+    let ready_queue = Arc::new(ReadyQueue::new(io_threads * SLAB_CAPACITY * 2));
+    let publish_gate = Arc::new(std::sync::Mutex::new(()));
+    let registry = Arc::new(ConnectionRegistry::new(io_threads, SLAB_CAPACITY));
 
     let sub_consumer = SubmissionConsumer::new(
         submission_poller,
@@ -227,29 +238,37 @@ pub fn run(args: ServeArgs) {
         })
         .expect("failed to spawn WriterConsumer");
 
-    let listen_socket = create_listener(port);
-    let ingress = IngressThread::new(
-        0,
-        listen_socket.into_raw_fd(),
-        producer,
-        allocator,
-        Arc::clone(&registry),
-    );
-
     eprintln!("disrust: ready");
 
-    let io_cpu = args.io_cpu;
-    let io_handle = thread::Builder::new()
-        .name("io-0".into())
-        .spawn(move || {
-            if let Some(cpu) = io_cpu {
-                affinity::pin_current_thread(cpu, "io-0").unwrap_or_else(|e| panic!("{e}"));
-            }
-            ingress.run()
-        })
-        .expect("failed to spawn IO thread");
+    let mut io_handles = Vec::with_capacity(io_threads);
+    for thread_id in 0..io_threads {
+        let listen_socket = create_listener(port);
+        let ingress = IngressThread::new(
+            thread_id as u8,
+            listen_socket.into_raw_fd(),
+            producer.clone(),
+            allocator,
+            Arc::clone(&publish_gate),
+            Arc::clone(&registry),
+        );
+        let io_cpu = args.io_cpu.map(|base| base + thread_id);
+        let thread_name = format!("io-{thread_id}");
+        let handle = thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                if let Some(cpu) = io_cpu {
+                    affinity::pin_current_thread(cpu, &thread_name)
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+                ingress.run()
+            })
+            .expect("failed to spawn IO thread");
+        io_handles.push(handle);
+    }
 
-    let _ = io_handle.join();
+    for handle in io_handles {
+        let _ = handle.join();
+    }
     let _ = sub_handle.join();
     let _ = comp_handle.join();
     let _ = writer_handle.join();

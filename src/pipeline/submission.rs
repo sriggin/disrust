@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use disruptor::{EventGuard, EventPoller, Polling, SingleProducerBarrier};
+use disruptor::{EventGuard, EventPoller, MultiProducerBarrier, Polling};
 
 use crate::buffer_pool::PoolSlice;
 use crate::clock::elapsed_since_ns;
@@ -30,7 +30,7 @@ enum BatchStopReason {
 }
 
 pub struct SubmissionConsumer {
-    poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
+    poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
     sessions: Vec<InferenceSession>,
     /// Round-robin session index.
     session_cursor: usize,
@@ -47,7 +47,7 @@ unsafe impl Send for SubmissionConsumer {}
 
 impl SubmissionConsumer {
     pub fn new(
-        poller: EventPoller<InferenceEvent, SingleProducerBarrier>,
+        poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
         sessions: Vec<InferenceSession>,
         batch_queue: Arc<BatchQueue>,
         max_batch_slots: usize,
@@ -154,7 +154,7 @@ fn idle_wait(idle_loops: &mut u32) {
 }
 
 fn drain_visible_events(
-    poller: &mut EventPoller<InferenceEvent, SingleProducerBarrier>,
+    poller: &mut EventPoller<InferenceEvent, MultiProducerBarrier>,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
 ) -> Result<(), Polling> {
@@ -170,7 +170,7 @@ fn drain_visible_events(
 }
 
 fn drain_guard(
-    guard: &mut EventGuard<'_, InferenceEvent, SingleProducerBarrier>,
+    guard: &mut EventGuard<'_, InferenceEvent, MultiProducerBarrier>,
     backlog: &mut VecDeque<PendingSlot>,
 ) {
     for event in &mut *guard {
@@ -256,11 +256,11 @@ fn build_batch_entry(
 }
 
 fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> usize {
+    metrics::inc_session_waits();
     loop {
         if let Some(idx) = try_reserve_session(sessions, session_cursor) {
             return idx;
         }
-        metrics::inc_session_wait_loops();
         std::hint::spin_loop();
     }
 }

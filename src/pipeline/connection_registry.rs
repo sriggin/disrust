@@ -4,8 +4,8 @@ use std::sync::Mutex;
 
 use crate::clock::elapsed_since_ns;
 use crate::config::{SLAB_CAPACITY, WRITE_BUF_SIZE};
+use crate::connection_id::{ConnectionRef, MAX_GENERATION};
 use crate::metrics;
-use crate::pipeline::ready_queue::ConnectionRef;
 
 const MAX_IOVECS_PER_WRITE: usize = 64;
 
@@ -41,7 +41,7 @@ impl ResponseFrame {
 }
 
 struct ConnectionWriteState {
-    generation: u32,
+    generation: u16,
     fd: RawFd,
     read_closed: bool,
     write_closed: bool,
@@ -78,8 +78,12 @@ impl ConnectionWriteState {
         }
     }
 
-    fn open(&mut self, fd: RawFd) -> u32 {
-        self.generation = self.generation.wrapping_add(1).max(1);
+    fn open(&mut self, fd: RawFd) -> u16 {
+        self.generation = if self.generation >= MAX_GENERATION {
+            1
+        } else {
+            self.generation + 1
+        };
         self.fd = fd;
         self.read_closed = false;
         self.write_closed = false;
@@ -94,8 +98,8 @@ impl ConnectionWriteState {
         self.generation
     }
 
-    fn matches(&self, generation: u32) -> bool {
-        !self.retired && self.generation == generation
+    fn matches(&self, conn: ConnectionRef) -> bool {
+        !self.retired && self.generation == conn.generation()
     }
 
     fn maybe_retire(&mut self) {
@@ -128,39 +132,55 @@ struct Slot {
 
 pub struct ConnectionRegistry {
     slots: Box<[Slot]>,
+    shard_capacity: usize,
 }
 
 impl ConnectionRegistry {
-    pub fn new(capacity: usize) -> Self {
-        let slots = (0..capacity)
+    pub fn new(shard_count: usize, shard_capacity: usize) -> Self {
+        let slots = (0..(shard_count * shard_capacity))
             .map(|_| Slot {
                 state: Mutex::new(ConnectionWriteState::new()),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { slots }
+        Self {
+            slots,
+            shard_capacity,
+        }
     }
 
-    pub fn open(&self, conn_id: u16, fd: RawFd) -> u32 {
-        let mut state = self.slots[conn_id as usize].state.lock().unwrap();
+    fn slot_index(&self, conn: ConnectionRef) -> usize {
+        conn.shard_id() as usize * self.shard_capacity + conn.conn_id as usize
+    }
+
+    fn slot_index_parts(&self, shard_id: u8, conn_id: u16) -> usize {
+        shard_id as usize * self.shard_capacity + conn_id as usize
+    }
+
+    pub fn open(&self, shard_id: u8, conn_id: u16, fd: RawFd) -> ConnectionRef {
+        let mut state = self.slots[self.slot_index_parts(shard_id, conn_id)]
+            .state
+            .lock()
+            .unwrap();
         assert!(
             state.retired,
-            "connection slot {} reopened before retirement",
-            conn_id
+            "connection slot {}:{} reopened before retirement",
+            shard_id, conn_id
         );
-        state.open(fd)
+        let generation = state.open(fd);
+        ConnectionRef::new(shard_id, conn_id, generation)
     }
 
-    pub fn update_published_seq_end(&self, conn_id: u16, generation: u32, published_seq_end: u64) {
-        let mut state = self.slots[conn_id as usize].state.lock().unwrap();
-        if state.matches(generation) {
+    pub fn update_published_seq_end(&self, conn: ConnectionRef, published_seq_end: u64) {
+        let mut state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if state.matches(conn) {
             state.published_seq_end = published_seq_end.max(state.published_seq_end);
         }
     }
 
-    pub fn mark_read_closed(&self, conn_id: u16, generation: u32, published_seq_end: u64) {
-        let mut state = self.slots[conn_id as usize].state.lock().unwrap();
-        if !state.matches(generation) {
+    pub fn mark_read_closed(&self, conn: ConnectionRef, published_seq_end: u64) {
+        let mut state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if !state.matches(conn) {
             return;
         }
         state.read_closed = true;
@@ -168,9 +188,9 @@ impl ConnectionRegistry {
         state.maybe_retire();
     }
 
-    pub fn is_retired(&self, conn_id: u16, generation: u32) -> bool {
-        let state = self.slots[conn_id as usize].state.lock().unwrap();
-        state.generation == generation && state.retired
+    pub fn is_retired(&self, conn: ConnectionRef) -> bool {
+        let state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        state.generation == conn.generation() && state.retired
     }
 
     pub fn enqueue_response(
@@ -180,8 +200,8 @@ impl ConnectionRegistry {
         published_at_ns: u64,
         bytes: &[u8],
     ) -> bool {
-        let mut state = self.slots[conn.conn_id as usize].state.lock().unwrap();
-        if !state.matches(conn.generation) || state.write_closed {
+        let mut state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if !state.matches(conn) || state.write_closed {
             return false;
         }
         state.queue.push_back(Box::new(ResponseFrame::new(
@@ -198,8 +218,8 @@ impl ConnectionRegistry {
     }
 
     pub fn take_flush(&self, conn: ConnectionRef) -> Option<FlushSubmission> {
-        let mut state = self.slots[conn.conn_id as usize].state.lock().unwrap();
-        if !state.matches(conn.generation) {
+        let mut state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if !state.matches(conn) {
             return None;
         }
 
@@ -249,8 +269,8 @@ impl ConnectionRegistry {
     }
 
     pub fn handle_write_result(&self, conn: ConnectionRef, result: i32) -> WriteResult {
-        let mut state = self.slots[conn.conn_id as usize].state.lock().unwrap();
-        if !state.matches(conn.generation) {
+        let mut state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if !state.matches(conn) {
             return WriteResult::Stale;
         }
         if !state.write_inflight {
@@ -303,8 +323,8 @@ impl ConnectionRegistry {
     }
 
     pub fn current_fd(&self, conn: ConnectionRef) -> Option<RawFd> {
-        let state = self.slots[conn.conn_id as usize].state.lock().unwrap();
-        if state.matches(conn.generation) && !state.retired {
+        let state = self.slots[self.slot_index(conn)].state.lock().unwrap();
+        if state.matches(conn) && !state.retired {
             Some(state.fd)
         } else {
             None
@@ -333,63 +353,49 @@ pub enum WriteResult {
 }
 
 pub fn encode_user_data(conn: ConnectionRef) -> u64 {
-    ((conn.generation as u64) << 16) | conn.conn_id as u64
+    conn.as_u32() as u64
 }
 
 pub fn decode_user_data(user_data: u64) -> ConnectionRef {
-    ConnectionRef {
-        conn_id: user_data as u16,
-        generation: (user_data >> 16) as u32,
-    }
+    ConnectionRef::from_u32(user_data as u32)
 }
 
 impl Default for ConnectionRegistry {
     fn default() -> Self {
-        Self::new(SLAB_CAPACITY)
+        Self::new(1, SLAB_CAPACITY)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ConnectionRegistry, WriteResult, decode_user_data, encode_user_data};
-    use crate::pipeline::ready_queue::ConnectionRef;
+    use crate::connection_id::ConnectionRef;
 
     #[test]
     fn user_data_round_trip() {
-        let conn = ConnectionRef {
-            conn_id: 17,
-            generation: 0xdead_beef,
-        };
+        let conn = ConnectionRef::new(3, 17, 0x0bee);
         assert_eq!(decode_user_data(encode_user_data(conn)), conn);
     }
 
     #[test]
     fn retires_connection_after_read_close_and_write_completion() {
-        let registry = ConnectionRegistry::new(4);
-        let generation = registry.open(1, 42);
-        let conn = ConnectionRef {
-            conn_id: 1,
-            generation,
-        };
+        let registry = ConnectionRegistry::new(1, 4);
+        let conn = registry.open(0, 1, 42);
         assert!(registry.enqueue_response(conn, 0, 123, &[1, 2, 3]));
         let flush = registry.take_flush(conn).expect("flush");
         assert_eq!(flush.fd, 42);
-        registry.mark_read_closed(1, generation, 1);
+        registry.mark_read_closed(conn, 1);
         match registry.handle_write_result(conn, 3) {
             WriteResult::Completed => {}
             _ => panic!("expected completed"),
         }
-        assert!(registry.is_retired(1, generation));
+        assert!(registry.is_retired(conn));
     }
 
     #[test]
     fn partial_write_requires_resubmit() {
-        let registry = ConnectionRegistry::new(4);
-        let generation = registry.open(2, 77);
-        let conn = ConnectionRef {
-            conn_id: 2,
-            generation,
-        };
+        let registry = ConnectionRegistry::new(1, 4);
+        let conn = registry.open(0, 2, 77);
         assert!(registry.enqueue_response(conn, 0, 1, &[1, 2, 3, 4]));
         let _ = registry.take_flush(conn).expect("flush");
         match registry.handle_write_result(conn, 2) {
@@ -408,12 +414,8 @@ mod tests {
 
     #[test]
     fn completion_of_inflight_write_requeues_later_response() {
-        let registry = ConnectionRegistry::new(4);
-        let generation = registry.open(3, 88);
-        let conn = ConnectionRef {
-            conn_id: 3,
-            generation,
-        };
+        let registry = ConnectionRegistry::new(1, 4);
+        let conn = registry.open(0, 3, 88);
 
         assert!(registry.enqueue_response(conn, 0, 1, &[1, 2, 3, 4]));
         let _ = registry.take_flush(conn).expect("initial flush");
@@ -441,15 +443,26 @@ mod tests {
 
     #[test]
     fn stale_generation_is_rejected() {
-        let registry = ConnectionRegistry::new(2);
-        let generation = registry.open(0, 10);
-        let conn = ConnectionRef {
-            conn_id: 0,
-            generation,
-        };
-        registry.mark_read_closed(0, generation, 0);
-        let next_generation = registry.open(0, 11);
-        assert_ne!(generation, next_generation);
+        let registry = ConnectionRegistry::new(1, 2);
+        let conn = registry.open(0, 0, 10);
+        registry.mark_read_closed(conn, 0);
+        let next_conn = registry.open(0, 0, 11);
+        assert_ne!(conn.generation(), next_conn.generation());
         assert!(!registry.enqueue_response(conn, 0, 0, &[1]));
+    }
+
+    #[test]
+    fn shard_identity_keeps_same_conn_id_slots_independent() {
+        let registry = ConnectionRegistry::new(2, 2);
+        let conn0 = registry.open(0, 1, 10);
+        let conn1 = registry.open(1, 1, 11);
+
+        assert!(registry.enqueue_response(conn0, 0, 1, &[1]));
+        assert!(registry.enqueue_response(conn1, 0, 1, &[2]));
+
+        let flush0 = registry.take_flush(conn0).expect("flush0");
+        let flush1 = registry.take_flush(conn1).expect("flush1");
+        assert_eq!(flush0.fd, 10);
+        assert_eq!(flush1.fd, 11);
     }
 }

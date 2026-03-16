@@ -2,10 +2,11 @@
 //!
 //! Extracted so integration tests and benchmarks can drive the flow without io_uring.
 
-use disruptor::{Producer, RingBufferFull, SingleConsumerBarrier, SingleProducer};
+use disruptor::{Producer, RingBufferFull};
 
 use crate::buffer_pool::{AllocError, PoolAllocator};
 use crate::clock::monotonic_now_ns;
+use crate::connection_id::ConnectionRef;
 use crate::constants::FEATURE_DIM;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
@@ -39,11 +40,9 @@ pub struct ProcessRequestOutcome {
 /// Returns `Err` only on a parse error; caller should close the connection.
 pub fn process_requests_from_buffer(
     buf: &[u8],
-    producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    producer: &mut impl Producer<InferenceEvent>,
     allocator: &mut PoolAllocator,
-    conn_id: u16,
-    generation: u32,
-    thread_id: u8,
+    conn: ConnectionRef,
     request_seq: &mut u64,
 ) -> Result<ProcessRequestOutcome, ProcessRequestError> {
     let mut consumed = 0;
@@ -75,9 +74,7 @@ pub fn process_requests_from_buffer(
                         }
                     };
                     protocol::copy_features(feature_bytes, pool_slice.as_mut_slice(), num_vectors);
-                    slot.io_thread_id = thread_id;
-                    slot.conn_id = conn_id;
-                    slot.generation = generation;
+                    slot.conn = conn;
                     slot.request_seq = seq;
                     slot.num_vectors = num_vectors;
                     slot.published_at_ns = monotonic_now_ns();

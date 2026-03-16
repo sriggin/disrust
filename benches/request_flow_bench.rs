@@ -5,6 +5,7 @@ use std::hint::black_box;
 use disruptor::{BusySpin, build_single_producer};
 
 use disrust::buffer_pool::{BufferPool, set_factory_pool};
+use disrust::connection_id::ConnectionRef;
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::request_flow;
 use disrust::ring_types::InferenceEvent;
@@ -31,8 +32,7 @@ fn main() {
     };
     let full_buf = single_request.repeat(REQUESTS_PER_BATCH);
 
-    let conn_id = 0u16;
-    let thread_id = 0u8;
+    let conn = ConnectionRef::new(0, 0, 1);
     let mut request_seq = 0u64;
 
     // Warm up
@@ -41,9 +41,7 @@ fn main() {
             &full_buf,
             &mut producer,
             &mut allocator,
-            conn_id,
-            0,
-            thread_id,
+            conn,
             &mut request_seq,
         );
         while let Ok(mut guard) = poller.poll() {
@@ -61,9 +59,7 @@ fn main() {
             black_box(&full_buf),
             &mut producer,
             &mut allocator,
-            conn_id,
-            0,
-            thread_id,
+            conn,
             &mut request_seq,
         );
         let _ = black_box(result);

@@ -4,11 +4,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectionRef {
-    pub conn_id: u16,
-    pub generation: u32,
-}
+pub use crate::connection_id::ConnectionRef;
 
 pub struct ReadyQueue {
     capacity: usize,
@@ -74,28 +70,10 @@ mod tests {
     #[test]
     fn preserves_fifo_order() {
         let queue = ReadyQueue::new(4);
-        queue.push(ConnectionRef {
-            conn_id: 1,
-            generation: 11,
-        });
-        queue.push(ConnectionRef {
-            conn_id: 2,
-            generation: 22,
-        });
-        assert_eq!(
-            queue.pop(),
-            Some(ConnectionRef {
-                conn_id: 1,
-                generation: 11,
-            })
-        );
-        assert_eq!(
-            queue.pop(),
-            Some(ConnectionRef {
-                conn_id: 2,
-                generation: 22,
-            })
-        );
+        queue.push(ConnectionRef::new(0, 1, 11));
+        queue.push(ConnectionRef::new(1, 2, 22));
+        assert_eq!(queue.pop(), Some(ConnectionRef::new(0, 1, 11)));
+        assert_eq!(queue.pop(), Some(ConnectionRef::new(1, 2, 22)));
         assert_eq!(queue.pop(), None);
     }
 }

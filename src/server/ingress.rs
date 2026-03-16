@@ -4,14 +4,15 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use disruptor::{SingleConsumerBarrier, SingleProducer};
+use disruptor::Producer;
 use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
 use crate::buffer_pool::PoolAllocator;
 use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY};
+use crate::connection_id::ConnectionRef;
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::request_flow;
@@ -63,7 +64,7 @@ impl IoUring {
 
 struct Connection {
     fd: RawFd,
-    generation: u32,
+    conn: ConnectionRef,
     read_buf: Box<[u8; READ_BUF_SIZE]>,
     read_len: usize,
     next_request_seq: u64,
@@ -73,10 +74,10 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(fd: RawFd, generation: u32) -> Self {
+    fn new(fd: RawFd, conn: ConnectionRef) -> Self {
         Self {
             fd,
-            generation,
+            conn,
             read_buf: Box::new([0u8; READ_BUF_SIZE]),
             read_len: 0,
             next_request_seq: 0,
@@ -94,20 +95,25 @@ impl Connection {
     }
 }
 
-pub struct IngressThread {
+pub struct IngressThread<P> {
     thread_id: u8,
     listen_fd: RawFd,
-    producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    producer: P,
     allocator: PoolAllocator,
+    publish_gate: Arc<Mutex<()>>,
     registry: Arc<ConnectionRegistry>,
 }
 
-impl IngressThread {
+impl<P> IngressThread<P>
+where
+    P: Producer<InferenceEvent>,
+{
     pub fn new(
         thread_id: u8,
         listen_fd: RawFd,
-        producer: SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+        producer: P,
         allocator: PoolAllocator,
+        publish_gate: Arc<Mutex<()>>,
         registry: Arc<ConnectionRegistry>,
     ) -> Self {
         Self {
@@ -115,6 +121,7 @@ impl IngressThread {
             listen_fd,
             producer,
             allocator,
+            publish_gate,
             registry,
         }
     }
@@ -137,8 +144,8 @@ impl IngressThread {
                     &mut parse_queue,
                     &mut self.producer,
                     &mut self.allocator,
+                    &self.publish_gate,
                     &self.registry,
-                    self.thread_id,
                     key,
                 );
                 continue;
@@ -155,6 +162,7 @@ impl IngressThread {
                         &mut ring,
                         &mut conns,
                         result,
+                        self.thread_id,
                         self.listen_fd,
                         &self.registry,
                     ),
@@ -164,8 +172,8 @@ impl IngressThread {
                         &mut parse_queue,
                         &mut self.producer,
                         &mut self.allocator,
+                        &self.publish_gate,
                         &self.registry,
-                        self.thread_id,
                         key,
                         result,
                     ),
@@ -176,8 +184,7 @@ impl IngressThread {
             let retired: Vec<u16> = conns
                 .iter()
                 .filter_map(|(k, c)| {
-                    (c.read_closed && self.registry.is_retired(k as u16, c.generation))
-                        .then_some(k as u16)
+                    (c.read_closed && self.registry.is_retired(c.conn)).then_some(k as u16)
                 })
                 .collect();
             for key in retired {
@@ -191,6 +198,7 @@ fn handle_accept(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
     result: i32,
+    thread_id: u8,
     listen_fd: RawFd,
     registry: &Arc<ConnectionRegistry>,
 ) {
@@ -201,8 +209,8 @@ fn handle_accept(
         } else {
             let entry = conns.vacant_entry();
             let key = entry.key();
-            let generation = registry.open(key as u16, client_fd);
-            entry.insert(Connection::new(client_fd, generation));
+            let conn = registry.open(thread_id, key as u16, client_fd);
+            entry.insert(Connection::new(client_fd, conn));
             submit_read(ring, conns, key as u16);
         }
     }
@@ -214,10 +222,10 @@ fn handle_read(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
     parse_queue: &mut VecDeque<u16>,
-    producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    producer: &mut impl Producer<InferenceEvent>,
     allocator: &mut PoolAllocator,
+    publish_gate: &Arc<Mutex<()>>,
     registry: &Arc<ConnectionRegistry>,
-    thread_id: u8,
     key: u16,
     result: i32,
 ) {
@@ -230,7 +238,7 @@ fn handle_read(
         if let Some(conn) = conns.get_mut(key_usize) {
             conn.read_inflight = false;
             conn.read_closed = true;
-            registry.mark_read_closed(key, conn.generation, conn.next_request_seq);
+            registry.mark_read_closed(conn.conn, conn.next_request_seq);
         }
         return;
     }
@@ -249,8 +257,8 @@ fn handle_read(
         parse_queue,
         producer,
         allocator,
+        publish_gate,
         registry,
-        thread_id,
         key,
     );
 }
@@ -260,10 +268,10 @@ fn parse_and_maybe_read(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
     parse_queue: &mut VecDeque<u16>,
-    producer: &mut SingleProducer<InferenceEvent, SingleConsumerBarrier>,
+    producer: &mut impl Producer<InferenceEvent>,
     allocator: &mut PoolAllocator,
+    publish_gate: &Arc<Mutex<()>>,
     registry: &Arc<ConnectionRegistry>,
-    thread_id: u8,
     key: u16,
 ) {
     let key_usize = key as usize;
@@ -272,34 +280,37 @@ fn parse_and_maybe_read(
     };
     let buf = &conn.read_buf[..conn.read_len];
 
+    let publish_guard = publish_gate.lock().unwrap();
     match request_flow::process_requests_from_buffer(
         buf,
         producer,
         allocator,
-        key,
-        conn.generation,
-        thread_id,
+        conn.conn,
         &mut conn.next_request_seq,
     ) {
         Ok(outcome) => {
+            drop(publish_guard);
             if outcome.consumed > 0 {
                 conn.read_buf
                     .copy_within(outcome.consumed..conn.read_len, 0);
                 conn.read_len -= outcome.consumed;
             }
             metrics::add_bytes_consumed(outcome.consumed as u64);
-            registry.update_published_seq_end(key, conn.generation, conn.next_request_seq);
+            registry.update_published_seq_end(conn.conn, conn.next_request_seq);
             if outcome.needs_read {
                 submit_read(ring, conns, key);
             }
         }
         Err(e) => {
+            drop(publish_guard);
             eprintln!(
                 "io-{}: request parse error ({:?}), closing conn {}",
-                thread_id, e, key
+                conn.conn.shard_id(),
+                e,
+                key
             );
             conn.read_closed = true;
-            registry.mark_read_closed(key, conn.generation, conn.next_request_seq);
+            registry.mark_read_closed(conn.conn, conn.next_request_seq);
             return;
         }
     }

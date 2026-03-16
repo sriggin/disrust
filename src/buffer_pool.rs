@@ -1,4 +1,4 @@
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -159,13 +159,9 @@ pub struct BufferPool {
 unsafe impl Send for BufferPool {}
 unsafe impl Sync for BufferPool {}
 
-/// Exclusive allocation capability for a `BufferPool`.
-///
-/// This type is intentionally non-`Sync` and non-`Clone` so allocation cannot
-/// be shared concurrently across threads.
+#[derive(Clone, Copy)]
 pub struct PoolAllocator {
     pool: &'static BufferPool,
-    _not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
 impl PoolAllocator {
@@ -228,10 +224,7 @@ impl BufferPool {
 
     /// Create an exclusive allocator capability for this pool.
     pub fn allocator(&'static self) -> PoolAllocator {
-        PoolAllocator {
-            pool: self,
-            _not_sync: std::marker::PhantomData,
-        }
+        PoolAllocator { pool: self }
     }
 
     /// Allocate space for `len` f32 values, returning a mutable slice.
@@ -249,41 +242,44 @@ impl BufferPool {
             });
         }
 
-        // Check if we have space (write cursor can't lap read cursor by more than capacity)
-        let write = self.write_cursor.load(Ordering::Acquire);
-        let read = self.read_cursor.load(Ordering::Acquire);
-        let in_use = write.wrapping_sub(read);
+        let (actual_offset, peak_in_use) = loop {
+            let write = self.write_cursor.load(Ordering::Acquire);
+            let read = self.read_cursor.load(Ordering::Acquire);
+            let in_use = write.wrapping_sub(read);
 
-        if in_use + len > self.capacity {
-            metrics::inc_pool_exhausted();
-            return Err(AllocError::Exhausted {
-                in_use,
-                capacity: self.capacity,
-            });
-        }
-        metrics::update_pool_in_use(in_use + len);
-
-        // Allocate
-        let offset = write % self.capacity;
-        let actual_offset = if offset + len > self.capacity {
-            // Would straddle the end, wrap to 0 only if physical [0, len) is free.
-            // That region is free iff the physical read offset is >= len, i.e. the
-            // consumer has advanced past the first `len` physical slots.
-            // Exception: when in_use == 0, the pool is empty and [0, len) is free.
-            if in_use != 0 && read % self.capacity < len {
+            if in_use + len > self.capacity {
                 metrics::inc_pool_exhausted();
                 return Err(AllocError::Exhausted {
                     in_use,
                     capacity: self.capacity,
                 });
             }
-            self.write_cursor
-                .store(write + (self.capacity - offset) + len, Ordering::Release);
-            0
-        } else {
-            self.write_cursor.store(write + len, Ordering::Release);
-            offset
+
+            let offset = write % self.capacity;
+            let (actual_offset, next_write) = if offset + len > self.capacity {
+                if in_use != 0 && read % self.capacity < len {
+                    metrics::inc_pool_exhausted();
+                    return Err(AllocError::Exhausted {
+                        in_use,
+                        capacity: self.capacity,
+                    });
+                }
+                (0, write + (self.capacity - offset) + len)
+            } else {
+                (offset, write + len)
+            };
+
+            if self
+                .write_cursor
+                .compare_exchange(write, next_write, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break (actual_offset, next_write.wrapping_sub(read));
+            }
+
+            std::hint::spin_loop();
         };
+        metrics::update_pool_in_use(peak_in_use);
 
         let ptr = unsafe { self.data.add(actual_offset) as *mut f32 };
         Ok(PoolSliceMut {
@@ -321,6 +317,7 @@ fn factory_pool() -> &'static BufferPool {
 mod tests {
     use super::*;
     use std::sync::Once;
+    use std::thread;
 
     static INIT_FACTORY_POOL: Once = Once::new();
 
@@ -518,6 +515,50 @@ mod tests {
             drop(s1);
             assert!(alloc.alloc(10).is_ok());
         });
+    }
+
+    #[test]
+    fn concurrent_allocations_preserve_unique_contents() {
+        let boxed = BufferPool::new_boxed(4096);
+        let ptr = Box::into_raw(boxed);
+        struct PoolGuard {
+            ptr: *mut BufferPool,
+        }
+        impl Drop for PoolGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    drop(Box::from_raw(self.ptr));
+                }
+            }
+        }
+        let _guard = PoolGuard { ptr };
+        let pool = unsafe { &*ptr };
+
+        let handles = (0..4)
+            .map(|thread_id| {
+                let mut allocator = pool.allocator();
+                thread::spawn(move || {
+                    let mut out = Vec::new();
+                    for _ in 0..32 {
+                        let mut slice = allocator.alloc(8).expect("alloc failed");
+                        slice.as_mut_slice().fill(thread_id as f32);
+                        out.push(slice.freeze());
+                    }
+                    out
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let all = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("join failed"))
+            .collect::<Vec<_>>();
+
+        for slice in &all {
+            let first = slice.as_slice()[0];
+            assert!(slice.as_slice().iter().all(|&value| value == first));
+        }
+        drop(all);
     }
 
     #[test]

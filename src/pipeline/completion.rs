@@ -11,7 +11,7 @@ use crate::config::WRITE_BUF_SIZE;
 use crate::metrics;
 use crate::pipeline::batch_queue::{BatchEntry, BatchQueue};
 use crate::pipeline::connection_registry::ConnectionRegistry;
-use crate::pipeline::ready_queue::{ConnectionRef, ReadyQueue};
+use crate::pipeline::ready_queue::ReadyQueue;
 use crate::pipeline::session::BatchPoll;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
@@ -60,7 +60,9 @@ impl CompletionConsumer {
                     metrics::idle_timers();
                     self.timers_idle = true;
                 }
-                metrics::inc_completion_queue_empty_spins();
+                if idle_loops == 0 {
+                    metrics::inc_completion_queue_empty_waits();
+                }
                 idle_loops = idle_loops.saturating_add(1);
                 if idle_loops < 64 {
                     std::hint::spin_loop();
@@ -79,14 +81,20 @@ impl CompletionConsumer {
             }
             metrics::record_batch_wait(batch_wait_start.elapsed());
 
-            let mut guard = loop {
-                match self.poller.poll_take(entry.slot_count as u64) {
-                    Ok(guard) => break guard,
-                    Err(Polling::NoEvents) => {
-                        metrics::inc_completion_poll_no_events();
-                        std::hint::spin_loop();
+            let mut guard = {
+                let mut polled = false;
+                loop {
+                    match self.poller.poll_take(entry.slot_count as u64) {
+                        Ok(guard) => break guard,
+                        Err(Polling::NoEvents) => {
+                            if !polled {
+                                metrics::inc_completion_poll_stalls();
+                                polled = true;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        Err(Polling::Shutdown) => return,
                     }
-                    Err(Polling::Shutdown) => return,
                 }
             };
 
@@ -124,10 +132,7 @@ fn process_batch(
         let response = &output[output_offset..output_offset + num_vecs];
         protocol::encode_response(response, &mut wire[..protocol::response_size(num_vecs)]);
 
-        let conn = ConnectionRef {
-            conn_id: event.conn_id,
-            generation: event.generation,
-        };
+        let conn = event.conn;
         let wire_len = protocol::response_size(num_vecs);
         if registry.enqueue_response(
             conn,

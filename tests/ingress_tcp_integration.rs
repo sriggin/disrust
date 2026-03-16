@@ -5,7 +5,7 @@ mod common;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::IntoRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,10 +44,11 @@ fn ingress_thread_accepts_tcp_requests_and_publishes_ring_events() {
     let pool_capacity = GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
     let allocator = pool.allocator();
-    let registry = Arc::new(ConnectionRegistry::new(SLAB_CAPACITY));
+    let publish_gate = Arc::new(Mutex::new(()));
+    let registry = Arc::new(ConnectionRegistry::new(4, SLAB_CAPACITY));
     let (listen_fd, addr) = create_listener();
 
-    let ingress = IngressThread::new(3, listen_fd, producer, allocator, registry);
+    let ingress = IngressThread::new(3, listen_fd, producer, allocator, publish_gate, registry);
     thread::Builder::new()
         .name("ingress-test".into())
         .spawn(move || ingress.run())
@@ -79,9 +80,7 @@ fn ingress_thread_accepts_tcp_requests_and_publishes_ring_events() {
                 Ok(mut guard) => {
                     for ev in &mut guard {
                         out.push((
-                            ev.conn_id,
-                            ev.generation,
-                            ev.io_thread_id,
+                            ev.conn,
                             ev.num_vectors,
                             ev.request_seq,
                             ev.features.as_slice().to_vec(),
@@ -96,17 +95,18 @@ fn ingress_thread_accepts_tcp_requests_and_publishes_ring_events() {
 
     assert_eq!(events.len(), 2, "expected two published events");
 
-    let (conn_id0, generation0, thread_id0, num_vectors0, seq0, features0) = &events[0];
-    let (conn_id1, generation1, thread_id1, num_vectors1, seq1, features1) = &events[1];
+    let (conn0, num_vectors0, seq0, features0) = &events[0];
+    let (conn1, num_vectors1, seq1, features1) = &events[1];
 
-    assert_eq!(*thread_id0, 3);
-    assert_eq!(*thread_id1, 3);
+    assert_eq!(conn0.shard_id(), 3);
+    assert_eq!(conn1.shard_id(), 3);
     assert_eq!(
-        *conn_id0, *conn_id1,
+        conn0.conn_id, conn1.conn_id,
         "same TCP connection should keep same conn_id"
     );
     assert_eq!(
-        *generation0, *generation1,
+        conn0.generation(),
+        conn1.generation(),
         "same TCP connection should keep same generation"
     );
 

@@ -6,8 +6,8 @@
 use crate::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use std::mem::size_of;
 
-/// io_thread_id is u8 in InferenceEvent; do not spawn more than this many IO threads.
-pub const MAX_IO_THREADS: usize = 256;
+/// Packed connection identity reserves 4 bits for ingress shard id.
+pub const MAX_IO_THREADS: usize = 16;
 
 /// Per-connection read buffer size (bytes).
 pub const READ_BUF_SIZE: usize = 65536;

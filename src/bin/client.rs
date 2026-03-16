@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::TcpStream;
 use std::os::fd::{IntoRawFd, RawFd};
-use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,9 @@ enum Command {
 
 #[derive(Args, Clone)]
 struct PipelineArgs {
+    /// Independent client worker threads, each running the full configured shape.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 1)]
     connections: usize,
@@ -69,6 +72,9 @@ struct PipelineArgs {
 
 #[derive(Args, Clone)]
 struct BenchArgs {
+    /// Independent client worker threads, each running the full configured shape.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 4)]
     connections: usize,
@@ -85,6 +91,9 @@ struct BenchArgs {
 
 #[derive(Args, Clone)]
 struct SustainArgs {
+    /// Independent client worker threads, each running the full configured shape.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Number of concurrent connections
     #[arg(short, long, default_value_t = 4)]
     connections: usize,
@@ -133,13 +142,16 @@ impl RequestTemplate {
     }
 }
 
+#[derive(Clone, Copy)]
 enum StopMode {
     FixedCount { requests_per_connection: u64 },
     Duration { warmup: Duration, measure: Duration },
 }
 
+#[derive(Clone)]
 struct Scenario {
     name: &'static str,
+    threads: usize,
     connections: usize,
     window: usize,
     templates: Arc<[RequestTemplate]>,
@@ -152,6 +164,7 @@ impl Scenario {
     fn pipeline(args: PipelineArgs) -> Self {
         Self {
             name: "pipeline",
+            threads: args.threads,
             connections: args.connections,
             window: args.window,
             templates: Arc::from([RequestTemplate::new(args.vectors)]),
@@ -166,6 +179,7 @@ impl Scenario {
     fn bench(args: BenchArgs) -> Self {
         Self {
             name: "bench",
+            threads: args.threads,
             connections: args.connections,
             window: args.window,
             templates: Arc::from([RequestTemplate::new(args.vectors)]),
@@ -180,6 +194,7 @@ impl Scenario {
     fn sustain(args: SustainArgs) -> Self {
         Self {
             name: "sustain",
+            threads: args.threads,
             connections: args.connections,
             window: args.window,
             templates: Arc::from([RequestTemplate::new(args.vectors)]),
@@ -314,27 +329,16 @@ fn decode_user_data(user_data: u64) -> (u64, u32) {
 }
 
 struct RunState {
-    start: Instant,
     warmup_end: Instant,
     measure_end: Instant,
     measurement_started: bool,
 }
 
 impl RunState {
-    fn new(stop_mode: &StopMode) -> Self {
-        let start = Instant::now();
-        let (warmup_end, measure_end) = match stop_mode {
-            StopMode::FixedCount { .. } => (start, start),
-            StopMode::Duration { warmup, measure } => {
-                let warmup_end = start + *warmup;
-                (warmup_end, warmup_end + *measure)
-            }
-        };
-
+    fn from_plan(plan: RunPlan) -> Self {
         Self {
-            start,
-            warmup_end,
-            measure_end,
+            warmup_end: plan.warmup_end,
+            measure_end: plan.measure_end,
             measurement_started: false,
         }
     }
@@ -362,113 +366,42 @@ impl SummaryStats {
     }
 }
 
-enum ReportEvent {
-    StartMeasurement(Instant),
-    Finish {
+#[derive(Clone, Copy)]
+struct RunPlan {
+    start: Instant,
+    warmup_end: Instant,
+    measure_end: Instant,
+}
+
+impl RunPlan {
+    fn new(stop_mode: &StopMode) -> Self {
+        let start = Instant::now();
+        let (warmup_end, measure_end) = match stop_mode {
+            StopMode::FixedCount { .. } => (start, start),
+            StopMode::Duration { warmup, measure } => {
+                let warmup_end = start + *warmup;
+                (warmup_end, warmup_end + *measure)
+            }
+        };
+        Self {
+            start,
+            warmup_end,
+            measure_end,
+        }
+    }
+}
+
+enum WorkerReport {
+    Interval {
+        interval_idx: u64,
+        end: Instant,
+        completions: u64,
+        snapshot: Option<TimerSnapshot>,
+    },
+    Finished {
         end: Instant,
         measured_completions: u64,
     },
-}
-
-struct Reporter {
-    tx: Sender<ReportEvent>,
-    handle: thread::JoinHandle<()>,
-}
-
-impl Reporter {
-    fn spawn(interval_timer: Arc<TimerMetric>, reporter_cpu: Option<usize>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let handle = thread::Builder::new()
-            .name("client-reporter".into())
-            .spawn(move || {
-                if let Some(cpu) = reporter_cpu {
-                    affinity::pin_current_thread(cpu, "client-reporter")
-                        .unwrap_or_else(|e| panic!("{e}"));
-                }
-                let mut measurement_start: Option<Instant> = None;
-                let mut last_interval_start: Option<Instant> = None;
-                let mut interval_completions: u64 = 0;
-                let mut total_hist = hdrhistogram::Histogram::new_with_bounds(1, 60_000_000_000, 3)
-                    .expect("failed to create cumulative client histogram");
-
-                loop {
-                    let timeout = match last_interval_start {
-                        Some(last) => {
-                            let elapsed = last.elapsed();
-                            if elapsed >= Duration::from_secs(1) {
-                                Duration::ZERO
-                            } else {
-                                Duration::from_secs(1) - elapsed
-                            }
-                        }
-                        None => Duration::from_secs(3600),
-                    };
-
-                    match rx.recv_timeout(timeout) {
-                        Ok(ReportEvent::StartMeasurement(start)) => {
-                            measurement_start = Some(start);
-                            last_interval_start = Some(start);
-                            let _ = interval_timer.snapshot_and_reset();
-                            total_hist.reset();
-                            interval_completions = 0;
-                        }
-                        Ok(ReportEvent::Finish {
-                            end,
-                            measured_completions,
-                        }) => {
-                            if let Some(last) = last_interval_start {
-                                let snapshot = interval_timer.snapshot();
-                                if let Some(ref snap) = snapshot {
-                                    interval_completions = snap.count();
-                                    snap.merge_into(&mut total_hist);
-                                }
-                                print_interval(snapshot, interval_completions, last, end);
-                            }
-                            print_summary(
-                                if total_hist.is_empty() {
-                                    None
-                                } else {
-                                    Some(TimerSnapshot::from_histogram(total_hist))
-                                },
-                                measurement_start,
-                                end,
-                                measured_completions,
-                            );
-                            break;
-                        }
-                        Err(RecvTimeoutError::Timeout) => {
-                            if let Some(last) = last_interval_start {
-                                let now = Instant::now();
-                                let snapshot = interval_timer.snapshot_and_reset();
-                                if let Some(ref snap) = snapshot {
-                                    interval_completions = snap.count();
-                                    snap.merge_into(&mut total_hist);
-                                }
-                                print_interval(snapshot, interval_completions, last, now);
-                                interval_completions = 0;
-                                last_interval_start = Some(now);
-                            }
-                        }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            })
-            .expect("failed to spawn reporter thread");
-
-        Self { tx, handle }
-    }
-
-    fn start_measurement(&self, now: Instant) {
-        let _ = self.tx.send(ReportEvent::StartMeasurement(now));
-    }
-
-    fn finish(self, end: Instant, measured_completions: u64) {
-        let _ = self.tx.send(ReportEvent::Finish {
-            end,
-            measured_completions,
-        });
-        self.handle.join().expect("reporter thread panicked");
-    }
 }
 
 fn print_interval(snapshot: Option<TimerSnapshot>, completions: u64, start: Instant, end: Instant) {
@@ -521,6 +454,90 @@ fn print_summary(
     eprintln!("  p99.9   {:.1}us", snapshot.p999_us());
     eprintln!("  p99.99  {:.1}us", snapshot.p9999_us());
     eprintln!("  max     {:.1}us", snapshot.max_us());
+}
+
+fn aggregate_snapshot(snapshots: Vec<Option<TimerSnapshot>>) -> Option<TimerSnapshot> {
+    let mut total_hist = hdrhistogram::Histogram::new_with_bounds(1, 60_000_000_000, 3)
+        .expect("failed to create aggregate client histogram");
+    let mut saw_data = false;
+    for snapshot in snapshots.into_iter().flatten() {
+        snapshot.merge_into(&mut total_hist);
+        saw_data = true;
+    }
+    saw_data.then(|| TimerSnapshot::from_histogram(total_hist))
+}
+
+fn report_worker_intervals(
+    rx: mpsc::Receiver<WorkerReport>,
+    worker_count: usize,
+    measurement_start: Instant,
+) -> (Option<TimerSnapshot>, Instant, u64) {
+    let mut total_hist = hdrhistogram::Histogram::new_with_bounds(1, 60_000_000_000, 3)
+        .expect("failed to create cumulative client histogram");
+    let mut interval_start = measurement_start;
+    let mut next_interval_idx = 0u64;
+    let mut pending = std::collections::BTreeMap::<u64, Vec<WorkerReport>>::new();
+    let mut finished = 0usize;
+    let mut measured_completions = 0u64;
+    let mut end = measurement_start;
+
+    while finished < worker_count {
+        let report = rx
+            .recv()
+            .expect("worker report channel closed unexpectedly");
+        let key = match report {
+            WorkerReport::Interval { interval_idx, .. } => interval_idx,
+            WorkerReport::Finished {
+                end: worker_end,
+                measured_completions: worker_completions,
+                ..
+            } => {
+                finished += 1;
+                measured_completions += worker_completions;
+                end = end.max(worker_end);
+                continue;
+            }
+        };
+        pending.entry(key).or_default().push(report);
+
+        while let Some(reports) = pending.remove(&next_interval_idx) {
+            if reports.len() < worker_count {
+                pending.insert(next_interval_idx, reports);
+                break;
+            }
+
+            let mut completions = 0u64;
+            let mut interval_end = interval_start;
+            let mut snapshots = Vec::with_capacity(worker_count);
+            for report in reports {
+                if let WorkerReport::Interval {
+                    interval_idx: _,
+                    end: worker_end,
+                    completions: worker_completions,
+                    snapshot,
+                } = report
+                {
+                    completions += worker_completions;
+                    interval_end = interval_end.max(worker_end);
+                    snapshots.push(snapshot);
+                }
+            }
+            let snapshot = aggregate_snapshot(snapshots);
+            if let Some(ref snap) = snapshot {
+                snap.merge_into(&mut total_hist);
+            }
+            print_interval(snapshot, completions, interval_start, interval_end);
+            interval_start = interval_end;
+            next_interval_idx += 1;
+        }
+    }
+
+    let final_snapshot = if total_hist.is_empty() {
+        None
+    } else {
+        Some(TimerSnapshot::from_histogram(total_hist))
+    };
+    (final_snapshot, end, measured_completions)
 }
 
 fn create_connection(addr: &str) -> io::Result<RawFd> {
@@ -686,82 +703,46 @@ fn handle_read_cqe(
     process_read_buffer(conn, scenario, stats, run, now, interval_latency_recorder);
 }
 
-fn run_scenario(
-    addr: &str,
+fn run_worker(
+    worker_id: usize,
+    addr: String,
     scenario: Scenario,
+    run_plan: RunPlan,
     event_loop_cpu: Option<usize>,
-    reporter_cpu: Option<usize>,
-) {
+    start_barrier: Arc<Barrier>,
+    report_tx: Option<Sender<WorkerReport>>,
+) -> WorkerOutcome {
     assert!(scenario.connections > 0, "connections must be > 0");
     assert!(scenario.window > 0, "window must be > 0");
 
     if let Some(cpu) = event_loop_cpu {
-        affinity::pin_current_thread(cpu, "client-main").unwrap_or_else(|e| panic!("{e}"));
+        let thread_name = format!("client-worker-{worker_id}");
+        affinity::pin_current_thread(cpu, &thread_name).unwrap_or_else(|e| panic!("{e}"));
     }
 
+    start_barrier.wait();
     let sq_entries = (scenario.connections * scenario.window * 2).clamp(256, 16384) as u32;
     let mut ring = IoUring::new(sq_entries).expect("io_uring creation failed");
     let mut conns: Slab<Connection> = Slab::with_capacity(scenario.connections);
     let mut cqe_buf: Vec<(u64, i32)> = Vec::with_capacity(sq_entries as usize);
     let mut stats = SummaryStats::default();
-    let mut run = RunState::new(&scenario.stop_mode);
-    let latency_interval_timer = scenario
-        .collect_latency
-        .then(|| Arc::new(TimerMetric::new()));
-    let reporter = latency_interval_timer
-        .as_ref()
-        .map(|interval| Reporter::spawn(Arc::clone(interval), reporter_cpu));
-    let mut latency_interval_recorder = latency_interval_timer
-        .as_ref()
-        .map(|timer| timer.recorder());
+    let mut run = RunState::from_plan(run_plan);
+    let latency_interval_timer = scenario.collect_latency.then(TimerMetric::new);
+    let mut latency_interval_recorder = latency_interval_timer.as_ref().map(TimerMetric::recorder);
+    let mut next_interval_idx = 0u64;
+    let mut last_interval_start = run.warmup_end;
 
     for _ in 0..scenario.connections {
-        let fd = create_connection(addr).expect("failed to connect");
+        let fd = create_connection(&addr).expect("failed to connect");
         let entry = conns.vacant_entry();
         entry.insert(Connection::new(fd, scenario.window));
-    }
-
-    if matches!(scenario.stop_mode, StopMode::Duration { warmup, .. } if warmup > Duration::ZERO) {
-        eprintln!(
-            "{}: {} connections, window={}, {} vector(s)/req, warmup={}s, duration={}s -> {}",
-            scenario.name,
-            scenario.connections,
-            scenario.window,
-            scenario.templates[0].num_vectors,
-            run.warmup_end.duration_since(run.start).as_secs(),
-            run.measure_end.duration_since(run.warmup_end).as_secs(),
-            addr
-        );
-        eprintln!(
-            "{:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}",
-            "qps", "p50", "p95", "p99", "p99.9", "n"
-        );
-    } else {
-        eprintln!(
-            "{}: {} connections, window={}, {} vector(s)/req -> {}",
-            scenario.name,
-            scenario.connections,
-            scenario.window,
-            scenario.templates[0].num_vectors,
-            addr
-        );
-    }
-
-    if scenario.collect_latency
-        && !matches!(scenario.stop_mode, StopMode::Duration { warmup, .. } if warmup > Duration::ZERO)
-        && let Some(reporter) = reporter.as_ref()
-    {
-        reporter.start_measurement(run.start);
-        run.measurement_started = true;
     }
 
     loop {
         let now = Instant::now();
         if scenario.collect_latency && !run.measurement_started && now >= run.warmup_end {
-            if let Some(reporter) = reporter.as_ref() {
-                reporter.start_measurement(now);
-            }
             run.measurement_started = true;
+            last_interval_start = now;
         }
         for (key, conn) in &mut conns {
             submit_writes(&mut ring, conn, key as u32, &scenario, &run, now);
@@ -803,15 +784,159 @@ fn run_scenario(
                 _ => panic!("unknown op {}", op),
             }
         }
+
+        if scenario.collect_latency
+            && run.measurement_started
+            && let Some(tx) = report_tx.as_ref()
+        {
+            let now = Instant::now();
+            while now.duration_since(last_interval_start) >= Duration::from_secs(1) {
+                let interval_end = last_interval_start + Duration::from_secs(1);
+                let snapshot = latency_interval_timer
+                    .as_ref()
+                    .and_then(TimerMetric::snapshot_and_reset);
+                let completions = snapshot.as_ref().map_or(0, TimerSnapshot::count);
+                tx.send(WorkerReport::Interval {
+                    interval_idx: next_interval_idx,
+                    end: interval_end,
+                    completions,
+                    snapshot,
+                })
+                .expect("failed to send worker interval report");
+                last_interval_start = interval_end;
+                next_interval_idx += 1;
+            }
+        }
     }
 
     let end = Instant::now();
+    drop(latency_interval_recorder);
+
+    if scenario.collect_latency
+        && run.measurement_started
+        && let Some(tx) = report_tx.as_ref()
+    {
+        let snapshot = latency_interval_timer
+            .as_ref()
+            .and_then(TimerMetric::snapshot_and_reset);
+        let completions = snapshot.as_ref().map_or(0, TimerSnapshot::count);
+        tx.send(WorkerReport::Interval {
+            interval_idx: next_interval_idx,
+            end,
+            completions,
+            snapshot,
+        })
+        .expect("failed to send final worker interval report");
+        tx.send(WorkerReport::Finished {
+            end,
+            measured_completions: stats.measured_completions,
+        })
+        .expect("failed to send worker finish report");
+    }
+
+    let total_completed = conns.iter().map(|(_, conn)| conn.completed_total).sum();
+    WorkerOutcome {
+        end,
+        measured_completions: stats.measured_completions,
+        total_completed,
+    }
+}
+
+struct WorkerOutcome {
+    end: Instant,
+    measured_completions: u64,
+    total_completed: u64,
+}
+
+fn run_scenario(
+    addr: &str,
+    scenario: Scenario,
+    event_loop_cpu: Option<usize>,
+    _reporter_cpu: Option<usize>,
+) {
+    assert!(scenario.threads > 0, "threads must be > 0");
+    let run_plan = RunPlan::new(&scenario.stop_mode);
+    let start_barrier = Arc::new(Barrier::new(scenario.threads));
+
+    if matches!(scenario.stop_mode, StopMode::Duration { warmup, .. } if warmup > Duration::ZERO) {
+        eprintln!(
+            "{}: {} thread(s) x {} connections, window={}, {} vector(s)/req, warmup={}s, duration={}s -> {}",
+            scenario.name,
+            scenario.threads,
+            scenario.connections,
+            scenario.window,
+            scenario.templates[0].num_vectors,
+            run_plan.warmup_end.duration_since(run_plan.start).as_secs(),
+            run_plan
+                .measure_end
+                .duration_since(run_plan.warmup_end)
+                .as_secs(),
+            addr
+        );
+        eprintln!(
+            "{:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}",
+            "qps", "p50", "p95", "p99", "p99.9", "n"
+        );
+    } else {
+        eprintln!(
+            "{}: {} thread(s) x {} connections, window={}, {} vector(s)/req -> {}",
+            scenario.name,
+            scenario.threads,
+            scenario.connections,
+            scenario.window,
+            scenario.templates[0].num_vectors,
+            addr
+        );
+    }
+
+    let report_rx = if scenario.collect_latency {
+        let (tx, rx) = mpsc::channel();
+        Some((tx, rx))
+    } else {
+        None
+    };
+
+    let handles = (0..scenario.threads)
+        .map(|worker_id| {
+            let worker_addr = addr.to_string();
+            let worker_scenario = scenario.clone();
+            let worker_plan = run_plan;
+            let worker_cpu = event_loop_cpu.map(|base| base + worker_id);
+            let worker_barrier = Arc::clone(&start_barrier);
+            let report_tx = report_rx.as_ref().map(|(tx, _)| tx.clone());
+            thread::Builder::new()
+                .name(format!("client-worker-{worker_id}"))
+                .spawn(move || {
+                    run_worker(
+                        worker_id,
+                        worker_addr,
+                        worker_scenario,
+                        worker_plan,
+                        worker_cpu,
+                        worker_barrier,
+                        report_tx,
+                    )
+                })
+                .expect("failed to spawn client worker")
+        })
+        .collect::<Vec<_>>();
+
     match scenario.stop_mode {
         StopMode::FixedCount {
             requests_per_connection,
         } => {
-            let total = scenario.connections as u64 * requests_per_connection;
-            let elapsed = end.duration_since(run.start);
+            let outcomes = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("worker thread panicked"))
+                .collect::<Vec<_>>();
+            let total =
+                scenario.threads as u64 * scenario.connections as u64 * requests_per_connection;
+            let end = outcomes
+                .iter()
+                .map(|outcome| outcome.end)
+                .max()
+                .unwrap_or(run_plan.start);
+            let elapsed = end.duration_since(run_plan.start);
             let qps = total as f64 / elapsed.as_secs_f64();
             eprintln!(
                 "{}: {} requests in {:.2}s = {:.0} QPS",
@@ -822,10 +947,19 @@ fn run_scenario(
             );
         }
         StopMode::Duration { .. } => {
-            drop(latency_interval_recorder);
-            if let Some(reporter) = reporter {
-                reporter.finish(end, stats.measured_completions);
+            let (_, rx) = report_rx.expect("latency reporting channel missing");
+            let (snapshot, end, measured_completions) =
+                report_worker_intervals(rx, scenario.threads, run_plan.warmup_end);
+            for handle in handles {
+                let outcome = handle.join().expect("worker thread panicked");
+                debug_assert!(outcome.total_completed >= outcome.measured_completions);
             }
+            print_summary(
+                snapshot,
+                Some(run_plan.warmup_end),
+                end,
+                measured_completions,
+            );
         }
     }
 }
@@ -837,6 +971,7 @@ fn smoke_test(addr: &str) {
         addr,
         Scenario {
             name: "smoke-1",
+            threads: 1,
             connections: 1,
             window: 1,
             templates: Arc::from([RequestTemplate::new(1)]),
@@ -855,6 +990,7 @@ fn smoke_test(addr: &str) {
         addr,
         Scenario {
             name: "smoke-4",
+            threads: 1,
             connections: 1,
             window: 1,
             templates: Arc::from([RequestTemplate::new(4)]),

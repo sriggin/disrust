@@ -5,6 +5,7 @@ mod common;
 use disruptor::{BusySpin, build_single_producer};
 
 use disrust::buffer_pool::BufferPool;
+use disrust::connection_id::ConnectionRef;
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::request_flow;
 use disrust::ring_types::InferenceEvent;
@@ -22,9 +23,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
     let pool = BufferPool::leak_new(pool_capacity);
     let mut allocator = pool.allocator();
 
-    let conn_id = 1u16;
-    let generation = 7u32;
-    let thread_id = 0u8;
+    let conn = ConnectionRef::new(0, 1, 7);
     let mut request_seq = 0u64;
 
     // One request: 2 vectors
@@ -38,9 +37,7 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
         &buf,
         &mut producer,
         &mut allocator,
-        conn_id,
-        generation,
-        thread_id,
+        conn,
         &mut request_seq,
     );
 
@@ -58,9 +55,10 @@ fn request_flow_processes_one_request_and_consumer_sees_event() {
             let events: Vec<_> = (&mut guard).collect();
             assert_eq!(events.len(), 1);
             let ev = &events[0];
-            assert_eq!(ev.conn_id, conn_id);
-            assert_eq!(ev.generation, generation);
-            assert_eq!(ev.io_thread_id, thread_id);
+            assert_eq!(ev.conn, conn);
+            assert_eq!(ev.conn_id(), conn.conn_id);
+            assert_eq!(ev.generation(), conn.generation());
+            assert_eq!(ev.io_thread_id(), conn.shard_id());
             assert_eq!(ev.num_vectors, num_vectors as u8);
             assert_eq!(ev.request_seq, 0);
             for (v, expected_chunk) in features.chunks(FEATURE_DIM).enumerate() {
@@ -85,9 +83,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     let pool = BufferPool::leak_new(pool_capacity);
     let mut allocator = pool.allocator();
 
-    let conn_id = 2u16;
-    let generation = 9u32;
-    let thread_id = 0u8;
+    let conn = ConnectionRef::new(0, 2, 9);
     let mut request_seq = 0u64;
 
     let r1 = common::one_request_bytes(1, &[1.0f32; FEATURE_DIM]);
@@ -100,9 +96,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
         &buf,
         &mut producer,
         &mut allocator,
-        conn_id,
-        generation,
-        thread_id,
+        conn,
         &mut request_seq,
     );
 
@@ -117,8 +111,7 @@ fn request_flow_processes_multiple_requests_in_one_buffer() {
     let mut seen = 0u64;
     while let Ok(mut guard) = poller.poll() {
         for ev in &mut guard {
-            assert_eq!(ev.conn_id, conn_id);
-            assert_eq!(ev.generation, generation);
+            assert_eq!(ev.conn, conn);
             assert_eq!(ev.request_seq, seen);
             assert_eq!(ev.num_vectors, 1);
             let v = ev.vector(0);
@@ -155,9 +148,7 @@ fn request_flow_incomplete_returns_consumed_only() {
         &buf,
         &mut producer,
         &mut allocator,
-        0,
-        1,
-        0,
+        ConnectionRef::new(0, 0, 1),
         &mut request_seq,
     );
 
@@ -189,9 +180,7 @@ fn request_flow_parse_error_returns_err() {
         &buf,
         &mut producer,
         &mut allocator,
-        0,
-        1,
-        0,
+        ConnectionRef::new(0, 0, 1),
         &mut request_seq,
     );
 

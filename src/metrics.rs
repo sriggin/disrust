@@ -12,9 +12,9 @@ mod imp {
     static REQ_RING_FULL: AtomicU64 = AtomicU64::new(0);
     static POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
     static POOL_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
-    static SESSION_WAIT_LOOPS: AtomicU64 = AtomicU64::new(0);
-    static COMPLETION_QUEUE_EMPTY_SPINS: AtomicU64 = AtomicU64::new(0);
-    static COMPLETION_POLL_NO_EVENTS: AtomicU64 = AtomicU64::new(0);
+    static SESSION_WAITS: AtomicU64 = AtomicU64::new(0);
+    static COMPLETION_QUEUE_EMPTY_WAITS: AtomicU64 = AtomicU64::new(0);
+    static COMPLETION_POLL_STALLS: AtomicU64 = AtomicU64::new(0);
     static WRITE_DRAIN_WAITS: AtomicU64 = AtomicU64::new(0);
     static WRITE_PARTIAL: AtomicU64 = AtomicU64::new(0);
     static WRITE_EAGAIN: AtomicU64 = AtomicU64::new(0);
@@ -80,9 +80,9 @@ mod imp {
         pub write_sqes: u64,
         pub write_cqes: u64,
         pub write_negative: u64,
-        pub session_wait_loops: u64,
-        pub completion_queue_empty_spins: u64,
-        pub completion_poll_no_events: u64,
+        pub session_waits: u64,
+        pub completion_queue_empty_waits: u64,
+        pub completion_poll_stalls: u64,
         pub write_drain_waits: u64,
         pub write_partial: u64,
         pub write_eagain: u64,
@@ -104,16 +104,16 @@ mod imp {
         POOL_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_session_wait_loops() {
-        SESSION_WAIT_LOOPS.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_session_waits() {
+        SESSION_WAITS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_completion_queue_empty_spins() {
-        COMPLETION_QUEUE_EMPTY_SPINS.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_completion_queue_empty_waits() {
+        COMPLETION_QUEUE_EMPTY_WAITS.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn inc_completion_poll_no_events() {
-        COMPLETION_POLL_NO_EVENTS.fetch_add(1, Ordering::Relaxed);
+    pub fn inc_completion_poll_stalls() {
+        COMPLETION_POLL_STALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_write_drain_waits() {
@@ -343,9 +343,9 @@ mod imp {
             write_sqes: WRITE_SQES.load(Ordering::Relaxed),
             write_cqes: WRITE_CQES.load(Ordering::Relaxed),
             write_negative: WRITE_NEGATIVE.load(Ordering::Relaxed),
-            session_wait_loops: SESSION_WAIT_LOOPS.load(Ordering::Relaxed),
-            completion_queue_empty_spins: COMPLETION_QUEUE_EMPTY_SPINS.load(Ordering::Relaxed),
-            completion_poll_no_events: COMPLETION_POLL_NO_EVENTS.load(Ordering::Relaxed),
+            session_waits: SESSION_WAITS.load(Ordering::Relaxed),
+            completion_queue_empty_waits: COMPLETION_QUEUE_EMPTY_WAITS.load(Ordering::Relaxed),
+            completion_poll_stalls: COMPLETION_POLL_STALLS.load(Ordering::Relaxed),
             write_drain_waits: WRITE_DRAIN_WAITS.load(Ordering::Relaxed),
             write_partial: WRITE_PARTIAL.load(Ordering::Relaxed),
             write_eagain: WRITE_EAGAIN.load(Ordering::Relaxed),
@@ -412,15 +412,15 @@ mod imp {
                     let write_cqes_d = snap.write_cqes.saturating_sub(last_snap.write_cqes);
                     let write_negative_d =
                         snap.write_negative.saturating_sub(last_snap.write_negative);
-                    let session_wait_loops_d = snap
-                        .session_wait_loops
-                        .saturating_sub(last_snap.session_wait_loops);
-                    let completion_queue_empty_spins_d = snap
-                        .completion_queue_empty_spins
-                        .saturating_sub(last_snap.completion_queue_empty_spins);
-                    let completion_poll_no_events_d = snap
-                        .completion_poll_no_events
-                        .saturating_sub(last_snap.completion_poll_no_events);
+                    let session_waits_d = snap
+                        .session_waits
+                        .saturating_sub(last_snap.session_waits);
+                    let completion_queue_empty_waits_d = snap
+                        .completion_queue_empty_waits
+                        .saturating_sub(last_snap.completion_queue_empty_waits);
+                    let completion_poll_stalls_d = snap
+                        .completion_poll_stalls
+                        .saturating_sub(last_snap.completion_poll_stalls);
                     let write_drain_waits_d = snap
                         .write_drain_waits
                         .saturating_sub(last_snap.write_drain_waits);
@@ -437,7 +437,7 @@ mod imp {
                         publish_to_write_submit_timer().snapshot_and_reset();
                     let write_drain = write_drain_timer().snapshot_and_reset();
                     println!(
-                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty={} completion_poll_no_events={} | gauges: req_occ={} req_max={} pool_max_in_use={} {} {}",
+                        "metrics delta {}s: req_published={} batches_submitted={} batches_completed={} slots_submitted={} backlog_slots_at_build={} vectors_submitted={} responses_written={} | batch_build: stop_cap={} stop_empty={} stop_noncontig={} {} {} {} | reads: submits={} cqes={} bytes={} neg={} consumed={} | writes: sqes={} cqes={} neg={} partial={} eagain={} fatal={} drain_waits={} {} | stalls: req_ring_full={} pool_exh={} pool_too_large={} session_waits={} completion_queue_empty_waits={} completion_poll_stalls={} | gauges: req_occ={} req_max={} pool_max_in_use={} {} {}",
                         interval_secs,
                         req_pub_d,
                         batches_submitted_d,
@@ -471,9 +471,9 @@ mod imp {
                         req_full_d,
                         pool_exh_d,
                         pool_tl_d,
-                        session_wait_loops_d,
-                        completion_queue_empty_spins_d,
-                        completion_poll_no_events_d,
+                        session_waits_d,
+                        completion_queue_empty_waits_d,
+                        completion_poll_stalls_d,
                         snap.req_occ,
                         snap.req_max_occ,
                         snap.pool_max_in_use,
@@ -529,9 +529,9 @@ mod imp {
         pub write_sqes: u64,
         pub write_cqes: u64,
         pub write_negative: u64,
-        pub session_wait_loops: u64,
-        pub completion_queue_empty_spins: u64,
-        pub completion_poll_no_events: u64,
+        pub session_waits: u64,
+        pub completion_queue_empty_waits: u64,
+        pub completion_poll_stalls: u64,
         pub write_drain_waits: u64,
         pub write_partial: u64,
         pub write_eagain: u64,
@@ -544,9 +544,9 @@ mod imp {
     pub fn inc_req_ring_full() {}
     pub fn inc_pool_exhausted() {}
     pub fn inc_pool_too_large() {}
-    pub fn inc_session_wait_loops() {}
-    pub fn inc_completion_queue_empty_spins() {}
-    pub fn inc_completion_poll_no_events() {}
+    pub fn inc_session_waits() {}
+    pub fn inc_completion_queue_empty_waits() {}
+    pub fn inc_completion_poll_stalls() {}
     pub fn inc_write_drain_waits() {}
     pub fn inc_write_partial() {}
     pub fn inc_write_eagain() {}
@@ -602,9 +602,9 @@ mod imp {
             write_sqes: 0,
             write_cqes: 0,
             write_negative: 0,
-            session_wait_loops: 0,
-            completion_queue_empty_spins: 0,
-            completion_poll_no_events: 0,
+            session_waits: 0,
+            completion_queue_empty_waits: 0,
+            completion_poll_stalls: 0,
             write_drain_waits: 0,
             write_partial: 0,
             write_eagain: 0,

@@ -8,6 +8,7 @@ pub mod affinity;
 pub mod buffer_pool;
 pub mod clock;
 pub mod config;
+pub mod connection_id;
 pub mod constants;
 #[cfg(feature = "cuda")]
 pub mod cuda;
