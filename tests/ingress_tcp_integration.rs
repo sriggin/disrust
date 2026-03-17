@@ -3,6 +3,7 @@
 mod common;
 
 use std::io::Write;
+use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::IntoRawFd;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use disrust::buffer_pool::BufferPool;
 use disrust::config::{GPU_DISRUPTOR_SIZE, SLAB_CAPACITY};
 use disrust::constants::{FEATURE_DIM, MAX_VECTORS_PER_REQUEST};
 use disrust::pipeline::connection_registry::ConnectionRegistry;
-use disrust::pipeline::connection_registry::WriteResult;
+use disrust::pipeline::response_queue::{ResponseQueue, ResponseReady};
+use disrust::protocol;
 use disrust::ring_types::InferenceEvent;
 use disrust::server::IngressThread;
 
@@ -70,11 +72,20 @@ fn ingress_thread_accepts_tcp_requests_and_publishes_ring_events() {
     let pool_capacity = GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
     let allocator = pool.allocator();
+    let response_queue = Arc::new(ResponseQueue::new(SLAB_CAPACITY * 2));
     let publish_gate = Arc::new(Mutex::new(()));
     let registry = Arc::new(ConnectionRegistry::new(4, SLAB_CAPACITY));
     let (listen_fd, addr) = create_listener();
 
-    let ingress = IngressThread::new(3, listen_fd, producer, allocator, publish_gate, registry);
+    let ingress = IngressThread::new(
+        3,
+        listen_fd,
+        producer,
+        allocator,
+        response_queue,
+        publish_gate,
+        registry,
+    );
     thread::Builder::new()
         .name("ingress-test".into())
         .spawn(move || ingress.run())
@@ -137,6 +148,7 @@ fn ingress_reuses_retired_slot_after_queued_parse_error() {
     let pool_capacity = GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
     let pool = BufferPool::leak_new(pool_capacity);
     let allocator = pool.allocator();
+    let response_queue = Arc::new(ResponseQueue::new(SLAB_CAPACITY * 2));
     let publish_gate = Arc::new(Mutex::new(()));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
     let (listen_fd, addr) = create_listener();
@@ -146,6 +158,7 @@ fn ingress_reuses_retired_slot_after_queued_parse_error() {
         listen_fd,
         producer,
         allocator,
+        response_queue,
         publish_gate,
         Arc::clone(&registry),
     );
@@ -182,33 +195,6 @@ fn ingress_reuses_retired_slot_after_queued_parse_error() {
     assert_eq!(events_a[0].2, 0);
     assert_eq!(events_a[1].2, 1);
 
-    let response = [1u8, 0, 0, 0, 0];
-    assert!(registry.enqueue_response(conn_a, 0, 1, &response));
-    assert!(!registry.enqueue_response(conn_a, 1, 2, &response));
-    let flush = registry
-        .take_flush(conn_a)
-        .expect("flush retired conn responses");
-    let iovecs = unsafe { std::slice::from_raw_parts(flush.iovecs, flush.iov_count as usize) };
-    let written = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>() as i32;
-    match registry.handle_write_result(conn_a, written) {
-        WriteResult::Completed => {}
-        WriteResult::ReadyAgain | WriteResult::NeedsResubmit => {
-            let flush = registry.take_flush(conn_a).expect("follow-up flush");
-            let iovecs =
-                unsafe { std::slice::from_raw_parts(flush.iovecs, flush.iov_count as usize) };
-            let written = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>() as i32;
-            match registry.handle_write_result(conn_a, written) {
-                WriteResult::Completed => {}
-                _ => panic!("expected completed write result after draining queued responses"),
-            }
-        }
-        _ => panic!("expected queued parse error connection to complete writes cleanly"),
-    }
-    assert!(
-        registry.is_retired(conn_a),
-        "connection should be retired in registry before next accept"
-    );
-
     drop(stream_a);
 
     let mut stream_b = TcpStream::connect(addr).expect("second connect failed");
@@ -234,4 +220,73 @@ fn ingress_reuses_retired_slot_after_queued_parse_error() {
         conn_a.generation(),
         "reused slab slot should advance generation"
     );
+}
+
+#[test]
+fn ingress_submits_writes_while_queued_parse_work_remains() {
+    common::init_factory_pool();
+
+    let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
+    let (mut event_poller, builder) = builder.event_poller();
+    let producer = builder.build();
+
+    let pool_capacity = GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+    let pool = BufferPool::leak_new(pool_capacity);
+    let allocator = pool.allocator();
+    let response_queue = Arc::new(ResponseQueue::new(SLAB_CAPACITY * 2));
+    let publish_gate = Arc::new(Mutex::new(()));
+    let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
+    let (listen_fd, addr) = create_listener();
+
+    let ingress = IngressThread::new(
+        0,
+        listen_fd,
+        producer,
+        allocator,
+        Arc::clone(&response_queue),
+        publish_gate,
+        registry,
+    );
+    thread::Builder::new()
+        .name("ingress-write-progress-test".into())
+        .spawn(move || ingress.run())
+        .expect("failed to spawn ingress thread");
+
+    let req1_features: Vec<f32> = (0..FEATURE_DIM).map(|i| i as f32 + 1.0).collect();
+    let req2_features: Vec<f32> = (0..FEATURE_DIM).map(|i| i as f32 + 100.0).collect();
+    let req1 = common::one_request_bytes(1, &req1_features);
+    let req2 = common::one_request_bytes(1, &req2_features);
+
+    let mut stream = TcpStream::connect(addr).expect("connect failed");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set read timeout");
+
+    // Leave a partial second request buffered so ingress stays on the queued-parse path
+    // after publishing the first event.
+    let partial_req2 = 6usize.min(req2.len());
+    stream.write_all(&req1).expect("write first request failed");
+    stream
+        .write_all(&req2[..partial_req2])
+        .expect("write partial second request failed");
+
+    let events = collect_events(&mut event_poller, 1);
+    assert_eq!(events.len(), 1, "expected first published event");
+    let conn = events[0].0;
+
+    let expected_sum = req1_features.iter().copied().sum::<f32>();
+    let mut expected = [0u8; 5];
+    protocol::encode_response(&[expected_sum], &mut expected);
+    response_queue.push(ResponseReady::new(conn, 0, 1, &expected));
+
+    let mut response = [0u8; 5];
+    match stream.read_exact(&mut response) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {
+            panic!("timed out waiting for first response while queued parse work remained")
+        }
+        Err(err) => panic!("read first response failed: {err}"),
+    }
+    assert_eq!(response, expected, "unexpected first response bytes");
 }

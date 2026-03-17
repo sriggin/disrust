@@ -18,9 +18,8 @@ use crate::config::{
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::inference::InferenceConsumer;
-use crate::pipeline::ready_queue::ReadyQueue;
+use crate::pipeline::response_queue::ResponseQueue;
 use crate::pipeline::session::InferenceSession;
-use crate::pipeline::writer::WriterConsumer;
 use crate::pipeline::{make_pool, verify_ort_dylib_present};
 use crate::ring_types::InferenceEvent;
 
@@ -74,10 +73,6 @@ pub struct ServeArgs {
     /// Number of ingress IO threads to run via SO_REUSEPORT sharding.
     #[arg(long, default_value_t = 1)]
     pub io_threads: u8,
-
-    /// Pin the writer thread to a specific CPU id.
-    #[arg(long)]
-    pub writer_cpu: Option<usize>,
 }
 
 fn create_listener(port: u16) -> Socket {
@@ -146,9 +141,6 @@ pub fn run(args: ServeArgs) {
         eprintln!("disrust: io_cpu_base={cpu}");
     }
     eprintln!("disrust: io_threads={io_threads}");
-    if let Some(cpu) = args.writer_cpu {
-        eprintln!("disrust: writer_cpu={cpu}");
-    }
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust preflight failed: {e}");
         std::process::exit(1);
@@ -199,7 +191,9 @@ pub fn run(args: ServeArgs) {
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
 
-    let ready_queue = Arc::new(ReadyQueue::new(io_threads * SLAB_CAPACITY * 2));
+    let response_queues = (0..io_threads)
+        .map(|_| Arc::new(ResponseQueue::new(SLAB_CAPACITY * 2)))
+        .collect::<Vec<_>>();
     let publish_gate = Arc::new(std::sync::Mutex::new(()));
     let registry = Arc::new(ConnectionRegistry::new(io_threads, SLAB_CAPACITY));
     let (worker_exit_tx, worker_exit_rx) = mpsc::channel::<WorkerExit>();
@@ -217,7 +211,7 @@ pub fn run(args: ServeArgs) {
         submission_poller,
         completion_poller,
         sessions,
-        Arc::clone(&ready_queue),
+        response_queues.clone(),
         Arc::clone(&registry),
         max_batch_slots,
         batch_coalesce,
@@ -244,40 +238,16 @@ pub fn run(args: ServeArgs) {
         })
         .expect("failed to spawn inference consumer");
 
-    let writer_consumer = WriterConsumer::new(Arc::clone(&ready_queue), Arc::clone(&registry))
-        .expect("failed to create WriterConsumer io_uring");
-    let writer_cpu = args.writer_cpu;
-    thread::Builder::new()
-        .name("writer".into())
-        .spawn({
-            let worker_exit_tx = worker_exit_tx.clone();
-            move || {
-                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                    if let Some(cpu) = writer_cpu {
-                        affinity::pin_current_thread(cpu, "writer")
-                            .unwrap_or_else(|e| panic!("{e}"));
-                    }
-                    writer_consumer.run()
-                }));
-                let _ = match outcome {
-                    Ok(()) => worker_exit_tx.send(WorkerExit::Returned("writer")),
-                    Err(payload) => {
-                        worker_exit_tx.send(WorkerExit::Panicked("writer", panic_message(payload)))
-                    }
-                };
-            }
-        })
-        .expect("failed to spawn WriterConsumer");
-
     eprintln!("disrust: ready");
 
-    for thread_id in 0..io_threads {
+    for (thread_id, response_queue) in response_queues.iter().enumerate() {
         let listen_socket = create_listener(port);
         let ingress = IngressThread::new(
             thread_id as u8,
             listen_socket.into_raw_fd(),
             producer.clone(),
             allocator,
+            Arc::clone(response_queue),
             Arc::clone(&publish_gate),
             Arc::clone(&registry),
         );

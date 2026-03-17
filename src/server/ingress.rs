@@ -1,4 +1,4 @@
-//! Ingress-only IO thread for the ONNX/CUDA server pipeline.
+//! Shard-owned IO thread for the ONNX/CUDA server pipeline.
 
 use std::collections::VecDeque;
 use std::io;
@@ -11,39 +11,49 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
 use crate::buffer_pool::PoolAllocator;
-use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY};
+use crate::clock::elapsed_since_ns;
+use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY, WRITE_BUF_SIZE};
 use crate::connection_id::ConnectionRef;
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
+use crate::pipeline::response_queue::ResponseQueue;
 use crate::request_flow;
 use crate::ring_types::InferenceEvent;
 
 const OP_ACCEPT: u64 = 0;
 const OP_READ: u64 = 1;
+const OP_WRITE: u64 = 2;
+const OP_NOTIFY: u64 = 3;
+const MAX_IOVECS_PER_WRITE: usize = 64;
 
-fn encode_user_data(op: u64, key: u16) -> u64 {
-    (op << 32) | key as u64
+fn encode_user_data(op: u64, data: u32) -> u64 {
+    (op << 32) | data as u64
 }
 
-fn decode_user_data(user_data: u64) -> (u64, u16) {
-    (user_data >> 32, user_data as u16)
+fn decode_user_data(user_data: u64) -> (u64, u32) {
+    (user_data >> 32, user_data as u32)
 }
 
 struct IoUring {
     inner: io_uring::IoUring,
+    outstanding: usize,
 }
 
 impl IoUring {
     fn new(entries: u32) -> io::Result<Self> {
         Ok(Self {
             inner: io_uring::IoUring::new(entries)?,
+            outstanding: 0,
         })
     }
 
     fn push(&mut self, sqe: &Entry) {
         loop {
             match unsafe { self.inner.submission().push(sqe) } {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.outstanding += 1;
+                    return;
+                }
                 Err(_) => {
                     self.inner.submit().expect("SQ flush failed");
                 }
@@ -57,8 +67,46 @@ impl IoUring {
             .expect("submit_and_wait failed");
     }
 
+    fn submit(&mut self) {
+        if self.outstanding > 0 {
+            self.inner.submit().expect("io_uring submit failed");
+        }
+    }
+
     fn drain_cqes_into(&mut self, buf: &mut Vec<(u64, i32)>) {
-        buf.extend(self.inner.completion().map(|c| (c.user_data(), c.result())));
+        for cqe in self.inner.completion() {
+            self.outstanding = self.outstanding.saturating_sub(1);
+            buf.push((cqe.user_data(), cqe.result()));
+        }
+    }
+}
+
+struct ResponseFrame {
+    published_at_ns: u64,
+    len: usize,
+    offset: usize,
+    data: [u8; WRITE_BUF_SIZE],
+}
+
+impl ResponseFrame {
+    fn new(published_at_ns: u64, bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() <= WRITE_BUF_SIZE);
+        let mut data = [0u8; WRITE_BUF_SIZE];
+        data[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            published_at_ns,
+            len: bytes.len(),
+            offset: 0,
+            data,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.len.saturating_sub(self.offset)
+    }
+
+    fn remaining_ptr(&self) -> *const u8 {
+        unsafe { self.data.as_ptr().add(self.offset) }
     }
 }
 
@@ -71,6 +119,13 @@ struct Connection {
     read_inflight: bool,
     read_closed: bool,
     parse_queued: bool,
+    write_closed: bool,
+    write_inflight: bool,
+    ready_queued: bool,
+    queue: VecDeque<Box<ResponseFrame>>,
+    inflight: VecDeque<Box<ResponseFrame>>,
+    inflight_iovecs: [libc::iovec; MAX_IOVECS_PER_WRITE],
+    inflight_iov_count: usize,
 }
 
 impl Connection {
@@ -84,6 +139,16 @@ impl Connection {
             read_inflight: false,
             read_closed: false,
             parse_queued: false,
+            write_closed: false,
+            write_inflight: false,
+            ready_queued: false,
+            queue: VecDeque::new(),
+            inflight: VecDeque::new(),
+            inflight_iovecs: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; MAX_IOVECS_PER_WRITE],
+            inflight_iov_count: 0,
         }
     }
 
@@ -93,6 +158,15 @@ impl Connection {
             (READ_BUF_SIZE - self.read_len) as u32,
         )
     }
+
+    fn should_reap(&self, registry: &ConnectionRegistry) -> bool {
+        self.read_closed
+            && self.write_closed
+            && !self.write_inflight
+            && self.queue.is_empty()
+            && self.inflight.is_empty()
+            && registry.is_retired(self.conn)
+    }
 }
 
 pub struct IngressThread<P> {
@@ -100,6 +174,7 @@ pub struct IngressThread<P> {
     listen_fd: RawFd,
     producer: P,
     allocator: PoolAllocator,
+    response_queue: Arc<ResponseQueue>,
     publish_gate: Arc<Mutex<()>>,
     registry: Arc<ConnectionRegistry>,
 }
@@ -113,6 +188,7 @@ where
         listen_fd: RawFd,
         producer: P,
         allocator: PoolAllocator,
+        response_queue: Arc<ResponseQueue>,
         publish_gate: Arc<Mutex<()>>,
         registry: Arc<ConnectionRegistry>,
     ) -> Self {
@@ -121,6 +197,7 @@ where
             listen_fd,
             producer,
             allocator,
+            response_queue,
             publish_gate,
             registry,
         }
@@ -132,8 +209,12 @@ where
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
         let mut parse_queue: VecDeque<u16> = VecDeque::new();
         submit_accept(&mut ring, self.listen_fd);
+        submit_notify(&mut ring, self.response_queue.notify_fd());
 
         loop {
+            drain_response_queue(&mut conns, &self.response_queue);
+            submit_ready_writes(&mut ring, &mut conns, &self.registry);
+
             if let Some(key) = parse_queue.pop_front() {
                 if let Some(conn) = conns.get_mut(key as usize) {
                     conn.parse_queued = false;
@@ -148,51 +229,86 @@ where
                     &self.registry,
                     key,
                 );
+                // Queued parse work can enqueue follow-on reads and shard-local writes.
+                // Those SQEs must be submitted before looping again, or sustained buffered
+                // parsing can starve socket progress indefinitely.
+                ring.submit();
                 reap_retired_connections(&mut conns, &self.registry);
-            } else {
-                ring.wait(1);
-                cqe_buf.clear();
-                ring.drain_cqes_into(&mut cqe_buf);
-                reap_retired_connections(&mut conns, &self.registry);
-
-                for &(user_data, result) in &cqe_buf {
-                    let (op, key) = decode_user_data(user_data);
-                    match op {
-                        OP_ACCEPT => handle_accept(
-                            &mut ring,
-                            &mut conns,
-                            result,
-                            self.thread_id,
-                            self.listen_fd,
-                            &self.registry,
-                        ),
-                        OP_READ => handle_read(
-                            &mut ring,
-                            &mut conns,
-                            &mut parse_queue,
-                            &mut self.producer,
-                            &mut self.allocator,
-                            &self.publish_gate,
-                            &self.registry,
-                            key,
-                            result,
-                        ),
-                        _ => {}
-                    }
-                }
-                reap_retired_connections(&mut conns, &self.registry);
+                continue;
             }
+
+            ring.wait(1);
+            cqe_buf.clear();
+            ring.drain_cqes_into(&mut cqe_buf);
+
+            for &(user_data, result) in &cqe_buf {
+                let (op, data) = decode_user_data(user_data);
+                match op {
+                    OP_ACCEPT => handle_accept(
+                        &mut ring,
+                        &mut conns,
+                        result,
+                        self.thread_id,
+                        self.listen_fd,
+                        &self.registry,
+                    ),
+                    OP_READ => handle_read(
+                        &mut ring,
+                        &mut conns,
+                        &mut parse_queue,
+                        &mut self.producer,
+                        &mut self.allocator,
+                        &self.publish_gate,
+                        &self.registry,
+                        data as u16,
+                        result,
+                    ),
+                    OP_WRITE => handle_write(&mut conns, &self.registry, data as u16, result),
+                    OP_NOTIFY => handle_notify(&mut ring, self.response_queue.notify_fd(), result),
+                    _ => {}
+                }
+            }
+
+            reap_retired_connections(&mut conns, &self.registry);
         }
+    }
+}
+
+fn drain_response_queue(conns: &mut Slab<Connection>, response_queue: &Arc<ResponseQueue>) {
+    while let Some(response) = response_queue.pop() {
+        let Some(conn) = conns.get_mut(response.conn.conn_id as usize) else {
+            continue;
+        };
+        if conn.conn != response.conn || conn.write_closed {
+            continue;
+        }
+        conn.queue.push_back(Box::new(ResponseFrame::new(
+            response.published_at_ns,
+            &response.data[..response.len],
+        )));
+        conn.ready_queued = true;
     }
 }
 
 fn reap_retired_connections(conns: &mut Slab<Connection>, registry: &Arc<ConnectionRegistry>) {
     let retired: Vec<u16> = conns
         .iter()
-        .filter_map(|(k, c)| (c.read_closed && registry.is_retired(c.conn)).then_some(k as u16))
+        .filter_map(|(k, c)| c.should_reap(registry).then_some(k as u16))
         .collect();
     for key in retired {
         conns.try_remove(key as usize);
+    }
+}
+
+fn maybe_mark_read_closed(registry: &Arc<ConnectionRegistry>, conn: &mut Connection) {
+    if conn.read_closed
+        && !conn.write_inflight
+        && conn.queue.is_empty()
+        && conn.inflight.is_empty()
+        && !conn.write_closed
+    {
+        conn.write_closed = true;
+        registry.mark_read_closed(conn.conn, conn.next_request_seq);
     }
 }
 
@@ -240,10 +356,11 @@ fn handle_read(
         if let Some(conn) = conns.get_mut(key_usize) {
             conn.read_inflight = false;
             conn.read_closed = true;
-            registry.mark_read_closed(conn.conn, conn.next_request_seq);
+            maybe_mark_read_closed(registry, conn);
         }
         return;
     }
+
     let bytes_read = result as usize;
     metrics::add_read_bytes(bytes_read as u64);
     let Some(conn) = conns.get_mut(key_usize) else {
@@ -312,7 +429,7 @@ fn parse_and_maybe_read(
                 key
             );
             conn.read_closed = true;
-            registry.mark_read_closed(conn.conn, conn.next_request_seq);
+            maybe_mark_read_closed(registry, conn);
             return;
         }
     }
@@ -343,6 +460,41 @@ fn submit_accept(ring: &mut IoUring, listen_fd: RawFd) {
     ring.push(&sqe);
 }
 
+fn submit_notify(ring: &mut IoUring, notify_fd: RawFd) {
+    let sqe = opcode::PollAdd::new(Fd(notify_fd), libc::POLLIN as _)
+        .build()
+        .user_data(encode_user_data(OP_NOTIFY, 0));
+    ring.push(&sqe);
+}
+
+fn handle_notify(ring: &mut IoUring, notify_fd: RawFd, result: i32) {
+    if result >= 0 {
+        loop {
+            let mut value = 0u64;
+            let rc = unsafe {
+                libc::read(
+                    notify_fd,
+                    (&mut value as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or_default();
+                if err == libc::EAGAIN {
+                    break;
+                }
+                panic!("eventfd read failed: {err}");
+            }
+            if rc == 0 {
+                break;
+            }
+        }
+    }
+    submit_notify(ring, notify_fd);
+}
+
 fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let conn = &mut conns[key as usize];
     if conn.read_inflight || conn.read_closed {
@@ -352,7 +504,125 @@ fn submit_read(ring: &mut IoUring, conns: &mut Slab<Connection>, key: u16) {
     let (buf_ptr, buf_len) = conn.read_buf_tail();
     let sqe = opcode::Recv::new(Fd(conn.fd), buf_ptr, buf_len)
         .build()
-        .user_data(encode_user_data(OP_READ, key));
+        .user_data(encode_user_data(OP_READ, key as u32));
     ring.push(&sqe);
     metrics::inc_read_submits();
+}
+
+fn submit_ready_writes(
+    ring: &mut IoUring,
+    conns: &mut Slab<Connection>,
+    registry: &Arc<ConnectionRegistry>,
+) {
+    let ready: Vec<u16> = conns
+        .iter()
+        .filter_map(|(key, conn)| {
+            (conn.ready_queued && !conn.write_closed && !conn.write_inflight).then_some(key as u16)
+        })
+        .collect();
+    for key in ready {
+        submit_write(ring, conns, registry, key);
+    }
+}
+
+fn submit_write(
+    ring: &mut IoUring,
+    conns: &mut Slab<Connection>,
+    registry: &Arc<ConnectionRegistry>,
+    key: u16,
+) {
+    let conn = &mut conns[key as usize];
+    conn.ready_queued = false;
+    if conn.write_closed || conn.write_inflight {
+        return;
+    }
+
+    if conn.inflight.is_empty() {
+        while conn.inflight.len() < MAX_IOVECS_PER_WRITE {
+            let Some(frame) = conn.queue.pop_front() else {
+                break;
+            };
+            metrics::record_publish_to_write_submit(elapsed_since_ns(frame.published_at_ns));
+            conn.inflight.push_back(frame);
+        }
+    }
+
+    if conn.inflight.is_empty() {
+        maybe_mark_read_closed(registry, conn);
+        return;
+    }
+
+    let mut iov_count = 0usize;
+    for frame in conn.inflight.iter() {
+        conn.inflight_iovecs[iov_count] = libc::iovec {
+            iov_base: frame.remaining_ptr() as *mut libc::c_void,
+            iov_len: frame.remaining(),
+        };
+        iov_count += 1;
+    }
+    conn.inflight_iov_count = iov_count;
+    conn.write_inflight = true;
+
+    let sqe = opcode::Writev::new(Fd(conn.fd), conn.inflight_iovecs.as_ptr(), iov_count as u32)
+        .build()
+        .user_data(encode_user_data(OP_WRITE, key as u32));
+    ring.push(&sqe);
+    metrics::inc_write_sqes();
+}
+
+fn handle_write(
+    conns: &mut Slab<Connection>,
+    registry: &Arc<ConnectionRegistry>,
+    key: u16,
+    result: i32,
+) {
+    metrics::inc_write_cqes();
+    let Some(conn) = conns.get_mut(key as usize) else {
+        return;
+    };
+    if result < 0 {
+        metrics::inc_write_negative();
+        match -result {
+            libc::EPIPE | libc::EBADF | libc::ECONNRESET => {
+                metrics::inc_write_fatal();
+            }
+            libc::EAGAIN => {
+                metrics::inc_write_eagain();
+                metrics::inc_write_fatal();
+            }
+            _ => {}
+        }
+        conn.write_closed = true;
+        conn.write_inflight = false;
+        conn.inflight.clear();
+        conn.queue.clear();
+        conn.inflight_iov_count = 0;
+        conn.read_closed = true;
+        maybe_mark_read_closed(registry, conn);
+        return;
+    }
+
+    let mut remaining = result as usize;
+    while remaining > 0 {
+        let Some(frame) = conn.inflight.front_mut() else {
+            break;
+        };
+        let frame_remaining = frame.remaining();
+        if remaining >= frame_remaining {
+            remaining -= frame_remaining;
+            conn.inflight.pop_front();
+        } else {
+            frame.offset += remaining;
+            remaining = 0;
+        }
+    }
+
+    conn.write_inflight = false;
+    conn.inflight_iov_count = 0;
+
+    if !conn.inflight.is_empty() || !conn.queue.is_empty() {
+        conn.ready_queued = true;
+    } else {
+        maybe_mark_read_closed(registry, conn);
+    }
 }

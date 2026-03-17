@@ -11,7 +11,7 @@ use crate::clock::elapsed_since_ns;
 use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
-use crate::pipeline::ready_queue::ReadyQueue;
+use crate::pipeline::response_queue::{ResponseQueue, ResponseReady};
 use crate::pipeline::session::{BatchPoll, InFlightBatch, InferenceSession};
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
@@ -51,7 +51,7 @@ pub struct InferenceConsumer {
     session_cursor: usize,
     backlog: VecDeque<PendingSlot>,
     inflight: VecDeque<InflightBatchEntry>,
-    ready_queue: Arc<ReadyQueue>,
+    response_queues: Vec<Arc<ResponseQueue>>,
     registry: Arc<ConnectionRegistry>,
     max_batch_slots: usize,
     batch_coalesce_timeout: Duration,
@@ -67,7 +67,7 @@ impl InferenceConsumer {
         submission_poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
         completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
         sessions: Vec<InferenceSession>,
-        ready_queue: Arc<ReadyQueue>,
+        response_queues: Vec<Arc<ResponseQueue>>,
         registry: Arc<ConnectionRegistry>,
         max_batch_slots: usize,
         batch_coalesce_timeout: Duration,
@@ -79,7 +79,7 @@ impl InferenceConsumer {
             session_cursor: 0,
             backlog: VecDeque::new(),
             inflight: VecDeque::new(),
-            ready_queue,
+            response_queues,
             registry,
             max_batch_slots,
             batch_coalesce_timeout,
@@ -235,7 +235,7 @@ impl InferenceConsumer {
                 );
                 #[cfg(not(feature = "metrics"))]
                 metrics::record_batch_wait(Duration::ZERO);
-                let ready_queue = Arc::clone(&self.ready_queue);
+                let response_queues = self.response_queues.clone();
                 let registry = Arc::clone(&self.registry);
                 let max_batch_slots = self.max_batch_slots;
                 let mut guard = wait_for_completion_guard(
@@ -245,7 +245,7 @@ impl InferenceConsumer {
                 process_batch(
                     &mut guard,
                     inflight.entry,
-                    &ready_queue,
+                    &response_queues,
                     &registry,
                     max_batch_slots,
                 );
@@ -429,7 +429,7 @@ fn wait_for_completion_guard<'a>(
 fn process_batch(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
     entry: BatchEntry,
-    ready_queue: &Arc<ReadyQueue>,
+    response_queues: &[Arc<ResponseQueue>],
     registry: &Arc<ConnectionRegistry>,
     max_batch_slots: usize,
 ) {
@@ -451,8 +451,13 @@ fn process_batch(
         protocol::encode_response(response, &mut wire);
 
         let conn = event.conn;
-        if registry.enqueue_response(conn, event.request_seq, event.published_at_ns, &wire) {
-            ready_queue.push(conn);
+        if registry.is_open(conn) {
+            response_queues[conn.shard_id() as usize].push(ResponseReady::new(
+                conn,
+                event.request_seq,
+                event.published_at_ns,
+                &wire,
+            ));
         }
 
         output_offset += num_vecs;

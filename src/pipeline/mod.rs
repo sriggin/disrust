@@ -3,8 +3,8 @@
 pub mod connection_registry;
 pub mod inference;
 pub mod ready_queue;
+pub mod response_queue;
 pub mod session;
-pub mod writer;
 
 use std::path::PathBuf;
 
