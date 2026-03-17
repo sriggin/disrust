@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 use clap::{Parser, ValueEnum};
-#[cfg(feature = "cuda")]
-use ort::init_from;
 
 #[cfg(feature = "cuda")]
 use disrust::buffer_pool::{BufferPool, PoolSlice, set_factory_pool};
@@ -19,9 +17,7 @@ use disrust::cuda::memory::{alloc_pinned, free_pinned};
 #[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
 #[cfg(feature = "cuda")]
-use disrust::pipeline::session::InferenceSession;
-#[cfg(feature = "cuda")]
-use disrust::pipeline::{make_pool, verify_ort_dylib_present};
+use disrust::pipeline::{InferenceBackend, OrtBackend};
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -84,10 +80,6 @@ fn main() {
     if args.vectors_per_slot == 0 {
         panic!("--vectors-per-slot must be > 0");
     }
-    let ort_dylib = verify_ort_dylib_present().expect("ORT dylib preflight failed");
-    init_from(&ort_dylib)
-        .expect("ort::init_from failed")
-        .commit();
     verify_cuda_startup().expect("CUDA preflight failed");
     let _ = set_factory_pool(BufferPool::new_boxed(1));
 
@@ -189,17 +181,17 @@ fn bench_direct(
     warmup_iters: usize,
     iters: usize,
 ) -> Stats {
-    let mut session = InferenceSession::with_output_capacity(model_bytes, num_vectors);
+    let mut backend = OrtBackend::new_with_capacity(model_bytes, num_vectors);
     let pinned = allocate_pinned_input(num_vectors);
     let host_ptr = pinned.as_ptr();
 
     for _ in 0..warmup_iters {
-        run_batch(&mut session, host_ptr, num_vectors, Vec::new());
+        run_batch(&mut backend, host_ptr, num_vectors, Vec::new());
     }
 
     let start = Instant::now();
     for _ in 0..iters {
-        run_batch(&mut session, black_box(host_ptr), num_vectors, Vec::new());
+        run_batch(&mut backend, black_box(host_ptr), num_vectors, Vec::new());
     }
     let elapsed = start.elapsed();
     stats_from_elapsed(elapsed, iters, num_vectors)
@@ -214,21 +206,21 @@ fn bench_subsystem(
     iters: usize,
 ) -> Stats {
     let total_vectors = slot_count * vectors_per_slot;
-    let mut session = InferenceSession::with_output_capacity(model_bytes, total_vectors);
-    let pool = make_pool();
+    let mut backend = OrtBackend::new_with_capacity(model_bytes, total_vectors);
+    let pool = OrtBackend::make_pool();
     let mut alloc = pool.allocator();
 
     for _ in 0..warmup_iters {
         let slices = make_contiguous_slices(&mut alloc, slot_count, vectors_per_slot);
         let host_ptr = slices[0].as_slice().as_ptr();
-        run_batch(&mut session, host_ptr, total_vectors, slices);
+        run_batch(&mut backend, host_ptr, total_vectors, slices);
     }
 
     let start = Instant::now();
     for _ in 0..iters {
         let slices = make_contiguous_slices(&mut alloc, slot_count, vectors_per_slot);
         let host_ptr = slices[0].as_slice().as_ptr();
-        run_batch(&mut session, black_box(host_ptr), total_vectors, slices);
+        run_batch(&mut backend, black_box(host_ptr), total_vectors, slices);
     }
     let elapsed = start.elapsed();
     stats_from_elapsed(elapsed, iters, total_vectors)
@@ -236,16 +228,16 @@ fn bench_subsystem(
 
 #[cfg(feature = "cuda")]
 fn run_batch(
-    session: &mut InferenceSession,
+    backend: &mut OrtBackend,
     host_ptr: *const f32,
     num_vectors: usize,
     input_slices: Vec<PoolSlice>,
 ) {
     assert!(
-        session.try_acquire(),
-        "InferenceSession unexpectedly unavailable in benchmark"
+        backend.try_acquire(),
+        "OrtBackend unexpectedly unavailable in benchmark"
     );
-    let mut batch = session.submit_batch(host_ptr, num_vectors);
+    let mut batch = backend.submit_batch(host_ptr, num_vectors);
     batch.input_slices = input_slices;
     batch.completion.wait();
     black_box(unsafe { std::slice::from_raw_parts(batch.output_ptr, batch.output_len) });

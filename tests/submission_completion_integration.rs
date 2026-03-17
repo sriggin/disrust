@@ -2,14 +2,13 @@ mod common;
 
 use std::collections::HashMap;
 use std::os::fd::IntoRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use disruptor::{BusySpin, Producer, build_multi_producer};
-use ort::init_from;
-use std::os::unix::net::UnixStream;
 
 use disrust::buffer_pool::BufferPool;
 use disrust::config::SLAB_CAPACITY;
@@ -18,24 +17,38 @@ use disrust::metrics;
 use disrust::pipeline::connection_registry::ConnectionRegistry;
 use disrust::pipeline::inference::InferenceConsumer;
 use disrust::pipeline::response_queue::ResponseQueue;
-use disrust::pipeline::session::InferenceSession;
-use disrust::pipeline::verify_ort_dylib_present;
+use disrust::pipeline::{InferenceBackend, OrtBackend};
 use disrust::ring_types::InferenceEvent;
 
 #[cfg(feature = "cuda")]
+use disrust::cuda::memory::{alloc_pinned, free_pinned};
+#[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
 
-fn ensure_ort_init() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let ort_dylib = verify_ort_dylib_present().expect("ORT dylib preflight failed");
-        init_from(&ort_dylib)
-            .expect("ort::init_from failed")
-            .commit();
-
+fn backend_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
         #[cfg(feature = "cuda")]
-        verify_cuda_startup().expect("CUDA preflight failed");
-    });
+        {
+            if let Err(err) = verify_cuda_startup() {
+                eprintln!("skipping CUDA-backed inference integration test: {err}");
+                return false;
+            }
+            let ptr = match alloc_pinned(std::mem::size_of::<f32>()) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    eprintln!("skipping CUDA-backed inference integration test: {err}");
+                    return false;
+                }
+            };
+            unsafe {
+                let _ = free_pinned(ptr);
+            }
+        }
+
+        OrtBackend::init();
+        true
+    })
 }
 
 fn encode_expected_response(fill: f32) -> [u8; 5] {
@@ -48,7 +61,9 @@ fn encode_expected_response(fill: f32) -> [u8; 5] {
 
 fn run_pipeline_order_test() {
     common::init_factory_pool();
-    ensure_ort_init();
+    if !backend_available() {
+        return;
+    }
 
     const RING_SIZE: usize = 256;
     let builder = build_multi_producer(RING_SIZE, InferenceEvent::factory, BusySpin);
@@ -58,7 +73,7 @@ fn run_pipeline_order_test() {
 
     let model_bytes =
         std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
-    let sessions = vec![InferenceSession::new(&model_bytes)];
+    let backend = OrtBackend::new(&model_bytes, 1);
 
     let response_queue = Arc::new(ResponseQueue::new(32));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
@@ -66,7 +81,7 @@ fn run_pipeline_order_test() {
     let inference = InferenceConsumer::new(
         submission_poller,
         completion_poller,
-        sessions,
+        backend,
         vec![Arc::clone(&response_queue)],
         Arc::clone(&registry),
         256,
@@ -161,7 +176,9 @@ fn run_pipeline_order_test() {
 
 fn run_sustained_response_queue_test() {
     common::init_factory_pool();
-    ensure_ort_init();
+    if !backend_available() {
+        return;
+    }
 
     const RING_SIZE: usize = 512;
     const CONNECTIONS: usize = 4;
@@ -174,7 +191,7 @@ fn run_sustained_response_queue_test() {
 
     let model_bytes =
         std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
-    let sessions = vec![InferenceSession::new(&model_bytes)];
+    let backend = OrtBackend::new(&model_bytes, 1);
 
     let response_queue = Arc::new(ResponseQueue::new(CONNECTIONS * REQUESTS_PER_CONNECTION));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
@@ -183,7 +200,7 @@ fn run_sustained_response_queue_test() {
     let inference = InferenceConsumer::new(
         submission_poller,
         completion_poller,
-        sessions,
+        backend,
         vec![Arc::clone(&response_queue)],
         Arc::clone(&registry),
         256,

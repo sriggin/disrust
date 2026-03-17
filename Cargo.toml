@@ -46,7 +46,7 @@ libc = "0.2"
 spsc-bip-buffer = "0.2"
 bytemuck = { version = "1", features = ["min_const_generics"] }
 hdrhistogram = { version = "7", default-features = false, features = ["sync"] }
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 # Specify the matching CUDA version feature, e.g. features = ["cuda-12040"] or ["cuda-11080"].
 # See https://docs.rs/cudarc for available version features.
 cudarc = { version = "0.19.3", features = ["cuda-12060"], optional = true }

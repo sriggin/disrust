@@ -12,18 +12,18 @@ use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::response_queue::{ResponseQueue, ResponseReady};
-use crate::pipeline::session::{BatchPoll, InFlightBatch, InferenceSession};
+use crate::pipeline::session::{BatchPoll, InferenceBackend, InFlightBatch};
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
 
 const MAX_COMPLETIONS_PER_PASS: usize = 8;
 const MAX_SUBMISSIONS_PER_PASS: usize = 8;
 
-struct BatchEntry {
+struct BatchEntry<R: Send> {
     slot_count: usize,
     #[cfg(feature = "metrics")]
     submitted_at: Instant,
-    batch: InFlightBatch,
+    batch: InFlightBatch<R>,
 }
 
 struct PendingSlot {
@@ -38,19 +38,18 @@ enum BatchStopReason {
     NonContiguous,
 }
 
-struct InflightBatchEntry {
-    entry: BatchEntry,
+struct InflightBatchEntry<R: Send> {
+    entry: BatchEntry<R>,
     #[cfg(feature = "metrics")]
     wait_started_at: Option<Instant>,
 }
 
-pub struct InferenceConsumer {
+pub struct InferenceConsumer<B: InferenceBackend> {
     submission_poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
     completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-    sessions: Vec<InferenceSession>,
-    session_cursor: usize,
+    backend: B,
     backlog: VecDeque<PendingSlot>,
-    inflight: VecDeque<InflightBatchEntry>,
+    inflight: VecDeque<InflightBatchEntry<B::Resources>>,
     response_queues: Vec<Arc<ResponseQueue>>,
     registry: Arc<ConnectionRegistry>,
     max_batch_slots: usize,
@@ -60,13 +59,13 @@ pub struct InferenceConsumer {
     timers_idle: bool,
 }
 
-unsafe impl Send for InferenceConsumer {}
+unsafe impl<B: InferenceBackend> Send for InferenceConsumer<B> {}
 
-impl InferenceConsumer {
+impl<B: InferenceBackend> InferenceConsumer<B> {
     pub fn new(
         submission_poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
         completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-        sessions: Vec<InferenceSession>,
+        backend: B,
         response_queues: Vec<Arc<ResponseQueue>>,
         registry: Arc<ConnectionRegistry>,
         max_batch_slots: usize,
@@ -75,8 +74,7 @@ impl InferenceConsumer {
         Self {
             submission_poller,
             completion_poller,
-            sessions,
-            session_cursor: 0,
+            backend,
             backlog: VecDeque::new(),
             inflight: VecDeque::new(),
             response_queues,
@@ -168,7 +166,7 @@ impl InferenceConsumer {
         }
 
         if self.backlog.len() < self.max_batch_slots {
-            if !session_available(&self.sessions) {
+            if !self.backend.is_available() {
                 return false;
             }
             if self.batch_coalesce_timeout > Duration::ZERO && self.coalesce_check_spins < 64 {
@@ -184,21 +182,17 @@ impl InferenceConsumer {
             }
         }
 
-        let Some(idx) = try_reserve_session(&self.sessions, &mut self.session_cursor) else {
+        if !self.backend.try_acquire() {
             if self.backlog.len() >= self.max_batch_slots {
                 metrics::inc_session_waits();
             }
             return false;
-        };
+        }
 
         if let Some(started) = self.backlog_started_at {
             metrics::record_backlog_age(started.elapsed());
         }
-        let batch_entry = build_batch_entry(
-            &mut self.sessions[idx],
-            &mut self.backlog,
-            self.max_batch_slots,
-        );
+        let batch_entry = build_batch_entry(&mut self.backend, &mut self.backlog, self.max_batch_slots);
         metrics::inc_batches_submitted();
         metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
         if self.backlog.is_empty() {
@@ -310,9 +304,6 @@ fn drain_guard(
 }
 
 fn take_event_features(event: &InferenceEvent) -> PoolSlice {
-    // SAFETY: while the inference consumer holds the submission poll guard, no later consumer can
-    // observe these slots yet and the producer cannot reuse them. That makes it safe to move
-    // `features` out into the local backlog before guard drop.
     unsafe {
         let event_ptr = event as *const InferenceEvent as *mut InferenceEvent;
         std::ptr::replace(
@@ -322,11 +313,11 @@ fn take_event_features(event: &InferenceEvent) -> PoolSlice {
     }
 }
 
-fn build_batch_entry(
-    session: &mut InferenceSession,
+fn build_batch_entry<B: InferenceBackend>(
+    backend: &mut B,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
-) -> BatchEntry {
+) -> BatchEntry<B::Resources> {
     debug_assert!(max_batch_slots > 0);
     debug_assert!(max_batch_slots <= MAX_SESSION_BATCH_SIZE);
     let first = backlog
@@ -374,7 +365,7 @@ fn build_batch_entry(
         BatchStopReason::NonContiguous => metrics::inc_batch_stop_non_contig(),
     }
 
-    let mut batch = session.submit_batch(host_ptr, num_vectors);
+    let mut batch = backend.submit_batch(host_ptr, num_vectors);
     batch.input_slices = input_slices;
     BatchEntry {
         slot_count,
@@ -382,21 +373,6 @@ fn build_batch_entry(
         submitted_at: Instant::now(),
         batch,
     }
-}
-
-fn session_available(sessions: &[InferenceSession]) -> bool {
-    sessions.iter().any(InferenceSession::is_available)
-}
-
-fn try_reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> Option<usize> {
-    for _ in 0..sessions.len() {
-        let idx = *session_cursor % sessions.len();
-        *session_cursor = (*session_cursor + 1) % sessions.len();
-        if sessions[idx].try_acquire() {
-            return Some(idx);
-        }
-    }
-    None
 }
 
 fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
@@ -410,8 +386,6 @@ fn wait_for_completion_guard<'a>(
     let mut polled = false;
     let poller_ptr: *mut EventPoller<InferenceEvent, SingleConsumerBarrier> = poller;
     loop {
-        // SAFETY: InferenceConsumer owns the completion poller on a single thread. This helper retries
-        // until a guard is produced, then returns that guard directly.
         match unsafe { (*poller_ptr).poll_take(slot_count as u64) } {
             Ok(guard) => return Ok(guard),
             Err(Polling::NoEvents) => {
@@ -426,9 +400,9 @@ fn wait_for_completion_guard<'a>(
     }
 }
 
-fn process_batch(
+fn process_batch<R: Send>(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
-    entry: BatchEntry,
+    entry: BatchEntry<R>,
     response_queues: &[Arc<ResponseQueue>],
     registry: &Arc<ConnectionRegistry>,
     max_batch_slots: usize,
@@ -436,7 +410,7 @@ fn process_batch(
     let mut guard_ref = &mut *guard;
     let output =
         unsafe { std::slice::from_raw_parts(entry.batch.output_ptr, entry.batch.output_len) };
-    let mut output_offset: usize = 0;
+    let mut output_offset = 0usize;
 
     debug_assert!(entry.slot_count <= max_batch_slots);
     for _ in 0..entry.slot_count {
@@ -474,6 +448,6 @@ fn process_batch(
     #[cfg(feature = "metrics")]
     metrics::record_batch_total(entry.submitted_at.elapsed());
     drop(entry);
-    session_available.store(true, std::sync::atomic::Ordering::Release);
+    session_available.store(true, Ordering::Release);
     metrics::inc_batches_completed();
 }
