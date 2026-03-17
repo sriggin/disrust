@@ -322,7 +322,9 @@ fn run_sustained_pipeline_writer_test() {
     let mut observed = HashMap::new();
     while observed.len() < CONNECTIONS {
         let remaining = receive_deadline.saturating_duration_since(Instant::now());
-        let (conn, frames) = result_rx.recv_timeout(remaining).expect("recv reader result");
+        let (conn, frames) = result_rx
+            .recv_timeout(remaining)
+            .expect("recv reader result");
         observed.insert(conn, frames);
     }
 
@@ -358,19 +360,11 @@ fn snapshot_summary() -> String {
 }
 
 #[test]
-#[cfg_attr(
-    feature = "cuda",
-    ignore = "pipeline integration test is validated on the no-cuda path"
-)]
 fn inference_consumer_preserves_per_connection_order() {
     run_pipeline_order_test();
 }
 
 #[test]
-#[cfg_attr(
-    feature = "cuda",
-    ignore = "pipeline integration test is validated on the no-cuda path"
-)]
 fn inference_and_writer_sustain_progress() {
     run_sustained_pipeline_writer_test();
 }

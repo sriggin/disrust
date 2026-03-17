@@ -130,7 +130,9 @@ impl InferenceConsumer {
                     Ok(true) => progressed = true,
                     Ok(false) => break,
                     Err(Polling::Shutdown) => return,
-                    Err(Polling::NoEvents) => unreachable!("try_complete_front never returns NoEvents"),
+                    Err(Polling::NoEvents) => {
+                        unreachable!("try_complete_front never returns NoEvents")
+                    }
                 }
             }
 

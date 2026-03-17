@@ -852,7 +852,7 @@ fn run_scenario(
     addr: &str,
     scenario: Scenario,
     event_loop_cpu: Option<usize>,
-    _reporter_cpu: Option<usize>,
+    reporter_cpu: Option<usize>,
 ) {
     assert!(scenario.threads > 0, "threads must be > 0");
     let run_plan = RunPlan::new(&scenario.stop_mode);
@@ -948,8 +948,18 @@ fn run_scenario(
         }
         StopMode::Duration { .. } => {
             let (_, rx) = report_rx.expect("latency reporting channel missing");
+            let reporter = thread::Builder::new()
+                .name("client-reporter".into())
+                .spawn(move || {
+                    if let Some(cpu) = reporter_cpu {
+                        affinity::pin_current_thread(cpu, "client-reporter")
+                            .unwrap_or_else(|e| panic!("{e}"));
+                    }
+                    report_worker_intervals(rx, scenario.threads, run_plan.warmup_end)
+                })
+                .expect("failed to spawn client reporter");
             let (snapshot, end, measured_completions) =
-                report_worker_intervals(rx, scenario.threads, run_plan.warmup_end);
+                reporter.join().expect("reporter thread panicked");
             for handle in handles {
                 let outcome = handle.join().expect("worker thread panicked");
                 debug_assert!(outcome.total_completed >= outcome.measured_completions);
