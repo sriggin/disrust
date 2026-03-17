@@ -1,5 +1,5 @@
 //! SubmissionConsumer: drains request-ring events into a local backlog, forms batches,
-//! submits to ORT, and pushes BatchEntry values to the batch queue.
+//! submits to the inference backend, and pushes BatchEntry values to the batch queue.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::metrics;
 use crate::pipeline::batch_queue::{BatchEntry, BatchQueue};
 use crate::ring_types::InferenceEvent;
 
-use super::session::InferenceSession;
+use super::session::InferenceBackend;
 
 pub(crate) struct PendingSlot {
     pub(crate) features: PoolSlice,
@@ -30,12 +30,10 @@ enum BatchStopReason {
     NonContiguous,
 }
 
-pub struct SubmissionConsumer {
+pub struct SubmissionConsumer<B: InferenceBackend> {
     poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
-    sessions: Vec<InferenceSession>,
-    /// Round-robin session index.
-    session_cursor: usize,
-    batch_queue: Arc<BatchQueue>,
+    backend: B,
+    batch_queue: Arc<BatchQueue<B::Resources>>,
     backlog: VecDeque<PendingSlot>,
     max_batch_slots: usize,
     batch_coalesce_timeout: Duration,
@@ -44,13 +42,13 @@ pub struct SubmissionConsumer {
 }
 
 // SAFETY: SubmissionConsumer runs on a single dedicated thread.
-unsafe impl Send for SubmissionConsumer {}
+unsafe impl<B: InferenceBackend> Send for SubmissionConsumer<B> {}
 
-impl SubmissionConsumer {
+impl<B: InferenceBackend> SubmissionConsumer<B> {
     pub fn new(
         poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
-        sessions: Vec<InferenceSession>,
-        batch_queue: Arc<BatchQueue>,
+        backend: B,
+        batch_queue: Arc<BatchQueue<B::Resources>>,
         max_batch_slots: usize,
         batch_coalesce_timeout: Duration,
     ) -> Self {
@@ -61,8 +59,7 @@ impl SubmissionConsumer {
         );
         Self {
             poller,
-            sessions,
-            session_cursor: 0,
+            backend,
             batch_queue,
             backlog: VecDeque::new(),
             max_batch_slots,
@@ -106,7 +103,7 @@ impl SubmissionConsumer {
             }
 
             if self.backlog.len() < self.max_batch_slots {
-                if !session_available(&self.sessions) {
+                if !self.backend.is_available() {
                     idle_wait(&mut idle_loops);
                     continue;
                 }
@@ -125,23 +122,27 @@ impl SubmissionConsumer {
                 }
             }
 
-            let idx = if self.backlog.len() >= self.max_batch_slots {
-                reserve_session(&self.sessions, &mut self.session_cursor)
-            } else if let Some(idx) = try_reserve_session(&self.sessions, &mut self.session_cursor)
-            {
-                idx
+            let acquired = if self.backlog.len() >= self.max_batch_slots {
+                // Full batch — spin until a slot is free.
+                metrics::inc_session_waits();
+                loop {
+                    if self.backend.try_acquire() {
+                        break true;
+                    }
+                    std::hint::spin_loop();
+                }
             } else {
+                self.backend.try_acquire()
+            };
+            if !acquired {
                 std::hint::spin_loop();
                 continue;
-            };
+            }
             if let Some(started) = self.backlog_started_at {
                 metrics::record_backlog_age(started.elapsed());
             }
-            let batch_entry = build_batch_entry(
-                &mut self.sessions[idx],
-                &mut self.backlog,
-                self.max_batch_slots,
-            );
+            let batch_entry =
+                build_batch_entry(&mut self.backend, &mut self.backlog, self.max_batch_slots);
             metrics::inc_batches_submitted();
             metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
             if self.backlog.is_empty() {
@@ -211,11 +212,11 @@ fn take_event_features(event: &InferenceEvent) -> PoolSlice {
     }
 }
 
-pub(crate) fn build_batch_entry(
-    session: &mut InferenceSession,
+pub(crate) fn build_batch_entry<B: InferenceBackend>(
+    backend: &mut B,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
-) -> BatchEntry {
+) -> BatchEntry<B::Resources> {
     let first = backlog
         .front()
         .expect("build_batch_entry requires non-empty backlog");
@@ -261,7 +262,7 @@ pub(crate) fn build_batch_entry(
         BatchStopReason::NonContiguous => metrics::inc_batch_stop_non_contig(),
     }
 
-    let mut batch = session.submit_batch(host_ptr, num_vectors);
+    let mut batch = backend.submit_batch(host_ptr, num_vectors);
     batch.input_slices = input_slices;
 
     BatchEntry {
@@ -270,32 +271,4 @@ pub(crate) fn build_batch_entry(
         submitted_at: Instant::now(),
         batch,
     }
-}
-
-pub(crate) fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> usize {
-    metrics::inc_session_waits();
-    loop {
-        if let Some(idx) = try_reserve_session(sessions, session_cursor) {
-            return idx;
-        }
-        std::hint::spin_loop();
-    }
-}
-
-pub(crate) fn try_reserve_session(
-    sessions: &[InferenceSession],
-    session_cursor: &mut usize,
-) -> Option<usize> {
-    for _ in 0..sessions.len() {
-        let idx = *session_cursor;
-        *session_cursor = (idx + 1) % sessions.len();
-        if sessions[idx].try_acquire() {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-pub(crate) fn session_available(sessions: &[InferenceSession]) -> bool {
-    sessions.iter().any(InferenceSession::is_available)
 }

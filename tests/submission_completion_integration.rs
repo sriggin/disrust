@@ -17,12 +17,12 @@ use disrust::buffer_pool::BufferPool;
 use disrust::config::{BATCH_QUEUE_CAPACITY, SLAB_CAPACITY};
 use disrust::constants::FEATURE_DIM;
 use disrust::metrics;
+use disrust::pipeline::OrtBackend;
 use disrust::pipeline::batch_queue::BatchQueue;
 use disrust::pipeline::completion::CompletionConsumer;
 use disrust::pipeline::connection_registry::{ConnectionRegistry, WriteResult};
 use disrust::pipeline::inference::InferenceConsumer;
 use disrust::pipeline::ready_queue::{ConnectionRef, ReadyQueue};
-use disrust::pipeline::session::InferenceSession;
 use disrust::pipeline::submission::SubmissionConsumer;
 use disrust::pipeline::verify_ort_dylib_present;
 use disrust::pipeline::writer::WriterConsumer;
@@ -70,7 +70,6 @@ fn run_pipeline_order_test(mode: PipelineMode) {
 
     let model_bytes =
         std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
-    let sessions = vec![InferenceSession::new(&model_bytes)];
 
     let ready_queue = Arc::new(ReadyQueue::new(32));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
@@ -80,7 +79,7 @@ fn run_pipeline_order_test(mode: PipelineMode) {
             let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
             let submission = SubmissionConsumer::new(
                 submission_poller,
-                sessions,
+                OrtBackend::new(&model_bytes, 1),
                 Arc::clone(&batch_queue),
                 256,
                 Duration::from_micros(500),
@@ -106,7 +105,7 @@ fn run_pipeline_order_test(mode: PipelineMode) {
             let inference = InferenceConsumer::new(
                 submission_poller,
                 completion_poller,
-                sessions,
+                OrtBackend::new(&model_bytes, 1),
                 Arc::clone(&ready_queue),
                 Arc::clone(&registry),
                 256,
@@ -234,7 +233,7 @@ fn spawn_pipeline_threads(
     mode: PipelineMode,
     submission_poller: disruptor::EventPoller<InferenceEvent, disruptor::MultiProducerBarrier>,
     completion_poller: disruptor::EventPoller<InferenceEvent, disruptor::SingleConsumerBarrier>,
-    sessions: Vec<InferenceSession>,
+    backend: OrtBackend,
     ready_queue: Arc<ReadyQueue>,
     registry: Arc<ConnectionRegistry>,
     stop: Arc<AtomicBool>,
@@ -244,7 +243,7 @@ fn spawn_pipeline_threads(
             let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
             let submission = SubmissionConsumer::new(
                 submission_poller,
-                sessions,
+                backend,
                 Arc::clone(&batch_queue),
                 256,
                 Duration::from_micros(500),
@@ -274,7 +273,7 @@ fn spawn_pipeline_threads(
             let inference = InferenceConsumer::new(
                 submission_poller,
                 completion_poller,
-                sessions,
+                backend,
                 ready_queue,
                 registry,
                 256,
@@ -305,7 +304,6 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
 
     let model_bytes =
         std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
-    let sessions = vec![InferenceSession::new(&model_bytes)];
 
     let ready_queue = Arc::new(ReadyQueue::new(128));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
@@ -315,7 +313,7 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
         mode,
         submission_poller,
         completion_poller,
-        sessions,
+        OrtBackend::new(&model_bytes, 1),
         Arc::clone(&ready_queue),
         Arc::clone(&registry),
         Arc::clone(&stop),

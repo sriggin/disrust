@@ -16,7 +16,10 @@
       "Bash(echo Failed:*)",
       "Bash(cargo rustc:*)",
       "Bash(cargo build:*)",
-      "Bash(timeout 5 ./target/debug/ort-verify --cpu --model tests/models/verify.onnx 2>&1; echo \"exit: $?\")"
+      "Bash(timeout 5 ./target/debug/ort-verify --cpu --model tests/models/verify.onnx 2>&1; echo \"exit: $?\")",
+      "Bash(cargo test:*)",
+      "Bash(ORT_DYLIB_PATH=/home/sriggin/dev/sean/disrust/.local/onnxruntime/current/lib/libonnxruntime.so cargo bench --bench pipeline_bench 2>&1)",
+      "Bash(ORT_DYLIB_PATH=/home/sriggin/dev/sean/disrust/.local/onnxruntime/current/lib/libonnxruntime.so cargo bench --bench pipeline_bench --no-default-features 2>&1)"
     ]
   }
 }

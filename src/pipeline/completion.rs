@@ -17,9 +17,9 @@ use crate::pipeline::session::BatchPoll;
 use crate::protocol;
 use crate::ring_types::InferenceEvent;
 
-pub struct CompletionConsumer {
+pub struct CompletionConsumer<R: Send> {
     poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-    batch_queue: Arc<BatchQueue>,
+    batch_queue: Arc<BatchQueue<R>>,
     ready_queue: Arc<ReadyQueue>,
     registry: Arc<ConnectionRegistry>,
     max_batch_slots: usize,
@@ -27,12 +27,12 @@ pub struct CompletionConsumer {
 }
 
 // SAFETY: CompletionConsumer runs on a single dedicated thread.
-unsafe impl Send for CompletionConsumer {}
+unsafe impl<R: Send> Send for CompletionConsumer<R> {}
 
-impl CompletionConsumer {
+impl<R: Send> CompletionConsumer<R> {
     pub fn new(
         poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-        batch_queue: Arc<BatchQueue>,
+        batch_queue: Arc<BatchQueue<R>>,
         ready_queue: Arc<ReadyQueue>,
         registry: Arc<ConnectionRegistry>,
         max_batch_slots: usize,
@@ -134,9 +134,9 @@ fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
     stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
-pub(crate) fn process_batch(
+pub(crate) fn process_batch<R: Send>(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
-    entry: BatchEntry,
+    entry: BatchEntry<R>,
     ready_queue: &Arc<ReadyQueue>,
     registry: &Arc<ConnectionRegistry>,
     max_batch_slots: usize,

@@ -2,16 +2,16 @@
 use std::sync::atomic::Ordering;
 
 use clap::Args;
-use ort::{init_from, session::Session};
+use ort::session::Session;
 
 use crate::config::ORT_INTRA_THREADS;
 use crate::constants::FEATURE_DIM as FDIM;
 use crate::pipeline::verify_ort_dylib_present;
+#[cfg(feature = "cuda")]
+use crate::pipeline::{InferenceBackend, OrtBackend};
 
 #[cfg(feature = "cuda")]
 use crate::cuda::memory::{alloc_pinned, free_pinned};
-#[cfg(feature = "cuda")]
-use crate::pipeline::session::InferenceSession;
 
 #[derive(Args, Clone)]
 pub struct VerifyArgs {
@@ -60,13 +60,13 @@ pub fn run(args: VerifyArgs) {
         false
     };
 
+    // ORT runtime init (dylib location + ort::init_from).
     let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
         eprintln!("disrust verify preflight failed: {e}");
         std::process::exit(1);
     });
     eprintln!("disrust verify: using ORT dylib {}", ort_dylib.display());
-
-    let committed = init_from(&ort_dylib)
+    let committed = ort::init_from(&ort_dylib)
         .unwrap_or_else(|e| {
             eprintln!("disrust verify preflight failed: ort::init_from failed: {e}");
             std::process::exit(1);
@@ -164,8 +164,8 @@ fn run_cpu_verify(model_bytes: &[u8], args: &VerifyArgs) {
 #[cfg(feature = "cuda")]
 fn run_cuda_verify(model_bytes: &[u8], args: &VerifyArgs) {
     let input_elems = args.batch * FDIM;
-    let mut session = InferenceSession::with_output_capacity(model_bytes, args.batch);
-    let output_name = session.output_name().to_string();
+    let mut backend = OrtBackend::new_with_capacity(model_bytes, args.batch);
+    let output_name = backend.output_name().to_string();
 
     let input_ptr = alloc_pinned(input_elems * std::mem::size_of::<f32>()).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -184,12 +184,12 @@ fn run_cuda_verify(model_bytes: &[u8], args: &VerifyArgs) {
         }
     }
 
-    if !session.try_acquire() {
-        eprintln!("fresh InferenceSession was unexpectedly unavailable");
+    if !backend.try_acquire() {
+        eprintln!("fresh OrtBackend was unexpectedly unavailable");
         std::process::exit(1);
     }
 
-    let batch = session.submit_batch(input_ptr, args.batch);
+    let batch = backend.submit_batch(input_ptr, args.batch);
     batch.completion.wait();
 
     let output = unsafe { std::slice::from_raw_parts(batch.output_ptr, batch.output_len) };

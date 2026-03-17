@@ -4,7 +4,6 @@ use std::thread;
 
 use clap::Args;
 use disruptor::{BusySpin, build_multi_producer};
-use ort::init_from;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::affinity;
@@ -17,9 +16,8 @@ use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::inference::InferenceConsumer;
 use crate::pipeline::ready_queue::ReadyQueue;
-use crate::pipeline::session::InferenceSession;
 use crate::pipeline::writer::WriterConsumer;
-use crate::pipeline::{make_pool, verify_ort_dylib_present};
+use crate::pipeline::{InferenceBackend, OrtBackend};
 use crate::ring_types::InferenceEvent;
 
 mod ingress;
@@ -132,28 +130,7 @@ pub fn run(args: ServeArgs) {
     if let Some(cpu) = args.writer_cpu {
         eprintln!("disrust: writer_cpu={cpu}");
     }
-    let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
-        eprintln!("disrust preflight failed: {e}");
-        std::process::exit(1);
-    });
-    eprintln!("disrust: using ORT dylib {}", ort_dylib.display());
-    eprintln!("disrust: initializing ONNX Runtime");
-    let committed = init_from(&ort_dylib)
-        .unwrap_or_else(|e| {
-            eprintln!("disrust preflight failed: ort::init_from failed: {e}");
-            std::process::exit(1);
-        })
-        .commit();
-    eprintln!("disrust: ONNX Runtime initialized (fresh={committed})");
-
-    #[cfg(feature = "cuda")]
-    {
-        crate::cuda::preflight::verify_cuda_startup().unwrap_or_else(|e| {
-            eprintln!("disrust preflight failed: {e}");
-            std::process::exit(1);
-        });
-        eprintln!("disrust: CUDA driver preflight ok");
-    }
+    OrtBackend::init();
 
     set_factory_pool(BufferPool::new_boxed(1));
 
@@ -162,14 +139,10 @@ pub fn run(args: ServeArgs) {
         std::process::exit(1);
     });
 
-    let sessions: Vec<InferenceSession> = (0..SESSION_POOL_SIZE)
-        .map(|i| {
-            eprintln!("disrust: loading session {}/{}", i + 1, SESSION_POOL_SIZE);
-            InferenceSession::new(&model_bytes)
-        })
-        .collect();
+    eprintln!("disrust: loading {} session(s)", SESSION_POOL_SIZE);
+    let backend = OrtBackend::new(&model_bytes, SESSION_POOL_SIZE);
 
-    let pool = make_pool();
+    let pool = OrtBackend::make_pool();
     let allocator = pool.allocator();
 
     eprintln!(
@@ -198,7 +171,7 @@ pub fn run(args: ServeArgs) {
     let inference_consumer = InferenceConsumer::new(
         submission_poller,
         completion_poller,
-        sessions,
+        backend,
         Arc::clone(&ready_queue),
         Arc::clone(&registry),
         max_batch_slots,

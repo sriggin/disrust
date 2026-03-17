@@ -17,8 +17,8 @@ use clap::Parser;
 use ort::init_from;
 
 use disrust::pipeline::batch_queue::{BatchEntry, BatchQueue};
-use disrust::pipeline::session::{BatchPoll, InferenceSession};
-use disrust::pipeline::{make_pool, verify_ort_dylib_present};
+use disrust::pipeline::session::{BatchPoll, OrtBatchResources};
+use disrust::pipeline::{InferenceBackend, OrtBackend, verify_ort_dylib_present};
 
 #[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
@@ -80,18 +80,8 @@ fn main() {
     );
     eprintln!("num_vectors,batches_per_s,vectors_per_s,avg_us");
 
-    // Pool is allocated once and shared across all bench sizes, matching server behaviour.
-    let pool = make_pool();
-    let mut alloc = pool.allocator();
-
     for num_vectors in batch_vectors {
-        let stats = bench_pipeline(
-            &model_bytes,
-            num_vectors,
-            &mut alloc,
-            args.warmup_iters,
-            args.iters,
-        );
+        let stats = bench_pipeline(&model_bytes, num_vectors, args.warmup_iters, args.iters);
         println!(
             "{},{:.0},{:.0},{:.1}",
             num_vectors, stats.batches_per_s, stats.vectors_per_s, stats.avg_us
@@ -117,15 +107,17 @@ fn stats_from_elapsed(elapsed: Duration, iters: usize, vectors_per_batch: usize)
 fn bench_pipeline(
     model_bytes: &[u8],
     num_vectors: usize,
-    alloc: &mut disrust::buffer_pool::PoolAllocator,
     warmup_iters: usize,
     iters: usize,
 ) -> Stats {
     use disrust::constants::FEATURE_DIM;
 
-    let mut session = InferenceSession::with_output_capacity(model_bytes, num_vectors);
+    let mut backend = OrtBackend::new_with_capacity(model_bytes, num_vectors);
+    // Pool allocated after session construction so CUDA context exists for cuMemAllocHost_v2.
+    let pool = OrtBackend::make_pool();
+    let mut alloc = pool.allocator();
     // capacity 2: one in flight + one slack to avoid push/pop deadlock at boundary
-    let batch_queue = Arc::new(BatchQueue::new(2));
+    let batch_queue = Arc::new(BatchQueue::<OrtBatchResources>::new(2));
     let done = Arc::new(AtomicBool::new(false));
 
     let comp_handle = {
@@ -141,11 +133,12 @@ fn bench_pipeline(
     let input = alloc
         .alloc(num_vectors * FEATURE_DIM)
         .expect("pool alloc failed for bench input");
+    let _ = alloc;
     let input = input.freeze();
     let host_ptr = input.as_slice().as_ptr();
 
     drive(
-        &mut session,
+        &mut backend,
         host_ptr,
         num_vectors,
         &batch_queue,
@@ -153,7 +146,7 @@ fn bench_pipeline(
     );
 
     let start = Instant::now();
-    drive(&mut session, host_ptr, num_vectors, &batch_queue, iters);
+    drive(&mut backend, host_ptr, num_vectors, &batch_queue, iters);
     let elapsed = start.elapsed();
 
     done.store(true, Ordering::Release);
@@ -163,20 +156,20 @@ fn bench_pipeline(
     stats_from_elapsed(elapsed, iters, num_vectors)
 }
 
-/// Submission side: acquire session, submit batch, push to queue. Repeats `iters` times,
+/// Submission side: acquire backend, submit batch, push to queue. Repeats `iters` times,
 /// then waits for the last batch to complete before returning.
 fn drive(
-    session: &mut InferenceSession,
+    backend: &mut OrtBackend,
     host_ptr: *const f32,
     num_vectors: usize,
-    batch_queue: &BatchQueue,
+    batch_queue: &BatchQueue<OrtBatchResources>,
     iters: usize,
 ) {
     for _ in 0..iters {
-        while !session.try_acquire() {
+        while !backend.try_acquire() {
             std::hint::spin_loop();
         }
-        let batch = session.submit_batch(black_box(host_ptr), num_vectors);
+        let batch = backend.submit_batch(black_box(host_ptr), num_vectors);
         batch_queue.push(BatchEntry {
             slot_count: 1,
             #[cfg(feature = "metrics")]
@@ -185,13 +178,13 @@ fn drive(
         });
     }
     // wait for the last batch to be released by the completion thread
-    while !session.is_available() {
+    while !backend.is_available() {
         std::hint::spin_loop();
     }
 }
 
 /// Completion side: pop batches, spin-poll until ready, black-box the output, release session.
-fn completion_thread(batch_queue: Arc<BatchQueue>, done: Arc<AtomicBool>) {
+fn completion_thread(batch_queue: Arc<BatchQueue<OrtBatchResources>>, done: Arc<AtomicBool>) {
     loop {
         if let Some(entry) = batch_queue.pop() {
             loop {

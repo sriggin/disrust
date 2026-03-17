@@ -9,31 +9,27 @@ use crate::metrics;
 use crate::pipeline::batch_queue::BatchEntry;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::ready_queue::ReadyQueue;
-use crate::pipeline::session::{BatchPoll, InferenceSession};
+use crate::pipeline::session::{BatchPoll, InferenceBackend};
 use crate::ring_types::InferenceEvent;
 
 use super::completion::process_batch;
-use super::submission::{
-    PendingSlot, build_batch_entry, drain_visible_events, idle_wait, session_available,
-    try_reserve_session,
-};
+use super::submission::{PendingSlot, build_batch_entry, drain_visible_events, idle_wait};
 
 const MAX_COMPLETIONS_PER_PASS: usize = 8;
 const MAX_SUBMISSIONS_PER_PASS: usize = 8;
 
-struct InflightBatchEntry {
-    entry: BatchEntry,
+struct InflightBatchEntry<R: Send> {
+    entry: BatchEntry<R>,
     #[cfg(feature = "metrics")]
     wait_started_at: Option<Instant>,
 }
 
-pub struct InferenceConsumer {
+pub struct InferenceConsumer<B: InferenceBackend> {
     submission_poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
     completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-    sessions: Vec<InferenceSession>,
-    session_cursor: usize,
+    backend: B,
     backlog: VecDeque<PendingSlot>,
-    inflight: VecDeque<InflightBatchEntry>,
+    inflight: VecDeque<InflightBatchEntry<B::Resources>>,
     ready_queue: Arc<ReadyQueue>,
     registry: Arc<ConnectionRegistry>,
     max_batch_slots: usize,
@@ -43,13 +39,14 @@ pub struct InferenceConsumer {
     timers_idle: bool,
 }
 
-unsafe impl Send for InferenceConsumer {}
+// SAFETY: InferenceConsumer runs on a single dedicated thread.
+unsafe impl<B: InferenceBackend> Send for InferenceConsumer<B> {}
 
-impl InferenceConsumer {
+impl<B: InferenceBackend> InferenceConsumer<B> {
     pub fn new(
         submission_poller: EventPoller<InferenceEvent, MultiProducerBarrier>,
         completion_poller: EventPoller<InferenceEvent, SingleConsumerBarrier>,
-        sessions: Vec<InferenceSession>,
+        backend: B,
         ready_queue: Arc<ReadyQueue>,
         registry: Arc<ConnectionRegistry>,
         max_batch_slots: usize,
@@ -58,8 +55,7 @@ impl InferenceConsumer {
         Self {
             submission_poller,
             completion_poller,
-            sessions,
-            session_cursor: 0,
+            backend,
             backlog: VecDeque::new(),
             inflight: VecDeque::new(),
             ready_queue,
@@ -113,7 +109,9 @@ impl InferenceConsumer {
                     Ok(true) => progressed = true,
                     Ok(false) => break,
                     Err(Polling::Shutdown) => return,
-                    Err(Polling::NoEvents) => unreachable!("try_complete_front never returns NoEvents"),
+                    Err(Polling::NoEvents) => {
+                        unreachable!("try_complete_front never returns NoEvents")
+                    }
                 }
             }
 
@@ -149,7 +147,7 @@ impl InferenceConsumer {
         }
 
         if self.backlog.len() < self.max_batch_slots {
-            if !session_available(&self.sessions) {
+            if !self.backend.is_available() {
                 return false;
             }
             if self.batch_coalesce_timeout > Duration::ZERO && self.coalesce_check_spins < 64 {
@@ -165,21 +163,18 @@ impl InferenceConsumer {
             }
         }
 
-        let Some(idx) = try_reserve_session(&self.sessions, &mut self.session_cursor) else {
+        if !self.backend.try_acquire() {
             if self.backlog.len() >= self.max_batch_slots {
                 metrics::inc_session_waits();
             }
             return false;
-        };
+        }
 
         if let Some(started) = self.backlog_started_at {
             metrics::record_backlog_age(started.elapsed());
         }
-        let batch_entry = build_batch_entry(
-            &mut self.sessions[idx],
-            &mut self.backlog,
-            self.max_batch_slots,
-        );
+        let batch_entry =
+            build_batch_entry(&mut self.backend, &mut self.backlog, self.max_batch_slots);
         metrics::inc_batches_submitted();
         metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
         if self.backlog.is_empty() {
