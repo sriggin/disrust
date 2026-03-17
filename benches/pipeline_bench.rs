@@ -14,11 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use ort::init_from;
 
 use disrust::pipeline::batch_queue::{BatchEntry, BatchQueue};
 use disrust::pipeline::session::{BatchPoll, OrtBatchResources};
-use disrust::pipeline::{InferenceBackend, OrtBackend, verify_ort_dylib_present};
+use disrust::pipeline::{InferenceBackend, OrtBackend};
 
 #[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
@@ -46,11 +45,6 @@ struct Args {
 fn main() {
     let filtered_args = std::env::args().filter(|arg| arg != "--bench");
     let args = Args::parse_from(filtered_args);
-
-    let ort_dylib = verify_ort_dylib_present().expect("ORT dylib preflight failed");
-    init_from(&ort_dylib)
-        .expect("ort::init_from failed")
-        .commit();
 
     #[cfg(feature = "cuda")]
     verify_cuda_startup().expect("CUDA preflight failed");

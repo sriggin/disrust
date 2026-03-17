@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 use clap::{Parser, ValueEnum};
-#[cfg(feature = "cuda")]
-use ort::init_from;
 
 #[cfg(feature = "cuda")]
 use disrust::buffer_pool::{BufferPool, PoolSlice, set_factory_pool};
@@ -19,7 +17,7 @@ use disrust::cuda::memory::{alloc_pinned, free_pinned};
 #[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
 #[cfg(feature = "cuda")]
-use disrust::pipeline::{InferenceBackend, OrtBackend, verify_ort_dylib_present};
+use disrust::pipeline::{InferenceBackend, OrtBackend};
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -82,10 +80,6 @@ fn main() {
     if args.vectors_per_slot == 0 {
         panic!("--vectors-per-slot must be > 0");
     }
-    let ort_dylib = verify_ort_dylib_present().expect("ORT dylib preflight failed");
-    init_from(&ort_dylib)
-        .expect("ort::init_from failed")
-        .commit();
     verify_cuda_startup().expect("CUDA preflight failed");
     let _ = set_factory_pool(BufferPool::new_boxed(1));
 

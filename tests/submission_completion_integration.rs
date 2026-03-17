@@ -3,14 +3,13 @@ mod common;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::fd::IntoRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use disruptor::{BusySpin, Producer, build_multi_producer};
-use ort::init_from;
 use std::os::unix::net::UnixStream;
 
 use disrust::buffer_pool::BufferPool;
@@ -24,30 +23,13 @@ use disrust::pipeline::connection_registry::{ConnectionRegistry, WriteResult};
 use disrust::pipeline::inference::InferenceConsumer;
 use disrust::pipeline::ready_queue::{ConnectionRef, ReadyQueue};
 use disrust::pipeline::submission::SubmissionConsumer;
-use disrust::pipeline::verify_ort_dylib_present;
 use disrust::pipeline::writer::WriterConsumer;
 use disrust::ring_types::InferenceEvent;
-
-#[cfg(feature = "cuda")]
-use disrust::cuda::preflight::verify_cuda_startup;
 
 #[derive(Clone, Copy)]
 enum PipelineMode {
     Split,
     Merged,
-}
-
-fn ensure_ort_init() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let ort_dylib = verify_ort_dylib_present().expect("ORT dylib preflight failed");
-        init_from(&ort_dylib)
-            .expect("ort::init_from failed")
-            .commit();
-
-        #[cfg(feature = "cuda")]
-        verify_cuda_startup().expect("CUDA preflight failed");
-    });
 }
 
 fn encode_expected_response(fill: f32) -> [u8; 5] {
@@ -60,7 +42,6 @@ fn encode_expected_response(fill: f32) -> [u8; 5] {
 
 fn run_pipeline_order_test(mode: PipelineMode) {
     common::init_factory_pool();
-    ensure_ort_init();
 
     const RING_SIZE: usize = 256;
     let builder = build_multi_producer(RING_SIZE, InferenceEvent::factory, BusySpin);
@@ -291,7 +272,6 @@ fn spawn_pipeline_threads(
 
 fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
     common::init_factory_pool();
-    ensure_ort_init();
 
     const RING_SIZE: usize = 512;
     const CONNECTIONS: usize = 4;

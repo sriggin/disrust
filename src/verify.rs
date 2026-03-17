@@ -6,7 +6,6 @@ use ort::session::Session;
 
 use crate::config::ORT_INTRA_THREADS;
 use crate::constants::FEATURE_DIM as FDIM;
-use crate::pipeline::verify_ort_dylib_present;
 #[cfg(feature = "cuda")]
 use crate::pipeline::{InferenceBackend, OrtBackend};
 
@@ -59,20 +58,6 @@ pub fn run(args: VerifyArgs) {
         }
         false
     };
-
-    // ORT runtime init (dylib location + ort::init_from).
-    let ort_dylib = verify_ort_dylib_present().unwrap_or_else(|e| {
-        eprintln!("disrust verify preflight failed: {e}");
-        std::process::exit(1);
-    });
-    eprintln!("disrust verify: using ORT dylib {}", ort_dylib.display());
-    let committed = ort::init_from(&ort_dylib)
-        .unwrap_or_else(|e| {
-            eprintln!("disrust verify preflight failed: ort::init_from failed: {e}");
-            std::process::exit(1);
-        })
-        .commit();
-    eprintln!("disrust verify: ONNX Runtime initialized (fresh={committed})");
 
     #[cfg(feature = "cuda")]
     if use_cuda {

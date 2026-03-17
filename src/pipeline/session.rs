@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use ort::{
-    AsPointer, api, init_from,
+    AsPointer, api,
     memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::Session,
     sys,
@@ -603,20 +603,6 @@ impl InferenceBackend for OrtBackend {
     type Resources = OrtBatchResources;
 
     fn init() {
-        let ort_dylib = super::verify_ort_dylib_present().unwrap_or_else(|e| {
-            eprintln!("disrust preflight failed: {e}");
-            std::process::exit(1);
-        });
-        eprintln!("disrust: using ORT dylib {}", ort_dylib.display());
-        eprintln!("disrust: initializing ONNX Runtime");
-        let committed = init_from(&ort_dylib)
-            .unwrap_or_else(|e| {
-                eprintln!("disrust preflight failed: ort::init_from failed: {e}");
-                std::process::exit(1);
-            })
-            .commit();
-        eprintln!("disrust: ONNX Runtime initialized (fresh={committed})");
-
         #[cfg(feature = "cuda")]
         {
             crate::cuda::preflight::verify_cuda_startup().unwrap_or_else(|e| {
