@@ -148,49 +148,51 @@ where
                     &self.registry,
                     key,
                 );
-                continue;
-            }
+                reap_retired_connections(&mut conns, &self.registry);
+            } else {
+                ring.wait(1);
+                cqe_buf.clear();
+                ring.drain_cqes_into(&mut cqe_buf);
+                reap_retired_connections(&mut conns, &self.registry);
 
-            ring.wait(1);
-            cqe_buf.clear();
-            ring.drain_cqes_into(&mut cqe_buf);
-
-            for &(user_data, result) in &cqe_buf {
-                let (op, key) = decode_user_data(user_data);
-                match op {
-                    OP_ACCEPT => handle_accept(
-                        &mut ring,
-                        &mut conns,
-                        result,
-                        self.thread_id,
-                        self.listen_fd,
-                        &self.registry,
-                    ),
-                    OP_READ => handle_read(
-                        &mut ring,
-                        &mut conns,
-                        &mut parse_queue,
-                        &mut self.producer,
-                        &mut self.allocator,
-                        &self.publish_gate,
-                        &self.registry,
-                        key,
-                        result,
-                    ),
-                    _ => {}
+                for &(user_data, result) in &cqe_buf {
+                    let (op, key) = decode_user_data(user_data);
+                    match op {
+                        OP_ACCEPT => handle_accept(
+                            &mut ring,
+                            &mut conns,
+                            result,
+                            self.thread_id,
+                            self.listen_fd,
+                            &self.registry,
+                        ),
+                        OP_READ => handle_read(
+                            &mut ring,
+                            &mut conns,
+                            &mut parse_queue,
+                            &mut self.producer,
+                            &mut self.allocator,
+                            &self.publish_gate,
+                            &self.registry,
+                            key,
+                            result,
+                        ),
+                        _ => {}
+                    }
                 }
-            }
-
-            let retired: Vec<u16> = conns
-                .iter()
-                .filter_map(|(k, c)| {
-                    (c.read_closed && self.registry.is_retired(c.conn)).then_some(k as u16)
-                })
-                .collect();
-            for key in retired {
-                conns.try_remove(key as usize);
+                reap_retired_connections(&mut conns, &self.registry);
             }
         }
+    }
+}
+
+fn reap_retired_connections(conns: &mut Slab<Connection>, registry: &Arc<ConnectionRegistry>) {
+    let retired: Vec<u16> = conns
+        .iter()
+        .filter_map(|(k, c)| (c.read_closed && registry.is_retired(c.conn)).then_some(k as u16))
+        .collect();
+    for key in retired {
+        conns.try_remove(key as usize);
     }
 }
 
