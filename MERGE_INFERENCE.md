@@ -460,6 +460,164 @@ Decision:
 - kept
 - should be committed
 
+### Attempt 6: Compile Out `publish_to_submit` Timing In Non-Metrics Builds
+
+Change:
+
+- [submission.rs](/home/sriggin/dev/sean/disrust/src/pipeline/submission.rs)
+
+Details:
+
+- removed `PendingSlot.published_at_ns` in non-metrics builds
+- compiled out the `elapsed_since_ns(next.published_at_ns)` call inside `build_batch_entry()` when
+  the `metrics` feature is disabled
+
+Why this was tried:
+
+- `perf` on the retained baseline still showed visible `clock_gettime` activity in the merged
+  inference lane
+- `build_batch_entry()` still computed `publish_to_submit` timing even though
+  `record_publish_to_submit()` is a no-op in non-metrics builds
+
+Validation:
+
+- [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
+  still passed
+- `cargo clippy --all-targets --no-default-features -- -D warnings` passed
+- `cargo check --no-default-features --bench pipeline_bench` passed
+
+Before / after relative to the current retained baseline:
+
+1. Narrow/deep (`2` client workers, `16` connections, `window=64`)
+
+Before:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115439/context.md)
+- `qps 1015124`
+- `p50 1800.2us`
+- `p95 1870.8us`
+- `p99 2012.2us`
+
+After:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115855/context.md)
+- `qps 982485`
+- `p50 1854.5us`
+- `p95 1927.2us`
+- `p99 2611.2us`
+
+Interpretation:
+
+- throughput regressed materially
+- p50, p95, and p99 all regressed
+
+2. Wide/shallow (`2` client workers, `250` connections, `window=2`)
+
+Before:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115536/context.md)
+- `qps 794179`
+- `p50 1118.2us`
+- `p95 1272.8us`
+- `p99 1818.6us`
+
+After:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115954/context.md)
+- `qps 763482`
+- `p50 1137.7us`
+- `p95 1546.2us`
+- `p99 2299.9us`
+
+Interpretation:
+
+- throughput regressed
+- p95 and p99 regressed materially
+
+Decision:
+
+- rejected
+- change backed out
+
+### Attempt 7: Right-Size `ResponseFrame` Storage
+
+Change:
+
+- [connection_registry.rs](/home/sriggin/dev/sean/disrust/src/pipeline/connection_registry.rs)
+
+Details:
+
+- changed `ResponseFrame.data` from an inline `[u8; WRITE_BUF_SIZE]` to a right-sized `Box<[u8]>`
+- goal was to keep stable `writev` pointers while avoiding fixed-size buffer zero-initialization for
+  tiny responses
+
+Why this was tried:
+
+- `perf` on the retained baseline still showed inference-side `malloc`, `realloc`,
+  `__memmove_avx_unaligned_erms`, and `drop_in_place<Vec<PoolSlice>>` activity
+- every response still paid for a full fixed-size response buffer in the completion -> writer
+  handoff, even when the actual wire frame was tiny
+
+Validation:
+
+- [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
+  still passed
+- `cargo clippy --all-targets --no-default-features -- -D warnings` passed
+- `cargo check --no-default-features --bench pipeline_bench` passed
+
+Before / after relative to the current retained baseline:
+
+1. Narrow/deep (`2` client workers, `16` connections, `window=64`)
+
+Before:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115439/context.md)
+- `qps 1015124`
+- `p50 1800.2us`
+- `p95 1870.8us`
+- `p99 2012.2us`
+
+After:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_120208/context.md)
+- `qps 1022768`
+- `p50 1811.5us`
+- `p95 1882.1us`
+- `p99 2014.2us`
+
+Interpretation:
+
+- throughput improved slightly
+- median and tail latency were effectively flat to slightly worse
+
+2. Wide/shallow (`2` client workers, `250` connections, `window=2`)
+
+Before:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_115536/context.md)
+- `qps 794179`
+- `p50 1118.2us`
+- `p95 1272.8us`
+- `p99 1818.6us`
+
+After:
+
+- [context.md](/home/sriggin/dev/sean/disrust/artifacts/sustain_capture/20260317_120307/context.md)
+- `qps 764020`
+- `p50 1146.9us`
+- `p95 1504.3us`
+- `p99 2111.5us`
+
+Interpretation:
+
+- wide/shallow regressed materially
+- not acceptable as a retained change
+
+Decision:
+
+- rejected
+- change backed out
+
 ### Attempt 4: Increase Per-Pass Submission/Completion Limits To `16`
 
 Change:
