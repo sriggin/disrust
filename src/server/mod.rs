@@ -1,5 +1,7 @@
 use std::os::unix::io::IntoRawFd;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
 use clap::Args;
@@ -25,6 +27,11 @@ use crate::ring_types::InferenceEvent;
 mod ingress;
 
 pub use ingress::IngressThread;
+
+enum WorkerExit {
+    Returned(&'static str),
+    Panicked(&'static str, String),
+}
 
 #[derive(Args, Clone)]
 pub struct ServeArgs {
@@ -84,6 +91,16 @@ fn create_listener(port: u16) -> Socket {
     socket.bind(&addr.into()).expect("bind failed");
     socket.listen(1024).expect("listen failed");
     socket
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(msg) => *msg,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(msg) => (*msg).to_string(),
+            Err(_) => "non-string panic payload".to_string(),
+        },
+    }
 }
 
 pub fn run(args: ServeArgs) {
@@ -185,6 +202,7 @@ pub fn run(args: ServeArgs) {
     let ready_queue = Arc::new(ReadyQueue::new(io_threads * SLAB_CAPACITY * 2));
     let publish_gate = Arc::new(std::sync::Mutex::new(()));
     let registry = Arc::new(ConnectionRegistry::new(io_threads, SLAB_CAPACITY));
+    let (worker_exit_tx, worker_exit_rx) = mpsc::channel::<WorkerExit>();
 
     if let (Some(submission_cpu), Some(completion_cpu)) = (args.submission_cpu, args.completion_cpu)
         && submission_cpu != completion_cpu
@@ -205,32 +223,54 @@ pub fn run(args: ServeArgs) {
         batch_coalesce,
     );
     let inference_cpu = args.submission_cpu.or(args.completion_cpu);
-    let inference_handle = thread::Builder::new()
+    thread::Builder::new()
         .name("inference".into())
-        .spawn(move || {
-            if let Some(cpu) = inference_cpu {
-                affinity::pin_current_thread(cpu, "inference").unwrap_or_else(|e| panic!("{e}"));
+        .spawn({
+            let worker_exit_tx = worker_exit_tx.clone();
+            move || {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    if let Some(cpu) = inference_cpu {
+                        affinity::pin_current_thread(cpu, "inference")
+                            .unwrap_or_else(|e| panic!("{e}"));
+                    }
+                    inference_consumer.run()
+                }));
+                let _ = match outcome {
+                    Ok(()) => worker_exit_tx.send(WorkerExit::Returned("inference")),
+                    Err(payload) => worker_exit_tx
+                        .send(WorkerExit::Panicked("inference", panic_message(payload))),
+                };
             }
-            inference_consumer.run()
         })
         .expect("failed to spawn inference consumer");
 
     let writer_consumer = WriterConsumer::new(Arc::clone(&ready_queue), Arc::clone(&registry))
         .expect("failed to create WriterConsumer io_uring");
     let writer_cpu = args.writer_cpu;
-    let writer_handle = thread::Builder::new()
+    thread::Builder::new()
         .name("writer".into())
-        .spawn(move || {
-            if let Some(cpu) = writer_cpu {
-                affinity::pin_current_thread(cpu, "writer").unwrap_or_else(|e| panic!("{e}"));
+        .spawn({
+            let worker_exit_tx = worker_exit_tx.clone();
+            move || {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    if let Some(cpu) = writer_cpu {
+                        affinity::pin_current_thread(cpu, "writer")
+                            .unwrap_or_else(|e| panic!("{e}"));
+                    }
+                    writer_consumer.run()
+                }));
+                let _ = match outcome {
+                    Ok(()) => worker_exit_tx.send(WorkerExit::Returned("writer")),
+                    Err(payload) => {
+                        worker_exit_tx.send(WorkerExit::Panicked("writer", panic_message(payload)))
+                    }
+                };
             }
-            writer_consumer.run()
         })
         .expect("failed to spawn WriterConsumer");
 
     eprintln!("disrust: ready");
 
-    let mut io_handles = Vec::with_capacity(io_threads);
     for thread_id in 0..io_threads {
         let listen_socket = create_listener(port);
         let ingress = IngressThread::new(
@@ -243,22 +283,38 @@ pub fn run(args: ServeArgs) {
         );
         let io_cpu = args.io_cpu.map(|base| base + thread_id);
         let thread_name = format!("io-{thread_id}");
-        let handle = thread::Builder::new()
+        thread::Builder::new()
             .name(thread_name.clone())
-            .spawn(move || {
-                if let Some(cpu) = io_cpu {
-                    affinity::pin_current_thread(cpu, &thread_name)
-                        .unwrap_or_else(|e| panic!("{e}"));
+            .spawn({
+                let worker_exit_tx = worker_exit_tx.clone();
+                move || {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        if let Some(cpu) = io_cpu {
+                            affinity::pin_current_thread(cpu, &thread_name)
+                                .unwrap_or_else(|e| panic!("{e}"));
+                        }
+                        ingress.run()
+                    }));
+                    let _ = match outcome {
+                        Ok(()) => worker_exit_tx.send(WorkerExit::Returned("ingress")),
+                        Err(payload) => worker_exit_tx
+                            .send(WorkerExit::Panicked("ingress", panic_message(payload))),
+                    };
                 }
-                ingress.run()
             })
             .expect("failed to spawn IO thread");
-        io_handles.push(handle);
     }
 
-    for handle in io_handles {
-        let _ = handle.join();
+    drop(worker_exit_tx);
+    match worker_exit_rx
+        .recv()
+        .expect("worker exit channel closed unexpectedly")
+    {
+        WorkerExit::Returned(name) => {
+            panic!("disrust: worker thread '{name}' exited unexpectedly");
+        }
+        WorkerExit::Panicked(name, message) => {
+            panic!("disrust: worker thread '{name}' panicked: {message}");
+        }
     }
-    let _ = inference_handle.join();
-    let _ = writer_handle.join();
 }

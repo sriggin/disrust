@@ -278,6 +278,10 @@ impl ConnectionRegistry {
         }
 
         if result < 0 {
+            // Design decision: any write-side error retires the connection, including `EAGAIN`.
+            // `EAGAIN` indicates a nonblocking socket that is temporarily not writable, but we
+            // intentionally choose bounded behavior over per-connection retry/backoff complexity
+            // in the writer. The server stays up; only the backpressured connection is dropped.
             state.write_closed = true;
             state.write_inflight = false;
             state.inflight.clear();

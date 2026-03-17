@@ -116,7 +116,11 @@ impl WriterConsumer {
                                 metrics::inc_write_fatal();
                             }
                             libc::EAGAIN => {
+                                // Design decision: treat socket backpressure as a per-connection
+                                // failure for now. We retire the connection rather than building
+                                // per-connection retry/backoff state in the writer hot path.
                                 metrics::inc_write_eagain();
+                                metrics::inc_write_fatal();
                             }
                             _ => {}
                         }
