@@ -1,25 +1,42 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use disruptor::{EventGuard, EventPoller, MultiProducerBarrier, Polling, SingleConsumerBarrier};
 
+use crate::buffer_pool::PoolSlice;
+use crate::clock::elapsed_since_ns;
+use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::metrics;
-use crate::pipeline::batch_queue::BatchEntry;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::ready_queue::ReadyQueue;
-use crate::pipeline::session::{BatchPoll, InferenceSession};
+use crate::pipeline::session::{BatchPoll, InFlightBatch, InferenceSession};
+use crate::protocol;
 use crate::ring_types::InferenceEvent;
-
-use super::completion::process_batch;
-use super::submission::{
-    PendingSlot, build_batch_entry, drain_visible_events, idle_wait, session_available,
-    try_reserve_session,
-};
 
 const MAX_COMPLETIONS_PER_PASS: usize = 8;
 const MAX_SUBMISSIONS_PER_PASS: usize = 8;
+
+struct BatchEntry {
+    slot_count: usize,
+    #[cfg(feature = "metrics")]
+    submitted_at: Instant,
+    batch: InFlightBatch,
+}
+
+struct PendingSlot {
+    features: PoolSlice,
+    num_vectors: usize,
+    published_at_ns: u64,
+}
+
+enum BatchStopReason {
+    Cap,
+    BacklogEmpty,
+    NonContiguous,
+}
 
 struct InflightBatchEntry {
     entry: BatchEntry,
@@ -250,6 +267,136 @@ impl InferenceConsumer {
     }
 }
 
+fn idle_wait(idle_loops: &mut u32) {
+    *idle_loops = idle_loops.saturating_add(1);
+    if *idle_loops < 64 {
+        std::hint::spin_loop();
+    } else if *idle_loops < 256 {
+        thread::yield_now();
+    } else {
+        thread::sleep(Duration::from_micros(10));
+    }
+}
+
+fn drain_visible_events(
+    poller: &mut EventPoller<InferenceEvent, MultiProducerBarrier>,
+    backlog: &mut VecDeque<PendingSlot>,
+    max_batch_slots: usize,
+) -> Result<(), Polling> {
+    while backlog.len() < max_batch_slots {
+        let remaining = (max_batch_slots - backlog.len()) as u64;
+        match poller.poll_take(remaining) {
+            Ok(mut guard) => drain_guard(&mut guard, backlog),
+            Err(Polling::NoEvents) => return Ok(()),
+            Err(Polling::Shutdown) => return Err(Polling::Shutdown),
+        }
+    }
+    Ok(())
+}
+
+fn drain_guard(
+    guard: &mut EventGuard<'_, InferenceEvent, MultiProducerBarrier>,
+    backlog: &mut VecDeque<PendingSlot>,
+) {
+    for event in &mut *guard {
+        backlog.push_back(PendingSlot {
+            features: take_event_features(event),
+            num_vectors: event.num_vectors as usize,
+            published_at_ns: event.published_at_ns,
+        });
+    }
+}
+
+fn take_event_features(event: &InferenceEvent) -> PoolSlice {
+    // SAFETY: while the inference consumer holds the submission poll guard, no later consumer can
+    // observe these slots yet and the producer cannot reuse them. That makes it safe to move
+    // `features` out into the local backlog before guard drop.
+    unsafe {
+        let event_ptr = event as *const InferenceEvent as *mut InferenceEvent;
+        std::ptr::replace(
+            std::ptr::addr_of_mut!((*event_ptr).features),
+            PoolSlice::empty(),
+        )
+    }
+}
+
+fn build_batch_entry(
+    session: &mut InferenceSession,
+    backlog: &mut VecDeque<PendingSlot>,
+    max_batch_slots: usize,
+) -> BatchEntry {
+    debug_assert!(max_batch_slots > 0);
+    debug_assert!(max_batch_slots <= MAX_SESSION_BATCH_SIZE);
+    let first = backlog
+        .front()
+        .expect("build_batch_entry requires non-empty backlog");
+    let host_ptr = first.features.as_slice().as_ptr();
+
+    let mut slot_count = 0usize;
+    let mut num_vectors = 0usize;
+    let mut input_slices = Vec::new();
+    let backlog_slots_at_build = backlog.len() as u64;
+    let mut stop_reason = None;
+
+    while let Some(next) = backlog.front() {
+        let contiguous = input_slices
+            .last()
+            .is_none_or(|prev: &PoolSlice| prev.is_contiguous(&next.features));
+        if !contiguous {
+            stop_reason = Some(BatchStopReason::NonContiguous);
+            break;
+        }
+        if slot_count >= max_batch_slots {
+            stop_reason = Some(BatchStopReason::Cap);
+            break;
+        }
+
+        let next = backlog.pop_front().expect("front just checked");
+        metrics::record_publish_to_submit(elapsed_since_ns(next.published_at_ns));
+        num_vectors += next.num_vectors;
+        slot_count += 1;
+        input_slices.push(next.features);
+    }
+
+    let stop_reason = if backlog.front().is_none() {
+        BatchStopReason::BacklogEmpty
+    } else {
+        stop_reason.expect("non-empty backlog must have a stop reason")
+    };
+
+    metrics::add_backlog_slots_at_build(backlog_slots_at_build);
+    metrics::add_slots_submitted(slot_count as u64);
+    match stop_reason {
+        BatchStopReason::Cap => metrics::inc_batch_stop_cap(),
+        BatchStopReason::BacklogEmpty => metrics::inc_batch_stop_backlog_empty(),
+        BatchStopReason::NonContiguous => metrics::inc_batch_stop_non_contig(),
+    }
+
+    let mut batch = session.submit_batch(host_ptr, num_vectors);
+    batch.input_slices = input_slices;
+    BatchEntry {
+        slot_count,
+        #[cfg(feature = "metrics")]
+        submitted_at: Instant::now(),
+        batch,
+    }
+}
+
+fn session_available(sessions: &[InferenceSession]) -> bool {
+    sessions.iter().any(InferenceSession::is_available)
+}
+
+fn try_reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> Option<usize> {
+    for _ in 0..sessions.len() {
+        let idx = *session_cursor % sessions.len();
+        *session_cursor = (*session_cursor + 1) % sessions.len();
+        if sessions[idx].try_acquire() {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
     stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
@@ -275,4 +422,51 @@ fn wait_for_completion_guard<'a>(
             Err(Polling::Shutdown) => return Err(Polling::Shutdown),
         }
     }
+}
+
+fn process_batch(
+    guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
+    entry: BatchEntry,
+    ready_queue: &Arc<ReadyQueue>,
+    registry: &Arc<ConnectionRegistry>,
+    max_batch_slots: usize,
+) {
+    let mut guard_ref = &mut *guard;
+    let output =
+        unsafe { std::slice::from_raw_parts(entry.batch.output_ptr, entry.batch.output_len) };
+    let mut output_offset: usize = 0;
+
+    debug_assert!(entry.slot_count <= max_batch_slots);
+    for _ in 0..entry.slot_count {
+        let event = guard_ref
+            .next()
+            .expect("guard exhausted before queued batch slot_count");
+        let num_vecs = event.num_vectors as usize;
+
+        let wire_len = protocol::response_size(num_vecs);
+        let mut wire = vec![0u8; wire_len];
+        let response = &output[output_offset..output_offset + num_vecs];
+        protocol::encode_response(response, &mut wire);
+
+        let conn = event.conn;
+        if registry.enqueue_response(conn, event.request_seq, event.published_at_ns, &wire) {
+            ready_queue.push(conn);
+        }
+
+        output_offset += num_vecs;
+        metrics::inc_responses_written();
+        metrics::dec_req_occ();
+    }
+
+    debug_assert_eq!(
+        output_offset, entry.batch.output_len,
+        "slot_count/num_vectors mismatch between ring events and batch output"
+    );
+
+    let session_available = Arc::clone(&entry.batch.session_available);
+    #[cfg(feature = "metrics")]
+    metrics::record_batch_total(entry.submitted_at.elapsed());
+    drop(entry);
+    session_available.store(true, std::sync::atomic::Ordering::Release);
+    metrics::inc_batches_completed();
 }

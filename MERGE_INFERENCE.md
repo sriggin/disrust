@@ -290,12 +290,8 @@ Decision:
 
 ### Benchmark Note
 
-The existing [pipeline_bench.rs](/home/sriggin/dev/sean/disrust/benches/pipeline_bench.rs)
-remains a split submission/completion benchmark.
-
-An attempt was made to extend it to the merged inference lane directly, but that adaptation did not
-yet produce a trustworthy benchmark and was not kept. For now, optimization decisions are being
-driven by:
+At the time these optimization passes were run, there was no trustworthy merged-only benchmark for
+the inference lane. Optimization decisions were therefore driven by:
 
 - the sustained pipeline+writer integration tests
 - the known narrow/deep and wide/shallow sustain shapes
@@ -305,7 +301,8 @@ driven by:
 
 Change:
 
-- [submission.rs](/home/sriggin/dev/sean/disrust/src/pipeline/submission.rs)
+- the per-batch `input_slices` construction inside the merged inference lane in
+  [inference.rs](/home/sriggin/dev/sean/disrust/src/pipeline/inference.rs)
 - changed the per-batch `input_slices` construction in `build_batch_entry()` from:
   - `Vec::new()`
   to:
@@ -383,10 +380,7 @@ Decision:
 
 Change:
 
-- [batch_queue.rs](/home/sriggin/dev/sean/disrust/src/pipeline/batch_queue.rs)
-- [submission.rs](/home/sriggin/dev/sean/disrust/src/pipeline/submission.rs)
-- [completion.rs](/home/sriggin/dev/sean/disrust/src/pipeline/completion.rs)
-- [pipeline_bench.rs](/home/sriggin/dev/sean/disrust/benches/pipeline_bench.rs)
+- timestamp bookkeeping on `BatchEntry` and the merged inference path
 
 Details:
 
@@ -405,7 +399,6 @@ Validation:
 - [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
   still passes
 - `cargo clippy --all-targets --no-default-features -- -D warnings` passes
-- `cargo check --no-default-features --bench pipeline_bench` passes
 
 Before / after relative to the retained scheduling-optimization baseline:
 
@@ -464,7 +457,7 @@ Decision:
 
 Change:
 
-- [submission.rs](/home/sriggin/dev/sean/disrust/src/pipeline/submission.rs)
+- `publish_to_submit` timing inside the merged inference lane
 
 Details:
 
@@ -780,25 +773,22 @@ Decision:
 
 ## Existing Coverage To Build On
 
-There is already one relevant benchmark:
+The split-only benchmark and split-only runtime scaffolding have now been removed.
 
-- [benches/pipeline_bench.rs](/home/sriggin/dev/sean/disrust/benches/pipeline_bench.rs)
+The retained coverage for the merged runtime is:
+
+- [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
 
 What it gives us:
 
-- a focused two-thread submission -> `BatchQueue` -> completion benchmark
-- real `InferenceSession` use
-- real async batch completion objects
-- direct measurement of the thread-boundary cost between submission and completion
+- pass/fail correctness coverage for the merged inference lane
+- sustained pipeline+writer progress coverage
+- per-connection response-order validation at the writer boundary
 
 What it does **not** give us:
 
-- pass/fail correctness coverage
-- mixed progress validation
-- a way to assert fairness under backlog + in-flight completions
-- any writer/registry-side correctness checks
-
-So it is useful, but it is not sufficient as the safety rail for another merge attempt.
+- a dedicated merged-only microbenchmark for fast throughput iteration
+- detailed fairness telemetry without adding new instrumentation
 
 ## Recommended Test Strategy
 
@@ -817,12 +807,8 @@ That pipeline-scope harness now exists in:
 
 - [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
 
-and it covers both:
-
-- split `SubmissionConsumer` + `CompletionConsumer`
-- merged `InferenceConsumer`
-
-with verification of per-connection response ordering at the completion -> writer boundary.
+and it covers the merged `InferenceConsumer` with verification of per-connection response ordering
+at the completion -> writer boundary.
 
 ## Sustained Writer-Backed Integration Result
 
@@ -830,24 +816,20 @@ The pipeline-scope test was still too small to catch the real sustain failure, s
 module now also contains a sustained pipeline+writer integration path using:
 
 - real request-ring publication
-- real `SubmissionConsumer` / `CompletionConsumer` or merged `InferenceConsumer`
+- real `InferenceConsumer`
 - real `WriterConsumer`
 - `UnixStream::pair()` sockets for the writer side
 - clean stop signals so the threads can be joined after the test
 
 Initial result:
 
-- split runtime passed the sustained pipeline+writer test
-- merged runtime reproduced the sustain liveness failure by stalling while publishing requests
+- the merged runtime reproduced the sustain liveness failure by stalling while publishing requests
 
 That reproducer lived in:
 
 - [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
 
-as:
-
-- `split_submission_completion_and_writer_sustain_progress`
-- `merged_gpu_and_writer_sustain_progress`
+as the merged sustain-progress integration test.
 
 What this proves more precisely:
 
@@ -860,10 +842,8 @@ That narrowed the likely bug class to:
 - progress/fairness in the merged loop under sustained load
 - or interaction between the merged loop and the real writer/registry path
 
-After the session-reservation fix described above:
-
-- split runtime passes the sustained pipeline+writer test
-- merged runtime now also passes the same sustained pipeline+writer test
+After the session-reservation fix described above, the merged runtime now passes the same
+sustained pipeline+writer test.
 
 So this section remains important because it documents the reproducer that exposed the bug, but the
 test is now a normal passing contract test rather than a `#[should_panic]` repro.
@@ -891,7 +871,7 @@ Suggested shape:
 
 1. Build a small request ring with the real event type.
 2. Publish synthetic `InferenceEvent`s directly into it.
-3. Run the existing split submission/completion pair against that ring.
+3. Run the merged inference consumer against that ring.
 4. Replace the real completion -> writer boundary with a test sink that records:
    - connection identity
    - request sequence
@@ -901,9 +881,7 @@ Suggested shape:
    - per-connection request sequence remains ordered
    - no progress stalls occur
 
-This should pass against the current split-thread design first.
-
-Only after that should a merged inference-thread implementation be introduced and held to the same test.
+This is the retained direction for future merged inference work; the old split pair is gone.
 
 ## Why This Test Matters
 
@@ -922,20 +900,18 @@ That is the key behavior the previous merge attempt did not validate before full
 
 The next retry should proceed in this order:
 
-1. Add the pipeline-scope integration test and make it pass on the current split-thread design.
-2. Keep [benches/pipeline_bench.rs](/home/sriggin/dev/sean/disrust/benches/pipeline_bench.rs) as
-   the low-level cost benchmark for the existing boundary.
-3. Add the missing merged-thread instrumentation:
+1. Add the pipeline-scope integration test and keep it passing on the merged runtime.
+2. Add the missing merged-thread instrumentation:
    - in-flight batch count
    - oldest in-flight age
    - ready-but-not-retired delay
-4. Implement a merged inference-thread scheduler with an explicit fairness policy.
-5. Run the new integration test.
-6. Run the existing sustain shapes:
+3. Implement a merged inference-thread scheduler with an explicit fairness policy.
+4. Run the integration test.
+5. Run the existing sustain shapes:
    - narrow/deep: `2` client threads, `16` connections, `window=64`
    - wide/shallow: `2` client threads, `250` connections, `window=2`
-7. Keep the merge only if:
-   - the new integration test passes
+6. Keep the change only if:
+   - the integration test passes
    - both sustain shapes complete correctly
    - performance is at least neutral on the previously healthy shape
 
@@ -944,9 +920,8 @@ The next retry should proceed in this order:
 The repository currently contains:
 
 - the merged `InferenceConsumer` implementation
-- the existing split `SubmissionConsumer` / `CompletionConsumer`
-- the new isolated submission/completion integration test
+- merged-path integration coverage in
+  [tests/submission_completion_integration.rs](/home/sriggin/dev/sean/disrust/tests/submission_completion_integration.rs)
 
-At the time of this note, the server runtime may be wired either way during active experimentation,
-but the measurements above show the merged runtime is not currently acceptable for the real
-benchmark shapes already in use.
+The split submission/completion runtime path and its dedicated benchmark have been removed. The
+active server architecture is the merged inference lane described above.

@@ -32,11 +32,6 @@ name = "gpu_inference_bench"
 path = "benches/gpu_inference_bench.rs"
 harness = false
 
-[[bench]]
-name = "pipeline_bench"
-path = "benches/pipeline_bench.rs"
-harness = false
-
 [[bin]]
 name = "client"
 path = "src/bin/client.rs"

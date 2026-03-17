@@ -14,28 +14,19 @@ use ort::init_from;
 use std::os::unix::net::UnixStream;
 
 use disrust::buffer_pool::BufferPool;
-use disrust::config::{BATCH_QUEUE_CAPACITY, SLAB_CAPACITY};
+use disrust::config::SLAB_CAPACITY;
 use disrust::constants::FEATURE_DIM;
 use disrust::metrics;
-use disrust::pipeline::batch_queue::BatchQueue;
-use disrust::pipeline::completion::CompletionConsumer;
-use disrust::pipeline::connection_registry::{ConnectionRegistry, WriteResult};
+use disrust::pipeline::connection_registry::ConnectionRegistry;
 use disrust::pipeline::inference::InferenceConsumer;
 use disrust::pipeline::ready_queue::{ConnectionRef, ReadyQueue};
 use disrust::pipeline::session::InferenceSession;
-use disrust::pipeline::submission::SubmissionConsumer;
 use disrust::pipeline::verify_ort_dylib_present;
 use disrust::pipeline::writer::WriterConsumer;
 use disrust::ring_types::InferenceEvent;
 
 #[cfg(feature = "cuda")]
 use disrust::cuda::preflight::verify_cuda_startup;
-
-#[derive(Clone, Copy)]
-enum PipelineMode {
-    Split,
-    Merged,
-}
 
 fn ensure_ort_init() {
     static INIT: OnceLock<()> = OnceLock::new();
@@ -58,7 +49,7 @@ fn encode_expected_response(fill: f32) -> [u8; 5] {
     bytes
 }
 
-fn run_pipeline_order_test(mode: PipelineMode) {
+fn run_pipeline_order_test() {
     common::init_factory_pool();
     ensure_ort_init();
 
@@ -75,50 +66,20 @@ fn run_pipeline_order_test(mode: PipelineMode) {
     let ready_queue = Arc::new(ReadyQueue::new(32));
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
 
-    match mode {
-        PipelineMode::Split => {
-            let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
-            let submission = SubmissionConsumer::new(
-                submission_poller,
-                sessions,
-                Arc::clone(&batch_queue),
-                256,
-                Duration::from_micros(500),
-            );
-            let completion = CompletionConsumer::new(
-                completion_poller,
-                Arc::clone(&batch_queue),
-                Arc::clone(&ready_queue),
-                Arc::clone(&registry),
-                256,
-            );
+    let inference = InferenceConsumer::new(
+        submission_poller,
+        completion_poller,
+        sessions,
+        Arc::clone(&ready_queue),
+        Arc::clone(&registry),
+        256,
+        Duration::from_micros(500),
+    );
 
-            let _submission_handle = thread::Builder::new()
-                .name("test-submission".into())
-                .spawn(move || submission.run())
-                .expect("failed to spawn submission thread");
-            let _completion_handle = thread::Builder::new()
-                .name("test-completion".into())
-                .spawn(move || completion.run())
-                .expect("failed to spawn completion thread");
-        }
-        PipelineMode::Merged => {
-            let inference = InferenceConsumer::new(
-                submission_poller,
-                completion_poller,
-                sessions,
-                Arc::clone(&ready_queue),
-                Arc::clone(&registry),
-                256,
-                Duration::from_micros(500),
-            );
-
-            let _gpu_handle = thread::Builder::new()
-                .name("test-inference".into())
-                .spawn(move || inference.run())
-                .expect("failed to spawn merged inference thread");
-        }
-    }
+    let _inference_handle = thread::Builder::new()
+        .name("test-inference".into())
+        .spawn(move || inference.run())
+        .expect("failed to spawn inference thread");
 
     let pool = BufferPool::leak_new(RING_SIZE * FEATURE_DIM);
     let mut allocator = pool.allocator();
@@ -211,86 +172,28 @@ fn run_pipeline_order_test(mode: PipelineMode) {
             }
 
             match registry.handle_write_result(conn, written as i32) {
-                WriteResult::NeedsResubmit | WriteResult::ReadyAgain => pending.push_back(conn),
-                WriteResult::Completed
-                | WriteResult::Idle
-                | WriteResult::Stale
-                | WriteResult::Error(_) => {}
+                disrust::pipeline::connection_registry::WriteResult::NeedsResubmit
+                | disrust::pipeline::connection_registry::WriteResult::ReadyAgain => {
+                    pending.push_back(conn)
+                }
+                disrust::pipeline::connection_registry::WriteResult::Completed
+                | disrust::pipeline::connection_registry::WriteResult::Idle
+                | disrust::pipeline::connection_registry::WriteResult::Stale
+                | disrust::pipeline::connection_registry::WriteResult::Error(_) => {}
             }
         } else {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for submission/completion pipeline to produce expected responses in {:?}; observed={observed:?}",
-                mode_name(mode)
+                "timed out waiting for inference pipeline to produce expected responses; observed={observed:?}",
             );
             thread::sleep(Duration::from_millis(1));
         }
     }
 
-    assert_eq!(observed, expected, "mode {}", mode_name(mode));
+    assert_eq!(observed, expected);
 }
 
-fn spawn_pipeline_threads(
-    mode: PipelineMode,
-    submission_poller: disruptor::EventPoller<InferenceEvent, disruptor::MultiProducerBarrier>,
-    completion_poller: disruptor::EventPoller<InferenceEvent, disruptor::SingleConsumerBarrier>,
-    sessions: Vec<InferenceSession>,
-    ready_queue: Arc<ReadyQueue>,
-    registry: Arc<ConnectionRegistry>,
-    stop: Arc<AtomicBool>,
-) -> Vec<thread::JoinHandle<()>> {
-    match mode {
-        PipelineMode::Split => {
-            let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
-            let submission = SubmissionConsumer::new(
-                submission_poller,
-                sessions,
-                Arc::clone(&batch_queue),
-                256,
-                Duration::from_micros(500),
-            );
-            let completion = CompletionConsumer::new(
-                completion_poller,
-                Arc::clone(&batch_queue),
-                ready_queue,
-                registry,
-                256,
-            );
-
-            let submission_stop = Arc::clone(&stop);
-            let completion_stop = Arc::clone(&stop);
-            vec![
-                thread::Builder::new()
-                    .name("test-submission".into())
-                    .spawn(move || submission.run_until(submission_stop))
-                    .expect("failed to spawn submission thread"),
-                thread::Builder::new()
-                    .name("test-completion".into())
-                    .spawn(move || completion.run_until(completion_stop))
-                    .expect("failed to spawn completion thread"),
-            ]
-        }
-        PipelineMode::Merged => {
-            let inference = InferenceConsumer::new(
-                submission_poller,
-                completion_poller,
-                sessions,
-                ready_queue,
-                registry,
-                256,
-                Duration::from_micros(500),
-            );
-            vec![
-                thread::Builder::new()
-                    .name("test-inference".into())
-                    .spawn(move || inference.run_until(stop))
-                    .expect("failed to spawn merged inference thread"),
-            ]
-        }
-    }
-}
-
-fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
+fn run_sustained_pipeline_writer_test() {
     common::init_factory_pool();
     ensure_ort_init();
 
@@ -311,15 +214,24 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
     let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
     let stop = Arc::new(AtomicBool::new(false));
 
-    let mut handles = spawn_pipeline_threads(
-        mode,
+    let inference = InferenceConsumer::new(
         submission_poller,
         completion_poller,
         sessions,
         Arc::clone(&ready_queue),
         Arc::clone(&registry),
-        Arc::clone(&stop),
+        256,
+        Duration::from_micros(500),
     );
+    let mut handles = vec![
+        thread::Builder::new()
+            .name("test-inference".into())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || inference.run_until(stop)
+            })
+            .expect("failed to spawn inference thread"),
+    ];
 
     let writer = WriterConsumer::new(Arc::clone(&ready_queue), Arc::clone(&registry))
         .expect("failed to create writer consumer");
@@ -395,8 +307,7 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
                     Err(_) => {
                         assert!(
                             Instant::now() < publisher_deadline,
-                            "timed out publishing requests in {:?} mode after {} successes; {}",
-                            mode_name(mode),
+                            "timed out publishing requests after {} successes; {}",
                             published_count,
                             snapshot_summary()
                         );
@@ -411,12 +322,7 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
     let mut observed = HashMap::new();
     while observed.len() < CONNECTIONS {
         let remaining = receive_deadline.saturating_duration_since(Instant::now());
-        let (conn, frames) = result_rx.recv_timeout(remaining).unwrap_or_else(|_| {
-            panic!(
-                "timed out waiting for reader results in {} mode",
-                mode_name(mode)
-            )
-        });
+        let (conn, frames) = result_rx.recv_timeout(remaining).expect("recv reader result");
         observed.insert(conn, frames);
     }
 
@@ -429,14 +335,7 @@ fn run_sustained_pipeline_writer_test(mode: PipelineMode) {
         handle.join().expect("pipeline thread panicked");
     }
 
-    assert_eq!(observed, expected, "mode {}", mode_name(mode));
-}
-
-fn mode_name(mode: PipelineMode) -> &'static str {
-    match mode {
-        PipelineMode::Split => "split",
-        PipelineMode::Merged => "merged",
-    }
+    assert_eq!(observed, expected);
 }
 
 fn snapshot_summary() -> String {
@@ -463,8 +362,8 @@ fn snapshot_summary() -> String {
     feature = "cuda",
     ignore = "pipeline integration test is validated on the no-cuda path"
 )]
-fn split_submission_and_completion_preserve_per_connection_order() {
-    run_pipeline_order_test(PipelineMode::Split);
+fn inference_consumer_preserves_per_connection_order() {
+    run_pipeline_order_test();
 }
 
 #[test]
@@ -472,24 +371,6 @@ fn split_submission_and_completion_preserve_per_connection_order() {
     feature = "cuda",
     ignore = "pipeline integration test is validated on the no-cuda path"
 )]
-fn merged_inference_consumer_preserves_per_connection_order() {
-    run_pipeline_order_test(PipelineMode::Merged);
-}
-
-#[test]
-#[cfg_attr(
-    feature = "cuda",
-    ignore = "pipeline integration test is validated on the no-cuda path"
-)]
-fn split_submission_completion_and_writer_sustain_progress() {
-    run_sustained_pipeline_writer_test(PipelineMode::Split);
-}
-
-#[test]
-#[cfg_attr(
-    feature = "cuda",
-    ignore = "pipeline integration test is validated on the no-cuda path"
-)]
-fn merged_inference_and_writer_sustain_progress() {
-    run_sustained_pipeline_writer_test(PipelineMode::Merged);
+fn inference_and_writer_sustain_progress() {
+    run_sustained_pipeline_writer_test();
 }

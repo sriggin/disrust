@@ -58,8 +58,6 @@ Main server/runtime areas:
   - [src/server/ingress.rs](/home/sriggin/dev/sean/disrust/src/server/ingress.rs)
 - inference pipeline:
   - [src/pipeline/inference.rs](/home/sriggin/dev/sean/disrust/src/pipeline/inference.rs)
-  - [src/pipeline/submission.rs](/home/sriggin/dev/sean/disrust/src/pipeline/submission.rs)
-  - [src/pipeline/completion.rs](/home/sriggin/dev/sean/disrust/src/pipeline/completion.rs)
   - [src/pipeline/writer.rs](/home/sriggin/dev/sean/disrust/src/pipeline/writer.rs)
   - [src/pipeline/connection_registry.rs](/home/sriggin/dev/sean/disrust/src/pipeline/connection_registry.rs)
 - shared core pieces:
