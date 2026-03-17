@@ -10,16 +10,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::affinity;
 use crate::buffer_pool::{BufferPool, set_factory_pool};
 use crate::config::{
-    BATCH_QUEUE_CAPACITY, DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES, GPU_DISRUPTOR_SIZE,
-    MAX_IO_THREADS, MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, SLAB_CAPACITY,
+    DEFAULT_BATCH_COALESCE_US, GPU_BUFFER_POOL_BYTES, GPU_DISRUPTOR_SIZE, MAX_IO_THREADS,
+    MAX_SESSION_BATCH_SIZE, SESSION_POOL_SIZE, SLAB_CAPACITY,
 };
 use crate::metrics;
-use crate::pipeline::batch_queue::BatchQueue;
-use crate::pipeline::completion::CompletionConsumer;
 use crate::pipeline::connection_registry::ConnectionRegistry;
+use crate::pipeline::inference::InferenceConsumer;
 use crate::pipeline::ready_queue::ReadyQueue;
 use crate::pipeline::session::InferenceSession;
-use crate::pipeline::submission::SubmissionConsumer;
 use crate::pipeline::writer::WriterConsumer;
 use crate::pipeline::{make_pool, verify_ort_dylib_present};
 use crate::ring_types::InferenceEvent;
@@ -184,46 +182,38 @@ pub fn run(args: ServeArgs) {
     let (completion_poller, builder) = builder.and_then().event_poller();
     let producer = builder.build();
 
-    let batch_queue = Arc::new(BatchQueue::new(BATCH_QUEUE_CAPACITY));
     let ready_queue = Arc::new(ReadyQueue::new(io_threads * SLAB_CAPACITY * 2));
     let publish_gate = Arc::new(std::sync::Mutex::new(()));
     let registry = Arc::new(ConnectionRegistry::new(io_threads, SLAB_CAPACITY));
 
-    let sub_consumer = SubmissionConsumer::new(
-        submission_poller,
-        sessions,
-        Arc::clone(&batch_queue),
-        max_batch_slots,
-        batch_coalesce,
-    );
-    let submission_cpu = args.submission_cpu;
-    let sub_handle = thread::Builder::new()
-        .name("submission".into())
-        .spawn(move || {
-            if let Some(cpu) = submission_cpu {
-                affinity::pin_current_thread(cpu, "submission").unwrap_or_else(|e| panic!("{e}"));
-            }
-            sub_consumer.run()
-        })
-        .expect("failed to spawn SubmissionConsumer");
+    if let (Some(submission_cpu), Some(completion_cpu)) = (args.submission_cpu, args.completion_cpu)
+        && submission_cpu != completion_cpu
+    {
+        eprintln!(
+            "disrust: --submission-cpu and --completion-cpu must match when submission and completion share one inference thread"
+        );
+        std::process::exit(1);
+    }
 
-    let comp_consumer = CompletionConsumer::new(
+    let inference_consumer = InferenceConsumer::new(
+        submission_poller,
         completion_poller,
-        Arc::clone(&batch_queue),
+        sessions,
         Arc::clone(&ready_queue),
         Arc::clone(&registry),
         max_batch_slots,
+        batch_coalesce,
     );
-    let completion_cpu = args.completion_cpu;
-    let comp_handle = thread::Builder::new()
-        .name("completion".into())
+    let inference_cpu = args.submission_cpu.or(args.completion_cpu);
+    let inference_handle = thread::Builder::new()
+        .name("inference".into())
         .spawn(move || {
-            if let Some(cpu) = completion_cpu {
-                affinity::pin_current_thread(cpu, "completion").unwrap_or_else(|e| panic!("{e}"));
+            if let Some(cpu) = inference_cpu {
+                affinity::pin_current_thread(cpu, "inference").unwrap_or_else(|e| panic!("{e}"));
             }
-            comp_consumer.run()
+            inference_consumer.run()
         })
-        .expect("failed to spawn CompletionConsumer");
+        .expect("failed to spawn inference consumer");
 
     let writer_consumer = WriterConsumer::new(Arc::clone(&ready_queue), Arc::clone(&registry))
         .expect("failed to create WriterConsumer io_uring");
@@ -269,7 +259,6 @@ pub fn run(args: ServeArgs) {
     for handle in io_handles {
         let _ = handle.join();
     }
-    let _ = sub_handle.join();
-    let _ = comp_handle.join();
+    let _ = inference_handle.join();
     let _ = writer_handle.join();
 }

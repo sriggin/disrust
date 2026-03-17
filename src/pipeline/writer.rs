@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use io_uring::{opcode, squeue::Entry, types::Fd};
@@ -78,9 +79,20 @@ impl WriterConsumer {
         })
     }
 
-    pub fn run(mut self) {
+    pub fn run(self) {
+        self.run_inner(None);
+    }
+
+    pub fn run_until(self, stop: Arc<AtomicBool>) {
+        self.run_inner(Some(stop));
+    }
+
+    fn run_inner(mut self, stop: Option<Arc<AtomicBool>>) {
         let mut idle_loops = 0u32;
         loop {
+            if stop_requested(stop.as_ref()) {
+                return;
+            }
             let mut progressed = false;
             while let Some(conn) = self.retry_queue.pop_front() {
                 progressed = true;
@@ -157,4 +169,8 @@ impl WriterConsumer {
         self.ring.submit();
         metrics::inc_write_sqes();
     }
+}
+
+fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
+    stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }

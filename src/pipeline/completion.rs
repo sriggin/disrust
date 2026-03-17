@@ -2,6 +2,7 @@
 //! them into the downstream writer stage.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -47,9 +48,20 @@ impl CompletionConsumer {
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(self) {
+        self.run_inner(None);
+    }
+
+    pub fn run_until(self, stop: Arc<AtomicBool>) {
+        self.run_inner(Some(stop));
+    }
+
+    fn run_inner(mut self, stop: Option<Arc<AtomicBool>>) {
         let mut idle_loops = 0u32;
         loop {
+            if stop_requested(stop.as_ref()) {
+                return;
+            }
             let entry = loop {
                 if let Some(entry) = self.batch_queue.pop() {
                     self.timers_idle = false;
@@ -69,10 +81,16 @@ impl CompletionConsumer {
                 } else {
                     thread::yield_now();
                 }
+                if stop_requested(stop.as_ref()) {
+                    return;
+                }
             };
 
             let batch_wait_start = Instant::now();
             loop {
+                if stop_requested(stop.as_ref()) {
+                    return;
+                }
                 match entry.batch.completion.poll() {
                     BatchPoll::Pending => std::hint::spin_loop(),
                     BatchPoll::Ready => break,
@@ -84,6 +102,9 @@ impl CompletionConsumer {
             let mut guard = {
                 let mut polled = false;
                 loop {
+                    if stop_requested(stop.as_ref()) {
+                        return;
+                    }
                     match self.poller.poll_take(entry.slot_count as u64) {
                         Ok(guard) => break guard,
                         Err(Polling::NoEvents) => {
@@ -109,7 +130,11 @@ impl CompletionConsumer {
     }
 }
 
-fn process_batch(
+fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
+    stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+pub(crate) fn process_batch(
     guard: &mut EventGuard<'_, InferenceEvent, SingleConsumerBarrier>,
     entry: BatchEntry,
     ready_queue: &Arc<ReadyQueue>,

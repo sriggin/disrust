@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,10 +18,10 @@ use crate::ring_types::InferenceEvent;
 
 use super::session::InferenceSession;
 
-struct PendingSlot {
-    features: PoolSlice,
-    num_vectors: usize,
-    published_at_ns: u64,
+pub(crate) struct PendingSlot {
+    pub(crate) features: PoolSlice,
+    pub(crate) num_vectors: usize,
+    pub(crate) published_at_ns: u64,
 }
 
 enum BatchStopReason {
@@ -71,9 +72,20 @@ impl SubmissionConsumer {
         }
     }
 
-    pub fn run(mut self) {
+    pub fn run(self) {
+        self.run_inner(None);
+    }
+
+    pub fn run_until(self, stop: Arc<AtomicBool>) {
+        self.run_inner(Some(stop));
+    }
+
+    fn run_inner(mut self, stop: Option<Arc<AtomicBool>>) {
         let mut idle_loops = 0u32;
         loop {
+            if stop_requested(stop.as_ref()) {
+                return;
+            }
             let backlog_was_empty = self.backlog.is_empty();
             match drain_visible_events(&mut self.poller, &mut self.backlog, self.max_batch_slots) {
                 Ok(()) => {}
@@ -142,7 +154,11 @@ impl SubmissionConsumer {
     }
 }
 
-fn idle_wait(idle_loops: &mut u32) {
+fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
+    stop.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+pub(crate) fn idle_wait(idle_loops: &mut u32) {
     *idle_loops = idle_loops.saturating_add(1);
     if *idle_loops < 64 {
         std::hint::spin_loop();
@@ -153,7 +169,7 @@ fn idle_wait(idle_loops: &mut u32) {
     }
 }
 
-fn drain_visible_events(
+pub(crate) fn drain_visible_events(
     poller: &mut EventPoller<InferenceEvent, MultiProducerBarrier>,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
@@ -195,7 +211,7 @@ fn take_event_features(event: &InferenceEvent) -> PoolSlice {
     }
 }
 
-fn build_batch_entry(
+pub(crate) fn build_batch_entry(
     session: &mut InferenceSession,
     backlog: &mut VecDeque<PendingSlot>,
     max_batch_slots: usize,
@@ -255,7 +271,7 @@ fn build_batch_entry(
     }
 }
 
-fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> usize {
+pub(crate) fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> usize {
     metrics::inc_session_waits();
     loop {
         if let Some(idx) = try_reserve_session(sessions, session_cursor) {
@@ -265,7 +281,10 @@ fn reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) ->
     }
 }
 
-fn try_reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize) -> Option<usize> {
+pub(crate) fn try_reserve_session(
+    sessions: &[InferenceSession],
+    session_cursor: &mut usize,
+) -> Option<usize> {
     for _ in 0..sessions.len() {
         let idx = *session_cursor;
         *session_cursor = (idx + 1) % sessions.len();
@@ -276,6 +295,6 @@ fn try_reserve_session(sessions: &[InferenceSession], session_cursor: &mut usize
     None
 }
 
-fn session_available(sessions: &[InferenceSession]) -> bool {
+pub(crate) fn session_available(sessions: &[InferenceSession]) -> bool {
     sessions.iter().any(InferenceSession::is_available)
 }
