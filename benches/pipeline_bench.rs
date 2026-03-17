@@ -179,6 +179,7 @@ fn drive(
         let batch = session.submit_batch(black_box(host_ptr), num_vectors);
         batch_queue.push(BatchEntry {
             slot_count: 1,
+            #[cfg(feature = "metrics")]
             submitted_at: Instant::now(),
             batch,
         });

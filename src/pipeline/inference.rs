@@ -18,8 +18,12 @@ use super::submission::{
     try_reserve_session,
 };
 
+const MAX_COMPLETIONS_PER_PASS: usize = 8;
+const MAX_SUBMISSIONS_PER_PASS: usize = 8;
+
 struct InflightBatchEntry {
     entry: BatchEntry,
+    #[cfg(feature = "metrics")]
     wait_started_at: Option<Instant>,
 }
 
@@ -104,12 +108,21 @@ impl InferenceConsumer {
                 progressed = true;
             }
 
-            if self.try_complete_front().is_ok_and(|done| done) {
-                progressed = true;
+            for _ in 0..MAX_COMPLETIONS_PER_PASS {
+                match self.try_complete_front() {
+                    Ok(true) => progressed = true,
+                    Ok(false) => break,
+                    Err(Polling::Shutdown) => return,
+                    Err(Polling::NoEvents) => unreachable!("try_complete_front never returns NoEvents"),
+                }
             }
 
-            if self.try_submit_next() {
-                progressed = true;
+            for _ in 0..MAX_SUBMISSIONS_PER_PASS {
+                if self.try_submit_next() {
+                    progressed = true;
+                } else {
+                    break;
+                }
             }
 
             if !progressed {
@@ -175,6 +188,7 @@ impl InferenceConsumer {
         self.coalesce_check_spins = 0;
         self.inflight.push_back(InflightBatchEntry {
             entry: batch_entry,
+            #[cfg(feature = "metrics")]
             wait_started_at: None,
         });
         true
@@ -187,17 +201,21 @@ impl InferenceConsumer {
 
         match front.entry.batch.completion.poll() {
             BatchPoll::Pending => {
+                #[cfg(feature = "metrics")]
                 front.wait_started_at.get_or_insert_with(Instant::now);
                 Ok(false)
             }
             BatchPoll::Ready => {
                 let inflight = self.inflight.pop_front().expect("front just checked");
+                #[cfg(feature = "metrics")]
                 metrics::record_batch_wait(
                     inflight
                         .wait_started_at
                         .map(|started| started.elapsed())
                         .unwrap_or(Duration::ZERO),
                 );
+                #[cfg(not(feature = "metrics"))]
+                metrics::record_batch_wait(Duration::ZERO);
                 let ready_queue = Arc::clone(&self.ready_queue);
                 let registry = Arc::clone(&self.registry);
                 let max_batch_slots = self.max_batch_slots;
@@ -216,12 +234,15 @@ impl InferenceConsumer {
             }
             BatchPoll::Failed => {
                 let inflight = self.inflight.pop_front().expect("front just checked");
+                #[cfg(feature = "metrics")]
                 metrics::record_batch_wait(
                     inflight
                         .wait_started_at
                         .map(|started| started.elapsed())
                         .unwrap_or(Duration::ZERO),
                 );
+                #[cfg(not(feature = "metrics"))]
+                metrics::record_batch_wait(Duration::ZERO);
                 inflight.entry.batch.completion.wait();
                 unreachable!("BatchCompletion::wait aborts on failure")
             }

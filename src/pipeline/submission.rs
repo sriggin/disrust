@@ -266,6 +266,7 @@ pub(crate) fn build_batch_entry(
 
     BatchEntry {
         slot_count,
+        #[cfg(feature = "metrics")]
         submitted_at: Instant::now(),
         batch,
     }

@@ -179,6 +179,7 @@ pub(crate) fn process_batch(
     );
 
     let session_available = Arc::clone(&entry.batch.session_available);
+    #[cfg(feature = "metrics")]
     metrics::record_batch_total(entry.submitted_at.elapsed());
     drop(entry);
     session_available.store(true, std::sync::atomic::Ordering::Release);
