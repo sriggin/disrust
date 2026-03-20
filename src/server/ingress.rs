@@ -208,6 +208,7 @@ where
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
         let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
         let mut parse_queue: VecDeque<u16> = VecDeque::new();
+        let mut parse_submit_budget = 0u8;
         submit_accept(&mut ring, self.listen_fd);
         submit_notify(&mut ring, self.response_queue.notify_fd());
 
@@ -230,13 +231,19 @@ where
                     key,
                 );
                 // Queued parse work can enqueue follow-on reads and shard-local writes.
-                // Those SQEs must be submitted before looping again, or sustained buffered
-                // parsing can starve socket progress indefinitely.
-                ring.submit();
+                // Submit often enough to preserve progress, but batch a few parse iterations
+                // together so the hot path does not pay an `io_uring_enter` syscall on every
+                // single buffered parse step.
+                parse_submit_budget = parse_submit_budget.saturating_add(1);
+                if parse_queue.is_empty() || parse_submit_budget >= 8 {
+                    ring.submit();
+                    parse_submit_budget = 0;
+                }
                 reap_retired_connections(&mut conns, &self.registry);
                 continue;
             }
 
+            parse_submit_budget = 0;
             ring.wait(1);
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
