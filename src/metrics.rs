@@ -38,6 +38,16 @@ mod imp {
     static WRITE_SQES: AtomicU64 = AtomicU64::new(0);
     static WRITE_CQES: AtomicU64 = AtomicU64::new(0);
     static WRITE_NEGATIVE: AtomicU64 = AtomicU64::new(0);
+    static IO_RESPONSE_DRAIN_LOOPS: AtomicU64 = AtomicU64::new(0);
+    static IO_RESPONSE_DRAIN_NS: AtomicU64 = AtomicU64::new(0);
+    static IO_WRITE_SUBMIT_LOOPS: AtomicU64 = AtomicU64::new(0);
+    static IO_WRITE_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+    static IO_PARSE_LOOPS: AtomicU64 = AtomicU64::new(0);
+    static IO_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+    static IO_CQE_LOOPS: AtomicU64 = AtomicU64::new(0);
+    static IO_CQE_NS: AtomicU64 = AtomicU64::new(0);
+    static IO_WAIT_LOOPS: AtomicU64 = AtomicU64::new(0);
+    static IO_WAIT_NS: AtomicU64 = AtomicU64::new(0);
     static BATCH_TOTAL_NS: OnceLock<TimerMetric> = OnceLock::new();
     static BATCH_WAIT_NS: OnceLock<TimerMetric> = OnceLock::new();
     static BACKLOG_AGE_NS: OnceLock<TimerMetric> = OnceLock::new();
@@ -80,6 +90,16 @@ mod imp {
         pub write_sqes: u64,
         pub write_cqes: u64,
         pub write_negative: u64,
+        pub io_response_drain_loops: u64,
+        pub io_response_drain_ns: u64,
+        pub io_write_submit_loops: u64,
+        pub io_write_submit_ns: u64,
+        pub io_parse_loops: u64,
+        pub io_parse_ns: u64,
+        pub io_cqe_loops: u64,
+        pub io_cqe_ns: u64,
+        pub io_wait_loops: u64,
+        pub io_wait_ns: u64,
         pub session_waits: u64,
         pub completion_queue_empty_waits: u64,
         pub completion_poll_stalls: u64,
@@ -243,6 +263,31 @@ mod imp {
         WRITE_NEGATIVE.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_io_response_drain(ns: u64) {
+        IO_RESPONSE_DRAIN_LOOPS.fetch_add(1, Ordering::Relaxed);
+        IO_RESPONSE_DRAIN_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_io_write_submit(ns: u64) {
+        IO_WRITE_SUBMIT_LOOPS.fetch_add(1, Ordering::Relaxed);
+        IO_WRITE_SUBMIT_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_io_parse(ns: u64) {
+        IO_PARSE_LOOPS.fetch_add(1, Ordering::Relaxed);
+        IO_PARSE_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_io_cqe(ns: u64) {
+        IO_CQE_LOOPS.fetch_add(1, Ordering::Relaxed);
+        IO_CQE_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn add_io_wait(ns: u64) {
+        IO_WAIT_LOOPS.fetch_add(1, Ordering::Relaxed);
+        IO_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
     fn batch_total_timer() -> &'static TimerMetric {
         BATCH_TOTAL_NS.get_or_init(TimerMetric::new)
     }
@@ -343,6 +388,16 @@ mod imp {
             write_sqes: WRITE_SQES.load(Ordering::Relaxed),
             write_cqes: WRITE_CQES.load(Ordering::Relaxed),
             write_negative: WRITE_NEGATIVE.load(Ordering::Relaxed),
+            io_response_drain_loops: IO_RESPONSE_DRAIN_LOOPS.load(Ordering::Relaxed),
+            io_response_drain_ns: IO_RESPONSE_DRAIN_NS.load(Ordering::Relaxed),
+            io_write_submit_loops: IO_WRITE_SUBMIT_LOOPS.load(Ordering::Relaxed),
+            io_write_submit_ns: IO_WRITE_SUBMIT_NS.load(Ordering::Relaxed),
+            io_parse_loops: IO_PARSE_LOOPS.load(Ordering::Relaxed),
+            io_parse_ns: IO_PARSE_NS.load(Ordering::Relaxed),
+            io_cqe_loops: IO_CQE_LOOPS.load(Ordering::Relaxed),
+            io_cqe_ns: IO_CQE_NS.load(Ordering::Relaxed),
+            io_wait_loops: IO_WAIT_LOOPS.load(Ordering::Relaxed),
+            io_wait_ns: IO_WAIT_NS.load(Ordering::Relaxed),
             session_waits: SESSION_WAITS.load(Ordering::Relaxed),
             completion_queue_empty_waits: COMPLETION_QUEUE_EMPTY_WAITS.load(Ordering::Relaxed),
             completion_poll_stalls: COMPLETION_POLL_STALLS.load(Ordering::Relaxed),
@@ -412,6 +467,29 @@ mod imp {
                     let write_cqes_d = snap.write_cqes.saturating_sub(last_snap.write_cqes);
                     let write_negative_d =
                         snap.write_negative.saturating_sub(last_snap.write_negative);
+                    let io_response_drain_loops_d = snap
+                        .io_response_drain_loops
+                        .saturating_sub(last_snap.io_response_drain_loops);
+                    let io_response_drain_ns_d = snap
+                        .io_response_drain_ns
+                        .saturating_sub(last_snap.io_response_drain_ns);
+                    let io_write_submit_loops_d = snap
+                        .io_write_submit_loops
+                        .saturating_sub(last_snap.io_write_submit_loops);
+                    let io_write_submit_ns_d = snap
+                        .io_write_submit_ns
+                        .saturating_sub(last_snap.io_write_submit_ns);
+                    let io_parse_loops_d =
+                        snap.io_parse_loops.saturating_sub(last_snap.io_parse_loops);
+                    let io_parse_ns_d =
+                        snap.io_parse_ns.saturating_sub(last_snap.io_parse_ns);
+                    let io_cqe_loops_d =
+                        snap.io_cqe_loops.saturating_sub(last_snap.io_cqe_loops);
+                    let io_cqe_ns_d = snap.io_cqe_ns.saturating_sub(last_snap.io_cqe_ns);
+                    let io_wait_loops_d =
+                        snap.io_wait_loops.saturating_sub(last_snap.io_wait_loops);
+                    let io_wait_ns_d =
+                        snap.io_wait_ns.saturating_sub(last_snap.io_wait_ns);
                     let session_waits_d = snap
                         .session_waits
                         .saturating_sub(last_snap.session_waits);
@@ -456,6 +534,32 @@ mod imp {
                         write_sqes_d, write_cqes_d, write_negative_d,
                         write_partial_d, write_eagain_d, write_fatal_d, write_drain_waits_d,
                     );
+                    let io_total_ns_d = io_response_drain_ns_d
+                        .saturating_add(io_write_submit_ns_d)
+                        .saturating_add(io_parse_ns_d)
+                        .saturating_add(io_cqe_ns_d)
+                        .saturating_add(io_wait_ns_d);
+                    println!(
+                        "  io_loop:     resp={} ({}) write={} ({}) parse={} ({}) cqe={} ({}) wait={} ({})",
+                        io_response_drain_loops_d,
+                        format_phase_share(
+                            io_response_drain_ns_d,
+                            io_response_drain_loops_d,
+                            io_total_ns_d,
+                        ),
+                        io_write_submit_loops_d,
+                        format_phase_share(
+                            io_write_submit_ns_d,
+                            io_write_submit_loops_d,
+                            io_total_ns_d,
+                        ),
+                        io_parse_loops_d,
+                        format_phase_share(io_parse_ns_d, io_parse_loops_d, io_total_ns_d),
+                        io_cqe_loops_d,
+                        format_phase_share(io_cqe_ns_d, io_cqe_loops_d, io_total_ns_d),
+                        io_wait_loops_d,
+                        format_phase_share(io_wait_ns_d, io_wait_loops_d, io_total_ns_d),
+                    );
                     println!(
                         "  stalls:      ring_full={} pool_exh={} pool_too_large={} session_waits={} cq_empty_waits={} poll_stalls={}",
                         req_full_d, pool_exh_d, pool_tl_d,
@@ -495,6 +599,19 @@ mod imp {
             None => format!("{}[n=0]", label),
         }
     }
+
+    fn format_phase_share(phase_ns: u64, phase_loops: u64, total_ns: u64) -> String {
+        if total_ns == 0 {
+            return "0.0% avg=0.0us".to_string();
+        }
+        let share = (phase_ns as f64 * 100.0) / total_ns as f64;
+        let avg_us = if phase_loops == 0 {
+            0.0
+        } else {
+            phase_ns as f64 / phase_loops as f64 / 1000.0
+        };
+        format!("{share:.1}% avg={avg_us:.1}us")
+    }
 }
 
 #[cfg(not(feature = "metrics"))]
@@ -523,6 +640,16 @@ mod imp {
         pub write_sqes: u64,
         pub write_cqes: u64,
         pub write_negative: u64,
+        pub io_response_drain_loops: u64,
+        pub io_response_drain_ns: u64,
+        pub io_write_submit_loops: u64,
+        pub io_write_submit_ns: u64,
+        pub io_parse_loops: u64,
+        pub io_parse_ns: u64,
+        pub io_cqe_loops: u64,
+        pub io_cqe_ns: u64,
+        pub io_wait_loops: u64,
+        pub io_wait_ns: u64,
         pub session_waits: u64,
         pub completion_queue_empty_waits: u64,
         pub completion_poll_stalls: u64,
@@ -566,6 +693,11 @@ mod imp {
     pub fn inc_write_sqes() {}
     pub fn inc_write_cqes() {}
     pub fn inc_write_negative() {}
+    pub fn add_io_response_drain(_: u64) {}
+    pub fn add_io_write_submit(_: u64) {}
+    pub fn add_io_parse(_: u64) {}
+    pub fn add_io_cqe(_: u64) {}
+    pub fn add_io_wait(_: u64) {}
     pub fn record_batch_total(_: std::time::Duration) {}
     pub fn record_batch_wait(_: std::time::Duration) {}
     pub fn record_backlog_age(_: std::time::Duration) {}
@@ -596,6 +728,16 @@ mod imp {
             write_sqes: 0,
             write_cqes: 0,
             write_negative: 0,
+            io_response_drain_loops: 0,
+            io_response_drain_ns: 0,
+            io_write_submit_loops: 0,
+            io_write_submit_ns: 0,
+            io_parse_loops: 0,
+            io_parse_ns: 0,
+            io_cqe_loops: 0,
+            io_cqe_ns: 0,
+            io_wait_loops: 0,
+            io_wait_ns: 0,
             session_waits: 0,
             completion_queue_empty_waits: 0,
             completion_poll_stalls: 0,

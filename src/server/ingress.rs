@@ -11,7 +11,7 @@ use io_uring::{opcode, squeue::Entry, types::Fd};
 use slab::Slab;
 
 use crate::buffer_pool::PoolAllocator;
-use crate::clock::elapsed_since_ns;
+use crate::clock::{elapsed_since_ns, monotonic_now_ns};
 use crate::config::{READ_BUF_SIZE, SLAB_CAPACITY, WRITE_BUF_SIZE};
 use crate::connection_id::ConnectionRef;
 use crate::metrics;
@@ -213,13 +213,19 @@ where
         submit_notify(&mut ring, self.response_queue.notify_fd());
 
         loop {
+            let phase_start = monotonic_now_ns();
             drain_response_queue(&mut conns, &self.response_queue);
+            metrics::add_io_response_drain(monotonic_now_ns().saturating_sub(phase_start));
+
+            let phase_start = monotonic_now_ns();
             submit_ready_writes(&mut ring, &mut conns, &self.registry);
+            metrics::add_io_write_submit(monotonic_now_ns().saturating_sub(phase_start));
 
             if let Some(key) = parse_queue.pop_front() {
                 if let Some(conn) = conns.get_mut(key as usize) {
                     conn.parse_queued = false;
                 }
+                let phase_start = monotonic_now_ns();
                 parse_and_maybe_read(
                     &mut ring,
                     &mut conns,
@@ -230,6 +236,7 @@ where
                     &self.registry,
                     key,
                 );
+                metrics::add_io_parse(monotonic_now_ns().saturating_sub(phase_start));
                 // Queued parse work can enqueue follow-on reads and shard-local writes.
                 // Submit often enough to preserve progress, but batch a few parse iterations
                 // together so the hot path does not pay an `io_uring_enter` syscall on every
@@ -244,10 +251,13 @@ where
             }
 
             parse_submit_budget = 0;
+            let phase_start = monotonic_now_ns();
             ring.wait(1);
+            metrics::add_io_wait(monotonic_now_ns().saturating_sub(phase_start));
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
 
+            let phase_start = monotonic_now_ns();
             for &(user_data, result) in &cqe_buf {
                 let (op, data) = decode_user_data(user_data);
                 match op {
@@ -275,6 +285,7 @@ where
                     _ => {}
                 }
             }
+            metrics::add_io_cqe(monotonic_now_ns().saturating_sub(phase_start));
 
             reap_retired_connections(&mut conns, &self.registry);
         }

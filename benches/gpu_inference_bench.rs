@@ -31,7 +31,7 @@ enum Mode {
 #[command(about = "GPU inference subsystem benchmark")]
 struct Args {
     /// Path to ONNX model file.
-    #[arg(short, long, default_value = "tests/models/ort_sum_model.onnx")]
+    #[arg(short, long, default_value = "tests/models/ort_verify_model.onnx")]
     model: String,
 
     /// Benchmark mode:

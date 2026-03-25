@@ -100,7 +100,7 @@ That means:
 Server:
 
 ```bash
-cargo run --release --bin disrust -- serve --model tests/models/ort_sum_model.onnx
+cargo run --release --bin disrust -- serve --model tests/models/ort_verify_model.onnx
 ```
 
 Client smoke test:
@@ -145,6 +145,32 @@ scripts/run_sustain_capture.sh --no-cuda
 ```bash
 CONNECTIONS=16 CLIENT_THREADS=2 scripts/run_sustain_capture.sh --no-cuda --perf-all --server-io-threads 4
 ```
+
+## Canonical Test Model
+
+The repo's single canonical trivial ONNX fixture is:
+
+- [tests/models/ort_verify_model.onnx](/home/sriggin/dev/sean/disrust/tests/models/ort_verify_model.onnx)
+
+Its structure is intentionally simple:
+
+- input: `float32[batch, 16]`
+- output: `float32[batch]`
+- computation: weighted dot product against weights `[1, 2, ..., 16]`
+
+For a row with values `x[0..15]`, the expected output is:
+
+```text
+sum(x[i] * (i + 1)) for i in 0..15
+```
+
+You can verify exact outputs through the built-in verification command:
+
+```bash
+cargo run --release --bin disrust -- verify --model tests/models/ort_verify_model.onnx --validate-generated-model --cpu
+```
+
+That command feeds deterministic generated inputs and checks the exact weighted-dot result for each output row. Use `--cuda` instead of `--cpu` when validating the CUDA execution path.
 
 ## Validation
 

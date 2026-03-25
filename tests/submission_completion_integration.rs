@@ -54,8 +54,8 @@ fn backend_available() -> bool {
 fn encode_expected_response(fill: f32) -> [u8; 5] {
     let mut bytes = [0u8; 5];
     bytes[0] = 1;
-    let sum = fill * FEATURE_DIM as f32;
-    bytes[1..].copy_from_slice(&sum.to_le_bytes());
+    let weighted_dot = fill * ((FEATURE_DIM * (FEATURE_DIM + 1)) / 2) as f32;
+    bytes[1..].copy_from_slice(&weighted_dot.to_le_bytes());
     bytes
 }
 
@@ -72,7 +72,7 @@ fn run_pipeline_order_test() {
     let mut producer = builder.build();
 
     let model_bytes =
-        std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
+        std::fs::read("tests/models/ort_verify_model.onnx").expect("failed to read test model");
     let backend = OrtBackend::new(&model_bytes, 1);
 
     let response_queue = Arc::new(ResponseQueue::new(32));
@@ -190,7 +190,7 @@ fn run_sustained_response_queue_test() {
     let mut producer = builder.build();
 
     let model_bytes =
-        std::fs::read("tests/models/ort_sum_model.onnx").expect("failed to read test model");
+        std::fs::read("tests/models/ort_verify_model.onnx").expect("failed to read test model");
     let backend = OrtBackend::new(&model_bytes, 1);
 
     let response_queue = Arc::new(ResponseQueue::new(CONNECTIONS * REQUESTS_PER_CONNECTION));
