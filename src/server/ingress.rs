@@ -416,11 +416,7 @@ fn parse_and_maybe_read(
     ) {
         Ok(outcome) => {
             drop(publish_guard);
-            if outcome.consumed > 0 {
-                conn.read_buf
-                    .copy_within(outcome.consumed..conn.read_len, 0);
-                conn.read_len -= outcome.consumed;
-            }
+            compact_read_buf(conn, outcome.consumed);
             metrics::add_bytes_consumed(outcome.consumed as u64);
             registry.update_published_seq_end(conn.conn, conn.next_request_seq);
             if outcome.needs_read {
@@ -446,6 +442,13 @@ fn parse_and_maybe_read(
         submit_read(ring, conns, key);
     } else if !c.read_closed && !c.read_inflight && c.read_len > 0 {
         enqueue_parse(conns, parse_queue, key);
+    }
+}
+
+fn compact_read_buf(conn: &mut Connection, consumed: usize) {
+    if consumed > 0 {
+        conn.read_buf.copy_within(consumed..conn.read_len, 0);
+        conn.read_len -= consumed;
     }
 }
 
@@ -631,5 +634,310 @@ fn handle_write(
         conn.ready_queued = true;
     } else {
         maybe_mark_read_closed(registry, conn);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use slab::Slab;
+
+    use super::*;
+    use crate::pipeline::connection_registry::ConnectionRegistry;
+    use crate::pipeline::response_queue::{ResponseQueue, ResponseReady};
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+
+    fn make_registry() -> Arc<ConnectionRegistry> {
+        Arc::new(ConnectionRegistry::new(1, 64))
+    }
+
+    /// Insert one connection at slab key 0, registered at conn_id 0.
+    fn setup(registry: &Arc<ConnectionRegistry>) -> (Slab<Connection>, ConnectionRef) {
+        let mut conns = Slab::with_capacity(4);
+        let entry = conns.vacant_entry();
+        assert_eq!(entry.key(), 0, "first slab key must be 0");
+        let conn_ref = registry.open(0, 0, -1);
+        entry.insert(Connection::new(-1, conn_ref));
+        (conns, conn_ref)
+    }
+
+    fn push_inflight(conn: &mut Connection, bytes: &[u8]) {
+        conn.inflight
+            .push_back(Box::new(ResponseFrame::new(0, bytes)));
+    }
+
+    fn push_queued(conn: &mut Connection, bytes: &[u8]) {
+        conn.queue.push_back(Box::new(ResponseFrame::new(0, bytes)));
+    }
+
+    fn inflight_offsets(conn: &Connection) -> Vec<usize> {
+        conn.inflight.iter().map(|f| f.offset).collect()
+    }
+
+    // ---------------------------------------------------------------------------
+    // compact_read_buf
+
+    #[test]
+    fn compact_zero_consumed_is_noop() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        let conn = &mut conns[0];
+        conn.read_buf[..5].copy_from_slice(b"hello");
+        conn.read_len = 5;
+        compact_read_buf(conn, 0);
+        assert_eq!(conn.read_len, 5);
+        assert_eq!(&conn.read_buf[..5], b"hello");
+    }
+
+    #[test]
+    fn compact_all_consumed_clears_len() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        let conn = &mut conns[0];
+        conn.read_buf[..4].copy_from_slice(b"data");
+        conn.read_len = 4;
+        compact_read_buf(conn, 4);
+        assert_eq!(conn.read_len, 0);
+    }
+
+    #[test]
+    fn compact_partial_shifts_remainder_to_front() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        let conn = &mut conns[0];
+        conn.read_buf[..8].copy_from_slice(b"abcdefgh");
+        conn.read_len = 8;
+        compact_read_buf(conn, 5);
+        assert_eq!(conn.read_len, 3);
+        assert_eq!(&conn.read_buf[..3], b"fgh");
+    }
+
+    // ---------------------------------------------------------------------------
+    // handle_write
+
+    #[test]
+    fn write_completes_single_frame() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        push_inflight(&mut conns[0], &[1u8; 10]);
+        conns[0].write_inflight = true;
+
+        handle_write(&mut conns, &registry, 0, 10);
+
+        let conn = &conns[0];
+        assert!(conn.inflight.is_empty());
+        assert!(!conn.write_inflight);
+        assert!(!conn.ready_queued);
+    }
+
+    #[test]
+    fn write_partial_advances_frame_offset() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        push_inflight(&mut conns[0], &[1u8; 20]);
+        conns[0].write_inflight = true;
+
+        handle_write(&mut conns, &registry, 0, 7);
+
+        let conn = &conns[0];
+        assert_eq!(conn.inflight.len(), 1);
+        assert_eq!(conn.inflight[0].offset, 7);
+        assert!(!conn.write_inflight);
+        assert!(conn.ready_queued);
+    }
+
+    #[test]
+    fn write_partial_spanning_frame_boundary() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        push_inflight(&mut conns[0], &[1u8; 10]);
+        push_inflight(&mut conns[0], &[2u8; 10]);
+        conns[0].write_inflight = true;
+
+        // Completes first frame (10) and 3 bytes into second.
+        handle_write(&mut conns, &registry, 0, 13);
+
+        let conn = &conns[0];
+        assert_eq!(conn.inflight.len(), 1);
+        assert_eq!(inflight_offsets(conn), vec![3]);
+        assert!(conn.ready_queued);
+    }
+
+    #[test]
+    fn write_drains_inflight_with_queue_pending() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        push_inflight(&mut conns[0], &[1u8; 10]);
+        push_queued(&mut conns[0], &[2u8; 10]);
+        conns[0].write_inflight = true;
+
+        handle_write(&mut conns, &registry, 0, 10);
+
+        let conn = &conns[0];
+        assert!(conn.inflight.is_empty());
+        assert!(!conn.write_inflight);
+        assert!(
+            conn.ready_queued,
+            "queue still has frames so ready_queued must be set"
+        );
+    }
+
+    #[test]
+    fn write_error_tears_down_connection() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        push_inflight(&mut conns[0], &[1u8; 10]);
+        push_queued(&mut conns[0], &[2u8; 10]);
+        conns[0].write_inflight = true;
+
+        handle_write(&mut conns, &registry, 0, -libc::EPIPE);
+
+        let conn = &conns[0];
+        assert!(conn.write_closed);
+        assert!(conn.read_closed);
+        assert!(!conn.write_inflight);
+        assert!(conn.inflight.is_empty());
+        assert!(conn.queue.is_empty());
+    }
+
+    #[test]
+    fn write_completing_last_frame_marks_read_closed() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        let conn = &mut conns[0];
+        conn.read_closed = true;
+        conn.write_inflight = true;
+        push_inflight(conn, &[1u8; 10]);
+
+        handle_write(&mut conns, &registry, 0, 10);
+
+        assert!(conns[0].write_closed);
+        assert!(registry.is_retired(conn_ref));
+    }
+
+    // ---------------------------------------------------------------------------
+    // drain_response_queue
+
+    #[test]
+    fn drain_routes_response_to_correct_connection() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        let rq = Arc::new(ResponseQueue::new(8));
+        rq.push(ResponseReady::encode(conn_ref, 0, 1, &[1.0f32]));
+
+        drain_response_queue(&mut conns, &rq);
+
+        assert_eq!(conns[0].queue.len(), 1);
+        assert!(conns[0].ready_queued);
+    }
+
+    #[test]
+    fn drain_drops_stale_generation() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        let rq = Arc::new(ResponseQueue::new(8));
+        let stale = ConnectionRef::new(
+            conn_ref.shard_id(),
+            conn_ref.conn_id,
+            conn_ref.generation().wrapping_add(1),
+        );
+        rq.push(ResponseReady::encode(stale, 0, 1, &[1.0f32]));
+
+        drain_response_queue(&mut conns, &rq);
+
+        assert!(conns[0].queue.is_empty());
+        assert!(!conns[0].ready_queued);
+    }
+
+    #[test]
+    fn drain_drops_response_for_write_closed_connection() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        conns[0].write_closed = true;
+        let rq = Arc::new(ResponseQueue::new(8));
+        rq.push(ResponseReady::encode(conn_ref, 0, 1, &[1.0f32]));
+
+        drain_response_queue(&mut conns, &rq);
+
+        assert!(conns[0].queue.is_empty());
+    }
+
+    #[test]
+    fn drain_drops_response_for_missing_conn_id() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        let rq = Arc::new(ResponseQueue::new(8));
+        // conn_id=99 does not exist in the slab
+        let ghost = ConnectionRef::new(0, 99, 1);
+        rq.push(ResponseReady::encode(ghost, 0, 1, &[1.0f32]));
+
+        drain_response_queue(&mut conns, &rq);
+
+        assert!(conns[0].queue.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // reap_retired_connections
+
+    fn retire(
+        registry: &Arc<ConnectionRegistry>,
+        conn_ref: ConnectionRef,
+        conns: &mut Slab<Connection>,
+    ) {
+        let conn = &mut conns[conn_ref.conn_id as usize];
+        conn.read_closed = true;
+        conn.write_closed = true;
+        registry.mark_read_closed(conn_ref, 0);
+    }
+
+    #[test]
+    fn reap_removes_fully_closed_retired_connection() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        retire(&registry, conn_ref, &mut conns);
+
+        reap_retired_connections(&mut conns, &registry);
+
+        assert!(conns.get(0).is_none());
+    }
+
+    #[test]
+    fn reap_skips_write_inflight() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        retire(&registry, conn_ref, &mut conns);
+        conns[0].write_inflight = true;
+
+        reap_retired_connections(&mut conns, &registry);
+
+        assert!(conns.get(0).is_some());
+    }
+
+    #[test]
+    fn reap_skips_non_empty_inflight_queue() {
+        let registry = make_registry();
+        let (mut conns, conn_ref) = setup(&registry);
+        retire(&registry, conn_ref, &mut conns);
+        push_inflight(&mut conns[0], &[1u8; 5]);
+
+        reap_retired_connections(&mut conns, &registry);
+
+        assert!(conns.get(0).is_some());
+    }
+
+    #[test]
+    fn reap_skips_connection_not_retired_in_registry() {
+        let registry = make_registry();
+        let (mut conns, _) = setup(&registry);
+        // Mark locally closed but do NOT call mark_read_closed on registry.
+        conns[0].read_closed = true;
+        conns[0].write_closed = true;
+
+        reap_retired_connections(&mut conns, &registry);
+
+        assert!(conns.get(0).is_some());
     }
 }

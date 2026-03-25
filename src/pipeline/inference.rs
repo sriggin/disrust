@@ -12,8 +12,7 @@ use crate::config::MAX_SESSION_BATCH_SIZE;
 use crate::metrics;
 use crate::pipeline::connection_registry::ConnectionRegistry;
 use crate::pipeline::response_queue::{ResponseQueue, ResponseReady};
-use crate::pipeline::session::{BatchPoll, InferenceBackend, InFlightBatch};
-use crate::protocol;
+use crate::pipeline::session::{BatchPoll, InFlightBatch, InferenceBackend};
 use crate::ring_types::InferenceEvent;
 
 const MAX_COMPLETIONS_PER_PASS: usize = 8;
@@ -192,7 +191,8 @@ impl<B: InferenceBackend> InferenceConsumer<B> {
         if let Some(started) = self.backlog_started_at {
             metrics::record_backlog_age(started.elapsed());
         }
-        let batch_entry = build_batch_entry(&mut self.backend, &mut self.backlog, self.max_batch_slots);
+        let batch_entry =
+            build_batch_entry(&mut self.backend, &mut self.backlog, self.max_batch_slots);
         metrics::inc_batches_submitted();
         metrics::add_vectors_submitted(batch_entry.batch.output_len as u64);
         if self.backlog.is_empty() {
@@ -419,18 +419,14 @@ fn process_batch<R: Send>(
             .expect("guard exhausted before queued batch slot_count");
         let num_vecs = event.num_vectors as usize;
 
-        let wire_len = protocol::response_size(num_vecs);
-        let mut wire = vec![0u8; wire_len];
         let response = &output[output_offset..output_offset + num_vecs];
-        protocol::encode_response(response, &mut wire);
-
         let conn = event.conn;
         if registry.is_open(conn) {
-            response_queues[conn.shard_id() as usize].push(ResponseReady::new(
+            response_queues[conn.shard_id() as usize].push(ResponseReady::encode(
                 conn,
                 event.request_seq,
                 event.published_at_ns,
-                &wire,
+                response,
             ));
         }
 

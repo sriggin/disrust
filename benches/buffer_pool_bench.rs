@@ -1,107 +1,124 @@
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use disrust::buffer_pool::BufferPool;
 use disrust::constants::FEATURE_DIM;
-use std::env;
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
-const DEFAULT_POOL_CAPACITY: usize = 65536 * 64 * FEATURE_DIM; // Same as real config
-const ITERATIONS: usize = 50_000_000;
+const DEFAULT_POOL_CAPACITY: usize = 65536 * 64 * FEATURE_DIM;
 
-fn bench_size(pool: &'static BufferPool, size: usize, label: &str) {
-    let mut alloc = pool.allocator();
+fn ring_size(pool_capacity: usize, alloc_size: usize) -> usize {
+    (pool_capacity / alloc_size / 2).clamp(1, 1024)
+}
 
-    // Warm up
-    for _ in 0..10000 {
-        let mut slice = alloc.alloc(size).unwrap();
-        slice.as_mut_slice()[0] = 1.0;
-        black_box(&slice);
-        drop(slice.freeze());
-    }
-
-    let start = std::time::Instant::now();
-
-    // Simulate ring buffer wraparound pattern: keep last N allocations alive
-    // Size ring to use ~50% of pool capacity to allow headroom
-    let (_, pool_capacity) = pool.utilization();
-    let max_possible = pool_capacity / size; // Max allocations that fit in pool
-    let ring_size = (max_possible / 2).clamp(1, 1024);
-    let mut ring: Vec<_> = (0..ring_size)
-        .map(|_| alloc.alloc(size).unwrap().freeze())
+/// Run one Criterion sample using iter_custom.
+///
+/// Ring setup and pre-warming happen before the timer starts so that every
+/// sample — regardless of the iters count Criterion requests — begins with
+/// the full ring's working set already established in cache.
+fn run_sample(
+    alloc: &mut disrust::buffer_pool::PoolAllocator,
+    alloc_size: usize,
+    ring_sz: usize,
+    iters: u64,
+) -> Duration {
+    // Untimed: initialize ring.
+    let mut ring: Vec<_> = (0..ring_sz)
+        .map(|_| alloc.alloc(alloc_size).unwrap().freeze())
         .collect();
 
-    for i in 0..ITERATIONS {
-        // Allocate new slice
-        let mut new_slice = alloc.alloc(size).unwrap();
-        new_slice.as_mut_slice()[0] = i as f32;
-        black_box(&new_slice);
-        let frozen = new_slice.freeze();
-
-        // Drop old slice (simulates disruptor wraparound)
-        ring[i % ring_size] = frozen;
+    // Untimed: pre-warm — visit every slot once to establish steady-state
+    // cache footprint before Criterion starts timing.
+    for i in 0..ring_sz {
+        let mut s = alloc.alloc(alloc_size).unwrap();
+        s.as_mut_slice()[0] = i as f32;
+        black_box(&s);
+        ring[i % ring_sz] = s.freeze();
     }
 
+    // Timed.
+    let start = Instant::now();
+    for i in 0..iters as usize {
+        let mut s = alloc.alloc(alloc_size).unwrap();
+        s.as_mut_slice()[0] = i as f32;
+        black_box(&s);
+        ring[i % ring_sz] = s.freeze();
+    }
     let elapsed = start.elapsed();
-    let ops_per_sec = ITERATIONS as f64 / elapsed.as_secs_f64();
-    let ns_per_op = elapsed.as_nanos() as f64 / ITERATIONS as f64;
 
-    eprintln!(
-        "{:25} {:8.2} ns/op  {:12.0} ops/sec",
-        label, ns_per_op, ops_per_sec
-    );
-
-    // Keep ring alive
-    black_box(ring);
+    // Untimed: rotate so index 0 is the oldest allocation before dropping.
+    // The pool's release() assumes FIFO order; without this, iters % ring_sz != 0
+    // leaves the Vec in rotated order and out-of-order drops corrupt the read cursor.
+    ring.rotate_left(iters as usize % ring_sz);
+    drop(ring);
+    elapsed
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+fn alloc_sizes(c: &mut Criterion) {
+    let pool = BufferPool::leak_new(DEFAULT_POOL_CAPACITY);
+    let mut alloc = pool.allocator();
 
-    if args.len() > 1 && args[1] == "--pool-sizes" {
-        // Benchmark different pool sizes with fixed allocation size
-        let alloc_size = FEATURE_DIM * 8; // 8 vectors (common case)
-        eprintln!(
-            "Benchmarking different pool sizes (alloc size: {} f32s)\n",
-            alloc_size
-        );
+    let cases: &[(&str, usize)] = &[
+        ("1 vec (16 f32)", FEATURE_DIM),
+        ("2 vec (32 f32)", FEATURE_DIM * 2),
+        ("4 vec (64 f32)", FEATURE_DIM * 4),
+        ("8 vec (128 f32)", FEATURE_DIM * 8),
+        ("16 vec (256 f32)", FEATURE_DIM * 16),
+        ("32 vec (512 f32)", FEATURE_DIM * 32),
+        ("64 vec (1024 f32)", FEATURE_DIM * 64),
+    ];
 
-        // Test from L1 cache (~32 KB) up to 1 GB
-        for &multiplier in &[
-            32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
-            524288, 1048576, 2097152,
-        ] {
-            let capacity = multiplier * FEATURE_DIM;
-            let pool = BufferPool::leak_new(capacity);
+    let mut group = c.benchmark_group("buffer_pool/alloc_size");
+    group.throughput(Throughput::Elements(1));
+
+    for &(label, alloc_size) in cases {
+        let ring_sz = ring_size(DEFAULT_POOL_CAPACITY, alloc_size);
+        group.bench_function(BenchmarkId::new("wraparound", label), |b| {
+            b.iter_custom(|iters| run_sample(&mut alloc, alloc_size, ring_sz, iters));
+        });
+    }
+
+    group.finish();
+}
+
+fn pool_sizes(c: &mut Criterion) {
+    let alloc_size = FEATURE_DIM * 8; // 8 vectors — common case
+
+    // Multipliers span ~2 KB (L1) through ~1 GB (far DRAM).
+    let multipliers: &[usize] = &[
+        32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+        1048576, 2097152,
+    ];
+
+    // Allocate all pools upfront so pool creation doesn't touch bench timing.
+    let pools: Vec<(&'static BufferPool, String)> = multipliers
+        .iter()
+        .map(|&m| {
+            let capacity = m * FEATURE_DIM;
             let size_bytes = capacity * 4;
             let label = if size_bytes < 1024 * 1024 {
-                format!("{} KB pool", size_bytes / 1024)
+                format!("{} KB", size_bytes / 1024)
             } else {
-                format!("{} MB pool", size_bytes / (1024 * 1024))
+                format!("{} MB", size_bytes / (1024 * 1024))
             };
-            bench_size(pool, alloc_size, &label);
-        }
-    } else if args.len() > 1 && args[1] == "--alloc-sizes" {
-        // Benchmark different allocation sizes with fixed pool
-        let pool = BufferPool::leak_new(DEFAULT_POOL_CAPACITY);
-        eprintln!(
-            "Pool capacity: {} f32s ({} MB)",
-            DEFAULT_POOL_CAPACITY,
-            DEFAULT_POOL_CAPACITY * 4 / 1_000_000
-        );
-        eprintln!("Benchmarking different allocation sizes\n");
+            (BufferPool::leak_new(capacity), label)
+        })
+        .collect();
 
-        bench_size(pool, FEATURE_DIM, "1 vector (16 f32)");
-        bench_size(pool, FEATURE_DIM * 2, "2 vectors (32 f32)");
-        bench_size(pool, FEATURE_DIM * 4, "4 vectors (64 f32)");
-        bench_size(pool, FEATURE_DIM * 8, "8 vectors (128 f32)");
-        bench_size(pool, FEATURE_DIM * 16, "16 vectors (256 f32)");
-        bench_size(pool, FEATURE_DIM * 32, "32 vectors (512 f32)");
-        bench_size(pool, FEATURE_DIM * 64, "64 vectors (1024 f32)");
-    } else {
-        eprintln!("Usage:");
-        eprintln!(
-            "  cargo bench --bench buffer_pool_bench -- --alloc-sizes   # Test different allocation sizes"
-        );
-        eprintln!(
-            "  cargo bench --bench buffer_pool_bench -- --pool-sizes    # Test different pool capacities"
-        );
+    let mut group = c.benchmark_group("buffer_pool/pool_size");
+    group.throughput(Throughput::Elements(1));
+    group.measurement_time(Duration::from_secs(10));
+
+    for (pool, label) in &pools {
+        let mut alloc = pool.allocator();
+        let (_, pool_capacity) = pool.utilization();
+        let ring_sz = ring_size(pool_capacity, alloc_size);
+        group.bench_function(BenchmarkId::new("wraparound", label), |b| {
+            b.iter_custom(|iters| run_sample(&mut alloc, alloc_size, ring_sz, iters));
+        });
     }
+
+    group.finish();
 }
+
+criterion_group!(benches, alloc_sizes, pool_sizes);
+criterion_main!(benches);

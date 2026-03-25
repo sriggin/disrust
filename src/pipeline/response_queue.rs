@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::WRITE_BUF_SIZE;
 use crate::connection_id::ConnectionRef;
+use crate::protocol;
 
 #[derive(Clone, Copy)]
 pub struct ResponseReady {
@@ -16,15 +17,21 @@ pub struct ResponseReady {
 }
 
 impl ResponseReady {
-    pub fn new(conn: ConnectionRef, request_seq: u64, published_at_ns: u64, bytes: &[u8]) -> Self {
-        debug_assert!(bytes.len() <= WRITE_BUF_SIZE);
+    pub fn encode(
+        conn: ConnectionRef,
+        request_seq: u64,
+        published_at_ns: u64,
+        results: &[f32],
+    ) -> Self {
+        let len = protocol::response_size(results.len());
+        debug_assert!(len <= WRITE_BUF_SIZE);
         let mut data = [0u8; WRITE_BUF_SIZE];
-        data[..bytes.len()].copy_from_slice(bytes);
+        protocol::encode_response(results, &mut data[..len]);
         Self {
             conn,
             request_seq,
             published_at_ns,
-            len: bytes.len(),
+            len,
             data,
         }
     }
@@ -128,18 +135,18 @@ mod tests {
         let queue = ResponseQueue::new(4);
         let conn0 = ConnectionRef::new(0, 1, 11);
         let conn1 = ConnectionRef::new(1, 2, 22);
-        queue.push(ResponseReady::new(conn0, 7, 100, &[1, 2, 3]));
-        queue.push(ResponseReady::new(conn1, 8, 101, &[4, 5]));
+        queue.push(ResponseReady::encode(conn0, 7, 100, &[1.0f32, 2.0, 3.0]));
+        queue.push(ResponseReady::encode(conn1, 8, 101, &[4.0f32, 5.0]));
 
         let first = queue.pop().expect("first response");
         assert_eq!(first.conn, conn0);
         assert_eq!(first.request_seq, 7);
-        assert_eq!(&first.data[..first.len], &[1, 2, 3]);
+        assert_eq!(first.data[0], 3); // num_vectors header
 
         let second = queue.pop().expect("second response");
         assert_eq!(second.conn, conn1);
         assert_eq!(second.request_seq, 8);
-        assert_eq!(&second.data[..second.len], &[4, 5]);
+        assert_eq!(second.data[0], 2); // num_vectors header
 
         assert!(queue.pop().is_none());
     }

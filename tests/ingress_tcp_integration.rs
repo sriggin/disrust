@@ -278,7 +278,7 @@ fn ingress_submits_writes_while_queued_parse_work_remains() {
     let expected_sum = req1_features.iter().copied().sum::<f32>();
     let mut expected = [0u8; 5];
     protocol::encode_response(&[expected_sum], &mut expected);
-    response_queue.push(ResponseReady::new(conn, 0, 1, &expected));
+    response_queue.push(ResponseReady::encode(conn, 0, 1, &[expected_sum]));
 
     let mut response = [0u8; 5];
     match stream.read_exact(&mut response) {
@@ -289,4 +289,75 @@ fn ingress_submits_writes_while_queued_parse_work_remains() {
         Err(err) => panic!("read first response failed: {err}"),
     }
     assert_eq!(response, expected, "unexpected first response bytes");
+}
+
+#[test]
+fn ingress_accepts_many_simultaneous_connections() {
+    // Verifies that accept resubmission (and later multishot accept) keeps
+    // firing for all connections: N clients connect, each sends one request,
+    // all N events must be published to the ring.
+    const N: usize = 8;
+    common::init_factory_pool();
+
+    let builder = build_single_producer(GPU_DISRUPTOR_SIZE, InferenceEvent::factory, BusySpin);
+    let (mut event_poller, builder) = builder.event_poller();
+    let producer = builder.build();
+
+    let pool_capacity = GPU_DISRUPTOR_SIZE * MAX_VECTORS_PER_REQUEST * FEATURE_DIM;
+    let pool = BufferPool::leak_new(pool_capacity);
+    let allocator = pool.allocator();
+    let response_queue = Arc::new(ResponseQueue::new(SLAB_CAPACITY * 2));
+    let publish_gate = Arc::new(Mutex::new(()));
+    let registry = Arc::new(ConnectionRegistry::new(1, SLAB_CAPACITY));
+    let (listen_fd, addr) = create_listener();
+
+    let ingress = IngressThread::new(
+        0,
+        listen_fd,
+        producer,
+        allocator,
+        response_queue,
+        publish_gate,
+        registry,
+    );
+    thread::Builder::new()
+        .name("ingress-multi-conn-test".into())
+        .spawn(move || ingress.run())
+        .expect("failed to spawn ingress thread");
+
+    let features: Vec<f32> = (0..FEATURE_DIM).map(|i| i as f32).collect();
+    let req = common::one_request_bytes(1, &features);
+
+    let _streams: Vec<_> = (0..N)
+        .map(|_| {
+            let mut stream = TcpStream::connect(addr).expect("connect failed");
+            stream.set_nodelay(true).unwrap();
+            stream.write_all(&req).expect("write failed");
+            stream
+        })
+        .collect();
+
+    let events = collect_events(&mut event_poller, N);
+
+    assert_eq!(
+        events.len(),
+        N,
+        "all {N} connections must produce a ring event"
+    );
+
+    // Each event must come from a distinct connection.
+    let mut conn_ids: Vec<_> = events.iter().map(|(c, _, _, _)| c.conn_id).collect();
+    conn_ids.sort_unstable();
+    conn_ids.dedup();
+    assert_eq!(
+        conn_ids.len(),
+        N,
+        "each connection must have a distinct conn_id"
+    );
+
+    // Feature data must be correct for every event.
+    for (_, num_vecs, _, feats) in &events {
+        assert_eq!(*num_vecs, 1);
+        assert_eq!(feats, &features);
+    }
 }

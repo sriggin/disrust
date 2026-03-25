@@ -16,7 +16,8 @@
       "Bash(echo Failed:*)",
       "Bash(cargo rustc:*)",
       "Bash(cargo build:*)",
-      "Bash(timeout 5 ./target/debug/ort-verify --cpu --model tests/models/verify.onnx 2>&1; echo \"exit: $?\")"
+      "Bash(timeout 5 ./target/debug/ort-verify --cpu --model tests/models/verify.onnx 2>&1; echo \"exit: $?\")",
+      "Bash(cargo test:*)"
     ]
   }
 }
