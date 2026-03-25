@@ -36,14 +36,32 @@ fn decode_user_data(user_data: u64) -> (u64, u32) {
 
 struct IoUring {
     inner: io_uring::IoUring,
-    outstanding: usize,
+    // Counts submitted SQEs that are still live in the kernel. For multishot ops this is not
+    // the same thing as the number of CQEs observed, because one SQE can generate many CQEs
+    // before the final completion retires it.
+    live_sqes: usize,
+}
+
+struct Completion {
+    user_data: u64,
+    result: i32,
+    flags: u32,
+}
+
+fn cqe_retires_sqe(flags: u32) -> bool {
+    !io_uring::cqueue::more(flags)
 }
 
 impl IoUring {
     fn new(entries: u32) -> io::Result<Self> {
+        let mut builder = io_uring::IoUring::builder();
+        builder
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .setup_defer_taskrun();
         Ok(Self {
-            inner: io_uring::IoUring::new(entries)?,
-            outstanding: 0,
+            inner: builder.build(entries)?,
+            live_sqes: 0,
         })
     }
 
@@ -51,7 +69,7 @@ impl IoUring {
         loop {
             match unsafe { self.inner.submission().push(sqe) } {
                 Ok(()) => {
-                    self.outstanding += 1;
+                    self.live_sqes += 1;
                     return;
                 }
                 Err(_) => {
@@ -68,15 +86,22 @@ impl IoUring {
     }
 
     fn submit(&mut self) {
-        if self.outstanding > 0 {
+        if self.live_sqes > 0 {
             self.inner.submit().expect("io_uring submit failed");
         }
     }
 
-    fn drain_cqes_into(&mut self, buf: &mut Vec<(u64, i32)>) {
+    fn drain_cqes_into(&mut self, buf: &mut Vec<Completion>) {
         for cqe in self.inner.completion() {
-            self.outstanding = self.outstanding.saturating_sub(1);
-            buf.push((cqe.user_data(), cqe.result()));
+            let flags = cqe.flags();
+            if cqe_retires_sqe(flags) {
+                self.live_sqes = self.live_sqes.saturating_sub(1);
+            }
+            buf.push(Completion {
+                user_data: cqe.user_data(),
+                result: cqe.result(),
+                flags,
+            });
         }
     }
 }
@@ -206,7 +231,7 @@ where
     pub fn run(mut self) {
         let mut ring = IoUring::new(4096).expect("io_uring creation failed");
         let mut conns: Slab<Connection> = Slab::with_capacity(SLAB_CAPACITY);
-        let mut cqe_buf: Vec<(u64, i32)> = Vec::new();
+        let mut cqe_buf: Vec<Completion> = Vec::new();
         let mut parse_queue: VecDeque<u16> = VecDeque::new();
         let mut parse_submit_budget = 0u8;
         submit_accept(&mut ring, self.listen_fd);
@@ -248,13 +273,14 @@ where
             cqe_buf.clear();
             ring.drain_cqes_into(&mut cqe_buf);
 
-            for &(user_data, result) in &cqe_buf {
-                let (op, data) = decode_user_data(user_data);
+            for cqe in &cqe_buf {
+                let (op, data) = decode_user_data(cqe.user_data);
                 match op {
                     OP_ACCEPT => handle_accept(
                         &mut ring,
                         &mut conns,
-                        result,
+                        cqe.result,
+                        cqe.flags,
                         self.thread_id,
                         self.listen_fd,
                         &self.registry,
@@ -268,10 +294,12 @@ where
                         &self.publish_gate,
                         &self.registry,
                         data as u16,
-                        result,
+                        cqe.result,
                     ),
-                    OP_WRITE => handle_write(&mut conns, &self.registry, data as u16, result),
-                    OP_NOTIFY => handle_notify(&mut ring, self.response_queue.notify_fd(), result),
+                    OP_WRITE => handle_write(&mut conns, &self.registry, data as u16, cqe.result),
+                    OP_NOTIFY => {
+                        handle_notify(&mut ring, self.response_queue.notify_fd(), cqe.result)
+                    }
                     _ => {}
                 }
             }
@@ -323,6 +351,7 @@ fn handle_accept(
     ring: &mut IoUring,
     conns: &mut Slab<Connection>,
     result: i32,
+    _flags: u32,
     thread_id: u8,
     listen_fd: RawFd,
     registry: &Arc<ConnectionRegistry>,
@@ -675,6 +704,20 @@ mod tests {
 
     fn inflight_offsets(conn: &Connection) -> Vec<usize> {
         conn.inflight.iter().map(|f| f.offset).collect()
+    }
+
+    // ---------------------------------------------------------------------------
+    // CQE semantics
+
+    #[test]
+    fn one_shot_cqe_retires_sqe() {
+        assert!(cqe_retires_sqe(0));
+    }
+
+    #[test]
+    fn multishot_nonterminal_cqe_keeps_sqe_live() {
+        const CQE_F_MORE: u32 = 1 << 1;
+        assert!(!cqe_retires_sqe(CQE_F_MORE));
     }
 
     // ---------------------------------------------------------------------------
